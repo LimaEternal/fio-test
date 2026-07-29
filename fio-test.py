@@ -12,6 +12,7 @@ fio-test.py — Автоматический бенчмаркинг несист
 """
 
 import argparse
+import concurrent.futures
 import json
 import subprocess
 import sys
@@ -322,16 +323,49 @@ def main() -> None:
                 )
         console.print()
 
-    total_steps = sum(
-        len(INTERFACE_CONFIGS[d["tran"]]) for d in disks
-    )
-
     if args.runtime != 30:
         console.print(
             f"[grey50]Длительность теста: {args.runtime}с[/grey50]\n"
         )
 
     results = []
+    tasks = []
+
+    for disk in disks:
+        disk_config = INTERFACE_CONFIGS[disk["tran"]]
+        for t in disk_config:
+            idx = len(results)
+            results.append({
+                "disk": disk["name"],
+                "model": disk["model"],
+                "serial": disk["serial"],
+                "tran": disk["tran"],
+                "size": disk["size"],
+                "sector": disk["phy_sec"],
+                "test_name": f"{t['name']}",
+                "iops": "...",
+                "bw": "...",
+                "lat_avg": "...",
+                "lat_p99": "...",
+                "error_msg": None,
+                "bs": "...",
+                "status": "...",
+            })
+
+            fio_args = list(t["args"])
+            if args.runtime != 30:
+                fio_args = [
+                    (
+                        f"--runtime={args.runtime}"
+                        if a.startswith("--runtime=")
+                        else a
+                    )
+                    for a in fio_args
+                ]
+
+            tasks.append((idx, disk, t, fio_args))
+
+    total_steps = len(tasks)
 
     with Live(
         build_table(results), refresh_per_second=4, console=console
@@ -346,42 +380,21 @@ def main() -> None:
             "[cyan]Выполнение бенчмарка...", total=total_steps
         )
 
-        for disk in disks:
-            disk_config = INTERFACE_CONFIGS[disk["tran"]]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(disks)
+        ) as executor:
+            future_to_info = {}
+            for idx, disk, t, fio_args in tasks:
+                future = executor.submit(
+                    run_fio_test, disk, t["id"], fio_args
+                )
+                future_to_info[future] = (idx, disk, t, fio_args)
 
-            for t in disk_config:
-                idx = len(results)
-                results.append({
-                    "disk": disk["name"],
-                    "model": disk["model"],
-                    "serial": disk["serial"],
-                    "tran": disk["tran"],
-                    "size": disk["size"],
-                    "sector": disk["phy_sec"],
-                    "test_name": f"[bold yellow]⏳ {t['name']}[/bold yellow]",
-                    "iops": "...",
-                    "bw": "...",
-                    "lat_avg": "...",
-                    "lat_p99": "...",
-                    "error_msg": None,
-                    "bs": "...",
-                    "status": "...",
-                })
-                live.update(build_table(results))
-
-                fio_args = list(t["args"])
-
-                if args.runtime != 30:
-                    fio_args = [
-                        (
-                            f"--runtime={args.runtime}"
-                            if a.startswith("--runtime=")
-                            else a
-                        )
-                        for a in fio_args
-                    ]
-
-                res = run_fio_test(disk, t["id"], fio_args)
+            for future in concurrent.futures.as_completed(
+                future_to_info
+            ):
+                idx, disk, t, fio_args = future_to_info[future]
+                res = future.result()
 
                 bs = "4k"
                 for a in fio_args:
@@ -391,7 +404,7 @@ def main() -> None:
 
                 if "error" in res:
                     results[idx]["test_name"] = (
-                        f"[red]❌ {t['name']}[/red]"
+                        f"[red]{t['name']}[/red]"
                     )
                     results[idx]["iops"] = "ERR"
                     results[idx]["bw"] = "—"
@@ -402,7 +415,7 @@ def main() -> None:
                     results[idx]["status"] = "undone"
                 else:
                     results[idx]["test_name"] = (
-                        f"[green]✅ {t['name']}[/green]"
+                        f"[green]{t['name']}[/green]"
                     )
                     results[idx]["iops"] = f"{res['iops']:,}"
                     results[idx]["bw"] = res["bw_mb"]
