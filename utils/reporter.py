@@ -72,10 +72,10 @@ def generate_report(
             lines.append(f"### /dev/{disk_key} ({r['model']})")
             lines.append("")
             lines.append(
-                "| Тест | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat p99 (мс) | Статус | Ошибка |"
+                "| Тест | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat p99 (мс) | Статус |"
             )
             lines.append(
-                "|------|------|------|-----------------|--------------|--------------|--------|--------|"
+                "|------|------|------|-----------------|--------------|--------------|--------|"
             )
 
         status_label = r.get("status", "...")
@@ -86,15 +86,14 @@ def generate_report(
         else:
             status_display = status_label
 
-        if r.get("error"):
-            err = r.get("error_msg", "Unknown")
+        if "ERR" in str(r.get("iops", "")):
             lines.append(
-                f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | — | — | — | — | {status_display} | {err} |"
+                f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | — | — | — | — | {status_display} |"
             )
         else:
             lines.append(
                 f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | {r['iops']} | {r['bw']} "
-                f"| {r['lat_avg']} | {r['lat_p99']} | {status_display} | — |"
+                f"| {r['lat_avg']} | {r['lat_p99']} | {status_display} |"
             )
 
     lines.append("")

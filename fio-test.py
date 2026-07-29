@@ -19,14 +19,6 @@ import sys
 from pathlib import Path
 
 from rich.console import Console
-from rich.live import Live
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-)
 from rich.table import Table
 
 from configs import nvme, sas, sata
@@ -233,7 +225,10 @@ def build_table(results: list[dict]) -> Table:
     """Строит Rich-таблицу с результатами."""
     table = Table(
         title="[bold green]Результаты тестирования накопителей (FIO)[/bold green]",
-        show_lines=True,
+        box=None,
+        show_edge=False,
+        show_lines=False,
+        padding=(0, 1),
     )
 
     table.add_column("Диск", style="cyan")
@@ -295,9 +290,9 @@ def main() -> None:
         f"Обнаружено целевых дисков: [bold green]{len(disks)}[/bold green]\n"
     )
 
-    for d in disks:
+    for i, d in enumerate(disks, 1):
         desc = INTERFACE_DESCRIPTIONS.get(d["tran"], "")
-        console.print(f"  [cyan]/dev/{d['name']}[/cyan] — {d['model']} ({d['tran']})")
+        console.print(f"  [cyan]{i}. /dev/{d['name']}[/cyan] — {d['model']} ({d['tran']})")
         if desc:
             console.print(f"    [grey50]{desc}[/grey50]")
     console.print()
@@ -327,6 +322,8 @@ def main() -> None:
         console.print(
             f"[grey50]Длительность теста: {args.runtime}с[/grey50]\n"
         )
+
+    console.print("[cyan]Выполнение бенчмарка...[/cyan]")
 
     results = []
     tasks = []
@@ -365,71 +362,55 @@ def main() -> None:
 
             tasks.append((idx, disk, t, fio_args))
 
-    total_steps = len(tasks)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(disks)
+    ) as executor:
+        future_to_info = {}
+        for idx, disk, t, fio_args in tasks:
+            future = executor.submit(
+                run_fio_test, disk, t["id"], fio_args
+            )
+            future_to_info[future] = (idx, disk, t, fio_args)
 
-    with Live(
-        build_table(results), refresh_per_second=4, console=console
-    ) as live:
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-        )
-        overall = progress.add_task(
-            "[cyan]Выполнение бенчмарка...", total=total_steps
-        )
+        for future in concurrent.futures.as_completed(
+            future_to_info
+        ):
+            idx, disk, t, fio_args = future_to_info[future]
+            res = future.result()
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(disks)
-        ) as executor:
-            future_to_info = {}
-            for idx, disk, t, fio_args in tasks:
-                future = executor.submit(
-                    run_fio_test, disk, t["id"], fio_args
+            bs = "4k"
+            for a in fio_args:
+                if a.startswith("--bs="):
+                    bs = a.split("=", 1)[1]
+                    break
+
+            if "error" in res:
+                results[idx]["test_name"] = (
+                    f"[red]{t['name']}[/red]"
                 )
-                future_to_info[future] = (idx, disk, t, fio_args)
+                results[idx]["iops"] = "ERR"
+                results[idx]["bw"] = "—"
+                results[idx]["lat_avg"] = "—"
+                results[idx]["lat_p99"] = "—"
+                results[idx]["error_msg"] = res["error"]
+                results[idx]["bs"] = bs
+                results[idx]["status"] = "undone"
+            else:
+                results[idx]["test_name"] = (
+                    f"[green]{t['name']}[/green]"
+                )
+                results[idx]["iops"] = f"{res['iops']:,}"
+                results[idx]["bw"] = res["bw_mb"]
+                results[idx]["lat_avg"] = res["lat_avg"]
+                results[idx]["lat_p99"] = res["lat_p99"]
+                results[idx]["error_msg"] = None
+                results[idx]["bs"] = bs
+                results[idx]["status"] = check_threshold(
+                    t["id"], res, thresholds[disk["tran"]]
+                )
 
-            for future in concurrent.futures.as_completed(
-                future_to_info
-            ):
-                idx, disk, t, fio_args = future_to_info[future]
-                res = future.result()
-
-                bs = "4k"
-                for a in fio_args:
-                    if a.startswith("--bs="):
-                        bs = a.split("=", 1)[1]
-                        break
-
-                if "error" in res:
-                    results[idx]["test_name"] = (
-                        f"[red]{t['name']}[/red]"
-                    )
-                    results[idx]["iops"] = "ERR"
-                    results[idx]["bw"] = "—"
-                    results[idx]["lat_avg"] = "—"
-                    results[idx]["lat_p99"] = "—"
-                    results[idx]["error_msg"] = res["error"]
-                    results[idx]["bs"] = bs
-                    results[idx]["status"] = "undone"
-                else:
-                    results[idx]["test_name"] = (
-                        f"[green]{t['name']}[/green]"
-                    )
-                    results[idx]["iops"] = f"{res['iops']:,}"
-                    results[idx]["bw"] = res["bw_mb"]
-                    results[idx]["lat_avg"] = res["lat_avg"]
-                    results[idx]["lat_p99"] = res["lat_p99"]
-                    results[idx]["error_msg"] = None
-                    results[idx]["bs"] = bs
-                    results[idx]["status"] = check_threshold(
-                        t["id"], res, thresholds[disk["tran"]]
-                    )
-
-                live.update(build_table(results))
-                progress.advance(overall)
-
+    console.print()
+    console.print(build_table(results))
     console.print(
         "\n[bold green]Все тесты завершены.[/bold green]"
     )
