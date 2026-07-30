@@ -224,29 +224,12 @@ def run_precondition(disk_info: dict) -> bool:
 
 
 # Custom box for inner table — horizontal lines only, no vertical separators
+# Try multiple approaches for compatibility with different rich versions
+_HLINE_BOX = None
 try:
-    # rich >= 12 — keyword arguments
-    _HLINE_BOX = Box(
-        top_left=" ", top="─", top_right=" ",
-        top_mid="─",
-        bottom_left=" ", bottom="─", bottom_right=" ",
-        bottom_mid="─",
-        mid_left="├", mid="─", mid_right="┤",
-        mid_center="─", mid_mid="─",
-        left=" ", right=" ", center=" ", middle="─",
-        vertical=" ", horizontal="─", cross="─",
-    )
-except TypeError:
-    # rich < 12 — positional arguments only
-    _HLINE_BOX = Box(
-        " ", " ", " ", " ",   # corners
-        "─", "─",             # top, bottom
-        " ", "─", " ",        # vertical, horizontal, cross
-        "─", "─",             # top_mid, bottom_mid
-        " ", "─", " ",        # mid_left, mid, mid_right
-        "─", "─",             # mid_center, mid_mid
-        " ", " ", " ", "─",   # left, right, center, middle
-    )
+    from rich.box import SIMPLE as _HLINE_BOX
+except (ImportError, Exception):
+    pass
 
 
 def _status_style(status: str) -> str:
