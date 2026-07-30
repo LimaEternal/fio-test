@@ -14,12 +14,14 @@ fio-test.py — Автоматический бенчмаркинг несист
 import argparse
 import concurrent.futures
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
+from rich.box import Box
 
 from configs import nvme, sas, sata
 from utils.reporter import generate_report
@@ -221,48 +223,75 @@ def run_precondition(disk_info: dict) -> bool:
     return res.returncode == 0
 
 
-def build_table(results: list[dict]) -> Table:
-    """Строит Rich-таблицу с результатами."""
-    table = Table(
+# Custom box for inner table — horizontal lines only, no vertical separators
+_HLINE_BOX = Box(
+    top_left=" ", top="─", top_right=" ",
+    top_mid="─",
+    bottom_left=" ", bottom="─", bottom_right=" ",
+    bottom_mid="─",
+    mid_left="├", mid="─", mid_right="┤",
+    mid_center="─", mid_mid="─",
+    left=" ", right=" ", center=" ", middle="─",
+    vertical=" ", horizontal="─", cross="─",
+)
+
+
+def _status_style(status: str) -> str:
+    """Возвращает styled строку статуса."""
+    if status == "done":
+        return "[bold green]done[/bold green]"
+    elif status == "undone":
+        return "[bold red]undone[/bold red]"
+    return status
+
+
+def build_results_table(disks: list, results: list) -> Table:
+    """Строит внешнюю таблицу с вложенными таблицами для каждого диска."""
+    # Group results by disk (preserving order)
+    grouped = []
+    for disk in disks:
+        disk_results = [r for r in results if r["disk"] == disk["name"]]
+        if disk_results:
+            grouped.append((disk, disk_results))
+
+    outer = Table(
         title="[bold green]Результаты тестирования накопителей (FIO)[/bold green]",
-        box=None,
-        show_edge=False,
-        show_lines=False,
+        show_edge=True,
+        show_lines=True,
         padding=(0, 1),
     )
+    outer.add_column("", no_header=True, justify="center", vertical="middle", width=3)
+    outer.add_column("")
 
-    table.add_column("Диск", style="cyan")
-    table.add_column("Модель / Серийник", style="magenta")
-    table.add_column("Интерфейс / Объём")
-    table.add_column("Профиль теста", style="yellow")
-    table.add_column("IOPS", justify="right", style="green")
-    table.add_column("Скорость (МБ/с)", justify="right", style="green")
-    table.add_column("Lat Avg (мс)", justify="right")
-    table.add_column("Lat p99 (мс)", justify="right")
-    table.add_column("Статус", justify="center")
-
-    for r in results:
-        status = r.get("status", "...")
-        if status == "done":
-            status_style = "[bold green]done[/bold green]"
-        elif status == "undone":
-            status_style = "[bold red]undone[/bold red]"
-        else:
-            status_style = status
-
-        table.add_row(
-            r["disk"],
-            f"{r['model']}\n[grey50]SN: {r['serial']}[/grey50]",
-            f"{r['tran']} (Sector: {r['sector']}B)\n[grey50]{r['size']}[/grey50]",
-            r["test_name"],
-            str(r["iops"]),
-            str(r["bw"]),
-            str(r["lat_avg"]),
-            str(r["lat_p99"]),
-            status_style,
+    for disk_num, (disk, disk_results) in enumerate(grouped, 1):
+        inner = Table(
+            box=_HLINE_BOX,
+            show_edge=False,
+            show_lines=True,
+            padding=(0, 2),
         )
+        inner.add_column("Профиль теста", style="yellow")
+        inner.add_column("Блок", justify="right")
+        inner.add_column("IOPS", justify="right", style="green")
+        inner.add_column("Скорость (МБ/с)", justify="right", style="green")
+        inner.add_column("Lat Avg (мс)", justify="right")
+        inner.add_column("Lat p99 (мс)", justify="right")
+        inner.add_column("Статус", justify="center")
 
-    return table
+        for r in disk_results:
+            inner.add_row(
+                r["test_name"],
+                str(r.get("bs", "—")),
+                str(r["iops"]),
+                str(r["bw"]),
+                str(r["lat_avg"]),
+                str(r["lat_p99"]),
+                _status_style(r.get("status", "...")),
+            )
+
+        outer.add_row(str(disk_num), inner)
+
+    return outer
 
 
 def main() -> None:
@@ -291,10 +320,11 @@ def main() -> None:
     )
 
     for i, d in enumerate(disks, 1):
-        desc = INTERFACE_DESCRIPTIONS.get(d["tran"], "")
-        console.print(f"  [cyan]{i}. /dev/{d['name']}[/cyan] — {d['model']} ({d['tran']})")
-        if desc:
-            console.print(f"    [grey50]{desc}[/grey50]")
+        slot_str = f", Slot: {d['slot']}" if d.get("slot") else ""
+        console.print(
+            f"  [cyan]{i}. /dev/{d['name']}[/cyan] — {d['model']} "
+            f"([white]{d['tran']}[/white], SN: [white]{d['serial']}[/white]{slot_str})"
+        )
     console.print()
 
     if args.precond:
@@ -410,7 +440,7 @@ def main() -> None:
                 )
 
     console.print()
-    console.print(build_table(results))
+    console.print(build_results_table(disks, results))
     console.print(
         "\n[bold green]Все тесты завершены.[/bold green]"
     )

@@ -6,6 +6,7 @@
 """
 
 import json
+import re
 import subprocess
 from typing import Dict, List, Optional
 
@@ -38,7 +39,7 @@ def get_non_system_disks(known_interfaces: Dict[str, list]) -> List[dict]:
     """
     cmd = [
         "lsblk", "--json",
-        "-o", "NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,MOUNTPOINT,PHY-SEC",
+        "-o", "NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,MOUNTPOINT,PHY-SEC,HCTL",
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -66,6 +67,12 @@ def get_non_system_disks(known_interfaces: Dict[str, list]) -> List[dict]:
         if tran not in known_interfaces:
             tran = "SATA"
 
+        slot = d.get("hctl") or ""
+        if not slot and "nvme" in d["name"]:
+            m = re.match(r"(nvme\d+)", d["name"])
+            if m:
+                slot = m.group(1)
+
         disks.append({
             "name": d["name"],
             "path": f"/dev/{d['name']}",
@@ -74,6 +81,7 @@ def get_non_system_disks(known_interfaces: Dict[str, list]) -> List[dict]:
             "tran": tran,
             "size": d.get("size"),
             "phy_sec": int(d.get("phy-sec") or 512),
+            "slot": slot,
         })
 
     return disks
