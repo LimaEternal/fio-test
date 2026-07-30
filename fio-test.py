@@ -251,7 +251,7 @@ def build_results_table(disks: list, results: list) -> Table:
             grouped.append((disk, disk_results))
 
     outer = Table(
-        title="[bold green]Результаты тестирования накопителей (FIO)[/bold green]",
+        show_header=False,
         show_edge=True,
         show_lines=True,
         padding=(0, 1),
@@ -436,6 +436,7 @@ def main() -> None:
                 )
 
     console.print()
+    console.print("[bold green]Результаты тестирования накопителей (FIO)[/bold green]")
     console.print(build_results_table(disks, results))
     console.print(
         "\n[bold green]Все тесты завершены.[/bold green]"
