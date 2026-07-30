@@ -256,7 +256,7 @@ def build_results_table(disks: list, results: list) -> Table:
         show_lines=True,
         padding=(0, 1),
     )
-    outer.add_column("", no_header=True, justify="center", vertical="middle", width=3)
+    outer.add_column("№", justify="center", width=3)
     outer.add_column("")
 
     for disk_num, (disk, disk_results) in enumerate(grouped, 1):
