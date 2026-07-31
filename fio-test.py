@@ -14,14 +14,11 @@ fio-test.py — Автоматический бенчмаркинг несист
 import argparse
 import concurrent.futures
 import json
-import re
 import subprocess
 import sys
-from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
-from rich.box import Box
 
 from configs import nvme, sas, sata
 from utils.reporter import generate_report
@@ -151,22 +148,118 @@ def parse_custom_thresholds(raw: str) -> dict:
     }
 
 
+def validate_configs() -> None:
+    """Валидация конфигов FIO-тестов. Вызывается при старте до сканирования дисков."""
+    if not isinstance(INTERFACE_CONFIGS, dict):
+        console.print("[red]INTERFACE_CONFIGS должен быть словарём[/red]")
+        sys.exit(1)
+
+    required_test_keys = {"id", "name", "args"}
+    required_args = {"--rw=", "--bs=", "--runtime=", "--time_based"}
+    valid_bs = {"512", "1k", "2k", "4k", "8k", "16k", "32k", "64k", "128k",
+                "256k", "512k", "1m"}
+
+    for iface, tests in INTERFACE_CONFIGS.items():
+        if not isinstance(tests, list) or len(tests) == 0:
+            console.print(f"[red]Ошибка в конфиге {iface}: TESTS должен быть непустым списком[/red]")
+            sys.exit(1)
+
+        for idx, test in enumerate(tests):
+            missing = required_test_keys - set(test.keys())
+            if missing:
+                console.print(f"[red]Ошибка в конфиге {iface}, тест {idx}: отсутствуют ключи {missing}[/red]")
+                sys.exit(1)
+
+            args = test["args"]
+            if not isinstance(args, list):
+                console.print(f"[red]Ошибка в конфиге {iface}, тест {test['id']}: args должен быть списком[/red]")
+                sys.exit(1)
+
+            for arg in args:
+                if not any(arg.startswith(req) for req in required_args):
+                    if arg in ("--time_based",):
+                        continue
+                    if not arg.startswith("--") and not arg.startswith("-"):
+                        console.print(
+                            f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
+                            f"неожиданный аргумент '{arg}'[/red]"
+                        )
+                        sys.exit(1)
+
+            bs_val = None
+            for arg in args:
+                if arg.startswith("--bs="):
+                    bs_val = arg.split("=", 1)[1].lower()
+                    break
+
+            if bs_val is None:
+                console.print(
+                    f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
+                    f"отсутствует параметр --bs[/red]"
+                )
+                sys.exit(1)
+
+            if bs_val not in valid_bs:
+                console.print(
+                    f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
+                    f"некорректный bs='{bs_val}'[/red]"
+                )
+                sys.exit(1)
+
+            if not any(a.startswith("--runtime=") for a in args):
+                console.print(
+                    f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
+                    f"отсутствует --runtime[/red]"
+                )
+                sys.exit(1)
+
+            if "--time_based" not in args:
+                console.print(
+                    f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
+                    f"отсутствует --time_based[/red]"
+                )
+                sys.exit(1)
+
+    for iface, thresholds in INTERFACE_THRESHOLDS.items():
+        if not isinstance(thresholds, dict):
+            console.print(f"[red]Ошибка в конфиге {iface}: THRESHOLDS должен быть словарём[/red]")
+            sys.exit(1)
+
+        if iface not in INTERFACE_CONFIGS:
+            console.print(f"[red]Ошибка в конфиге {iface}: интерфейс не найден в INTERFACE_CONFIGS[/red]")
+            sys.exit(1)
+
+        test_ids = {t["id"] for t in INTERFACE_CONFIGS[iface]}
+        for tid, vals in thresholds.items():
+            if tid not in test_ids:
+                console.print(
+                    f"[red]Ошибка в THRESHOLDS[{iface}]: тест '{tid}' не найден в TESTS[/red]"
+                )
+                sys.exit(1)
+            if "min_bw_mb" not in vals and "min_iops" not in vals:
+                console.print(
+                    f"[red]Ошибка в THRESHOLDS[{iface}]['{tid}']: "
+                    f"нужен min_bw_mb или min_iops[/red]"
+                )
+                sys.exit(1)
+
+        if len(thresholds) != len(test_ids):
+            console.print(
+                f"[red]Ошибка в THRESHOLDS[{iface}]: "
+                f"количество порогов ({len(thresholds)}) != количество тестов ({len(test_ids)})[/red]"
+            )
+            sys.exit(1)
+
+    for iface, desc in INTERFACE_DESCRIPTIONS.items():
+        if not isinstance(desc, str) or not desc.strip():
+            console.print(f"[red]Ошибка в конфиге {iface}: DESCRIPTION должен быть непустой строкой[/red]")
+            sys.exit(1)
+
+
 def run_fio_test(disk_info: dict, test_id: str, base_args: list[str]) -> dict:
     """Запускает один подтест FIO и парсит JSON-результат."""
     disk_path = disk_info["path"]
-    sector_size = disk_info["phy_sec"]
-
     fio_args = list(base_args)
-
-    if sector_size == 4096:
-        if "rand" in test_id:
-            fio_args = [
-                a if not a.startswith("--bs=") else "--bs=4k" for a in fio_args
-            ]
-        elif "seq" in test_id:
-            fio_args = [
-                a if not a.startswith("--bs=") else "--bs=128k" for a in fio_args
-            ]
 
     cmd = [
         "fio",
@@ -292,6 +385,7 @@ def build_results_table(disks: list, results: list) -> Table:
 
 def main() -> None:
     args = parse_args()
+    validate_configs()
 
     thresholds = dict(INTERFACE_THRESHOLDS)
 
