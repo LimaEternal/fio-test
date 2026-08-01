@@ -216,10 +216,48 @@ def validate_configs():
             sys.exit(1)
 
 
+def _kill_process_group(proc):
+    """Отправляет SIGTERM всей группе процессов."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def _run_io_process(cmd, cancel_event):
+    """Запускает процесс и ждёт завершения.
+
+    Возвращает (proc, stdout, stderr) либо None при отмене или ошибке запуска.
+    FileNotFoundError пробрасывается наверх для точной диагностики.
+    """
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,
+        )
+        while proc.poll() is None:
+            if cancel_event and cancel_event.is_set():
+                _kill_process_group(proc)
+                proc.wait()
+                return None
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                continue
+        stdout, stderr = proc.communicate()
+        return proc, stdout, stderr
+    except FileNotFoundError:
+        raise
+    except Exception:
+        if proc and proc.poll() is None:
+            _kill_process_group(proc)
+        return None
+
+
 def run_fio_test(disk_info, test_id, base_args, cancel_event=None):
     """Запускает fio-тест. Поддерживает отмену через cancel_event."""
     disk_path = disk_info["path"]
-    fio_args = list(base_args)
     cmd = [
         "fio",
         "--name", test_id,
@@ -229,40 +267,21 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None):
         "--group_reporting",
         "--norandommap",
         "--output-format=json",
-    ] + fio_args
+    ] + list(base_args)
 
-    proc = None
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
-        while proc.poll() is None:
-            if cancel_event and cancel_event.is_set():
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                proc.wait()
-                return {"error": "Тест отменён пользователем"}
-            try:
-                proc.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                continue
-
-        stdout, stderr = proc.communicate()
-        stdout = stdout.decode() if stdout else ""
-        stderr = stderr.decode() if stderr else ""
-
+        result = _run_io_process(cmd, cancel_event)
     except FileNotFoundError:
         return {"error": "Утилита fio не найдена. Установите fio и повторите попытку."}
-    except Exception as exc:
-        if proc and proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        return {"error": str(exc)}
+
+    if result is None:
+        if cancel_event and cancel_event.is_set():
+            return {"error": "Тест отменён пользователем"}
+        return {"error": "Ошибка запуска fio"}
+
+    proc, stdout, stderr = result
+    stdout = stdout.decode() if stdout else ""
+    stderr = stderr.decode() if stderr else ""
 
     if proc.returncode != 0:
         hint = stderr.strip()[:200] if stderr else ""
@@ -308,32 +327,14 @@ def run_precondition(disk_info, cancel_event=None):
         "--group_reporting",
         "--output-format=json",
     ]
-    proc = None
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
-        while proc.poll() is None:
-            if cancel_event and cancel_event.is_set():
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                proc.wait()
-                return False
-            try:
-                proc.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                continue
-        return proc.returncode == 0
-    except Exception:
-        if proc and proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        result = _run_io_process(cmd, cancel_event)
+    except FileNotFoundError:
         return False
+    if result is None:
+        return False
+    proc, _, _ = result
+    return proc.returncode == 0
 
 
 def optimize_nvme_args(test_id, args_list, pcie_info):
@@ -557,7 +558,7 @@ def main():
     console.print()
     console.print(table)
 
-    generate_report(disks, results, output_path=args.output)
+    generate_report(disks, results, TEST_NAMES, output_path=args.output)
 
 
 if __name__ == "__main__":

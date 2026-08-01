@@ -1,21 +1,14 @@
-"""Построение плоской консольной таблицы с результатами FIO."""
+"""Построение плоской консольной таблицы с результатами FIO.
+
+Внешняя таблица содержит ровно две колонки: паспорт накопителя
+(№ + Накопитель) и результаты тестов. Это гарантирует единственный
+вертикальный разделитель между группами, а горизонтальные линии
+(add_section) разделяют блоки разных дисков.
+"""
 
 from rich import box
 from rich.table import Table
 from rich.text import Text
-
-
-COLUMN_HEADERS = (
-    "№",
-    "Накопитель",
-    "Профиль теста",
-    "Блок",
-    "IOPS",
-    "Скорость (МБ/с)",
-    "Lat Avg (мс)",
-    "Lat P99 (мс)",
-    "Статус",
-)
 
 
 def format_status(status):
@@ -25,21 +18,15 @@ def format_status(status):
     return Text("undone", style="bold red")
 
 
-def _multiline_cell(header, values):
-    """Формирует ячейку с названием колонки и строками обычного текста."""
+def _multiline_cell(header, values, formatter=None):
+    """Формирует ячейку с жирной шапкой и строками значений."""
     cell = Text(header, style="bold")
     for value in values:
         cell.append("\n")
-        cell.append(str(value))
-    return cell
-
-
-def _status_cell(statuses):
-    """Формирует колонку статусов, сохраняя цвет только у значений статуса."""
-    cell = Text(COLUMN_HEADERS[-1], style="bold")
-    for status in statuses:
-        cell.append("\n")
-        cell.append_text(format_status(status))
+        if formatter:
+            cell.append_text(formatter(value))
+        else:
+            cell.append(str(value))
     return cell
 
 
@@ -89,39 +76,57 @@ def _test_columns(disk_results, test_names):
     return columns
 
 
+def _cell_grid(columns):
+    """Строит grid без рамок из списка (header, values, formatter, justify, min_width)."""
+    grid = Table.grid(padding=(0, 1))
+    cells = []
+    for header, values, formatter, justify, min_width in columns:
+        grid.add_column(justify=justify, min_width=min_width)
+        cells.append(_multiline_cell(header, values, formatter))
+    grid.add_row(*cells)
+    return grid
+
+
+def _passport_cell(index, disk):
+    """Строит ячейку паспорта: № и Накопитель в одной группе без вертикали."""
+    return _cell_grid([
+        ("№", (index,), None, "right", 4),
+        ("Накопитель", _disk_details(disk), None, "left", 26),
+    ])
+
+
+def _results_cell(disk_results, test_names):
+    """Строит ячейку с результатами всех настроенных тестов."""
+    columns = _test_columns(disk_results, test_names)
+    return _cell_grid([
+        ("Профиль теста", columns["names"], None, "left", 18),
+        ("Блок", columns["blocks"], None, "center", None),
+        ("IOPS", columns["iops"], None, "right", None),
+        ("Скорость (МБ/с)", columns["bandwidth"], None, "right", None),
+        ("Lat Avg (мс)", columns["lat_avg"], None, "right", None),
+        ("Lat P99 (мс)", columns["lat_p99"], None, "right", None),
+        ("Статус", columns["statuses"], format_status, "center", None),
+    ])
+
+
 def build_results_table(disks, results, test_names):
     """Строит одну непрерывную таблицу для всех накопителей."""
     table = Table(
         box=box.ROUNDED,
         expand=True,
         show_header=False,
-        show_lines=True,
         border_style="",
         padding=(0, 1),
     )
-    table.add_column(justify="right", width=4)
-    table.add_column(min_width=28)
-    table.add_column(min_width=18)
-    table.add_column(justify="center")
-    table.add_column(justify="right")
-    table.add_column(justify="right")
-    table.add_column(justify="right")
-    table.add_column(justify="right")
-    table.add_column(justify="center")
+    table.add_column(min_width=30)
+    table.add_column()
 
     for index, disk in enumerate(disks, 1):
         disk_results = results[index - 1] if index - 1 < len(results) else {}
-        test_columns = _test_columns(disk_results, test_names)
         table.add_row(
-            _multiline_cell(COLUMN_HEADERS[0], (index,)),
-            _multiline_cell(COLUMN_HEADERS[1], _disk_details(disk)),
-            _multiline_cell(COLUMN_HEADERS[2], test_columns["names"]),
-            _multiline_cell(COLUMN_HEADERS[3], test_columns["blocks"]),
-            _multiline_cell(COLUMN_HEADERS[4], test_columns["iops"]),
-            _multiline_cell(COLUMN_HEADERS[5], test_columns["bandwidth"]),
-            _multiline_cell(COLUMN_HEADERS[6], test_columns["lat_avg"]),
-            _multiline_cell(COLUMN_HEADERS[7], test_columns["lat_p99"]),
-            _status_cell(test_columns["statuses"]),
+            _passport_cell(index, disk),
+            _results_cell(disk_results, test_names),
         )
+        table.add_section()
 
     return table

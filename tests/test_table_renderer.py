@@ -82,14 +82,27 @@ def load_entrypoint():
 
 
 class TableRendererTests(unittest.TestCase):
-    def test_all_disks_share_one_outer_table_without_section_lines(self):
+    def test_all_disks_share_one_outer_table_with_section_lines_between(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 
         lines = output.splitlines()
         self.assertEqual(sum(line.startswith("╭") for line in lines), 1)
         self.assertEqual(sum(line.startswith("╰") for line in lines), 1)
-        self.assertFalse(any(line.startswith(("├", "┼", "┤")) for line in lines))
+        separators = [line for line in lines if line.startswith("├")]
+        self.assertEqual(len(separators), 1)
+        self.assertIn("┼", separators[0])
         self.assertNotIn("", lines)
+
+    def test_only_one_vertical_separator_between_groups(self):
+        output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+
+        content = [
+            line for line in output.splitlines()
+            if line.startswith("│") and not line.startswith("├")
+        ]
+        self.assertTrue(content)
+        for line in content:
+            self.assertEqual(line.count("│"), 3)
 
     def test_column_names_repeat_for_every_disk_without_global_title(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))

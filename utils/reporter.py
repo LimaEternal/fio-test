@@ -22,12 +22,11 @@ TEST_NAMES = {
     "rand_write": "4. Случ. Запись 4k",
 }
 
-TEST_ORDER = ["seq_read", "seq_write", "rand_read", "rand_write"]
-
 
 def generate_report(
     disks: List[dict],
     results: List[dict],
+    test_names: Optional[dict] = None,
     output_path: Optional[Union[str, Path]] = None,
 ) -> Path:
     """
@@ -36,11 +35,14 @@ def generate_report(
     Параметры:
         disks       — список словарей с данными дисков
         results     — список словарей с результатами тестов (по одному на диск)
+        test_names  — порядок и отображаемые имена тестов (по умолчанию TEST_NAMES)
         output_path — путь для выходного файла (по умолчанию fio_report_<timestamp>.md)
 
     Возвращает:
         Path к созданному файлу
     """
+    if test_names is None:
+        test_names = TEST_NAMES
     try:
         if output_path is None:
             reports_dir = Path("reports")
@@ -87,9 +89,8 @@ def generate_report(
                 "|---------------|------|------|-----------------|--------------|--------------|--------|"
             )
 
-            for test_id in TEST_ORDER:
+            for test_id, test_name in test_names.items():
                 res = disk_results.get(test_id, {})
-                test_name = TEST_NAMES.get(test_id, test_id)
 
                 if "error" in res:
                     lines.append(
