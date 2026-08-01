@@ -119,6 +119,13 @@ class TableRendererTests(unittest.TestCase):
         self.assertIn("12,345", output)
         self.assertIn("96.5", output)
 
+    def test_passport_uses_numbered_disk_name_without_no_sign(self):
+        output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+
+        self.assertIn("1. /dev/sda", output)
+        self.assertIn("2. /dev/sdb", output)
+        self.assertNotIn("№", output)
+
     def test_disk_details_and_test_results_are_direct_cells(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 

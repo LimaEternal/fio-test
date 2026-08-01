@@ -76,9 +76,9 @@ def _test_columns(disk_results, test_names):
     return columns
 
 
-def _cell_grid(columns):
+def _cell_grid(columns, padding=(0, 1)):
     """Строит grid без рамок из списка (header, values, formatter, justify, min_width)."""
-    grid = Table.grid(padding=(0, 1))
+    grid = Table.grid(padding=padding)
     cells = []
     for header, values, formatter, justify, min_width in columns:
         grid.add_column(justify=justify, min_width=min_width)
@@ -88,10 +88,11 @@ def _cell_grid(columns):
 
 
 def _passport_cell(index, disk):
-    """Строит ячейку паспорта: № и Накопитель в одной группе без вертикали."""
+    """Строит ячейку паспорта: номер и данные накопителя в одной колонке."""
+    details = list(_disk_details(disk))
+    lines = [f"{index}. {details[0]}"] + [f"   {line}" for line in details[1:]]
     return _cell_grid([
-        ("№", (index,), None, "right", 4),
-        ("Накопитель", _disk_details(disk), None, "left", 26),
+        ("Накопитель", lines, None, "left", 20),
     ])
 
 
@@ -106,7 +107,7 @@ def _results_cell(disk_results, test_names):
         ("Lat Avg (мс)", columns["lat_avg"], None, "right", None),
         ("Lat P99 (мс)", columns["lat_p99"], None, "right", None),
         ("Статус", columns["statuses"], format_status, "center", None),
-    ])
+    ], padding=(0, 2))
 
 
 def build_results_table(disks, results, test_names):
@@ -118,7 +119,7 @@ def build_results_table(disks, results, test_names):
         border_style="",
         padding=(0, 1),
     )
-    table.add_column(min_width=30)
+    table.add_column(min_width=24)
     table.add_column()
 
     for index, disk in enumerate(disks, 1):
