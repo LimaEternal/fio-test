@@ -6,9 +6,11 @@ fio-test.py — Автоматический бенчмаркинг несист
 и выводит результаты в реальном времени через rich, а по завершении — в MD-отчёт.
 
 Использование:
-    python fio-test.py
-    python fio-test.py --precond
-    python fio-test.py --output report.md
+    python fio-test.py              — сканирование (dry-run)
+    python fio-test.py -c           — тестирование
+    python fio-test.py -c -p        — с прекондишнингом
+    python fio-test.py -c -r 60     — 60 сек на тест
+    python fio-test.py -c -o my.md  — свой путь отчёта
 """
 
 import argparse
@@ -22,7 +24,7 @@ from rich.table import Table
 
 from configs import nvme, sas, sata
 from utils.reporter import generate_report
-from utils.scanner import get_non_system_disks
+from utils.scanner import scan_disks
 
 console = Console()
 
@@ -51,15 +53,23 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Примеры:\n"
-            "  python fio-test.py                  — базовое тестирование\n"
-            "  python fio-test.py --precond         — с прекондишнингом\n"
-            "  python fio-test.py --output my.md    — свой путь для отчёта\n"
-            "  python fio-test.py --threshold-nvme 2000,1500,100000,80000\n"
+            "  python fio-test.py                  — сканирование (dry-run)\n"
+            "  python fio-test.py -c               — тестирование\n"
+            "  python fio-test.py -c -p             — с прекондишнингом\n"
+            "  python fio-test.py -c -r 60          — 60 сек на тест\n"
+            "  python fio-test.py -c -o my.md       — свой путь отчёта\n"
+            "  python fio-test.py -c --threshold-nvme 5000,3000,500000,200000\n"
         ),
     )
 
     parser.add_argument(
-        "--precond",
+        "-c", "--confirm",
+        action="store_true",
+        help="Подтвердить запуск тестов. Без этого флага скрипт только покажет диски и выйдет.",
+    )
+
+    parser.add_argument(
+        "-p", "--precond",
         action="store_true",
         help=(
             "Выполнить прекондишнинг (запись 100%% объёма диска перед тестами). "
@@ -69,14 +79,14 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--output",
+        "-o", "--output",
         type=str,
         default=None,
         help="Путь для MD-отчёта (по умолчанию: reports/fio_report_<timestamp>.md)",
     )
 
     parser.add_argument(
-        "--runtime",
+        "-r", "--runtime",
         type=int,
         default=30,
         help="Длительность каждого теста в секундах (по умолчанию: 30)",
@@ -396,8 +406,21 @@ def main() -> None:
     if args.threshold_sata:
         thresholds["SATA"] = parse_custom_thresholds(args.threshold_sata)
 
-    console.print("[bold blue]Сканирование системы на несистемные диски...[/bold blue]")
-    disks = get_non_system_disks(INTERFACE_CONFIGS)
+    console.print("[bold blue]Сканирование системы на несистемные диски...[/bold blue]\n")
+    system_disks, disks = scan_disks(INTERFACE_CONFIGS)
+
+    if system_disks:
+        console.print("[bold yellow]Системные диски (пропуск):[/bold yellow]")
+        for d in system_disks:
+            slot_str = f", Slot: {d['slot']}" if d.get("slot") else ""
+            console.print(
+                f"  [yellow]/dev/{d['name']}[/yellow] — {d['model']} "
+                f"({d['tran']}, SN: {d['serial']}{slot_str})"
+            )
+            console.print(
+                f"    └─ [red]/[/red] (корневая ФС)"
+            )
+        console.print()
 
     if not disks:
         console.print(
@@ -406,16 +429,21 @@ def main() -> None:
         sys.exit(1)
 
     console.print(
-        f"Обнаружено целевых дисков: [bold green]{len(disks)}[/bold green]\n"
+        f"[bold green]Целевые диски:[/bold green]"
     )
-
     for i, d in enumerate(disks, 1):
         slot_str = f", Slot: {d['slot']}" if d.get("slot") else ""
         console.print(
             f"  [cyan]{i}. /dev/{d['name']}[/cyan] — {d['model']} "
-            f"([white]{d['tran']}[/white], SN: [white]{d['serial']}[/white]{slot_str})"
+            f"({d['tran']}, SN: {d['serial']}{slot_str})"
         )
     console.print()
+
+    if not args.confirm:
+        console.print(
+            "[yellow]Для запуска тестов добавьте -c (--confirm)[/yellow]"
+        )
+        sys.exit(0)
 
     if args.precond:
         console.print(
