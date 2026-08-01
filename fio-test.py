@@ -25,11 +25,11 @@ import sys
 import threading
 
 from rich.console import Console
-from rich.table import Table
 
 from configs import nvme, sas, sata
 from utils.reporter import generate_report
 from utils.scanner import scan_disks
+from utils.table_renderer import build_results_table
 
 console = Console(color_system=None, highlight=False)
 
@@ -391,77 +391,6 @@ def optimize_nvme_args(test_id, args_list, pcie_info):
 
 
 
-def _status_style(status):
-    """Форматирует статус теста тегами rich."""
-    if status == "done":
-        return "[bold green]done[/bold green]"
-    return "[bold red]undone[/bold red]"
-
-
-def build_results_table(disks, results):
-    """Строит таблицу результатов с внешней таблицей и внутренними таблицами по дискам."""
-    from rich.box import ROUNDED, SIMPLE
-
-    outer = Table(
-        show_header=True,
-        box=ROUNDED,
-    )
-    outer.add_column("№", justify="right", style="bold", width=4)
-    outer.add_column("Накопитель", min_width=30)
-    outer.add_column("Результаты тестирования накопителей (FIO)", min_width=70)
-
-    for idx, disk in enumerate(disks, 1):
-        disk_name = disk["name"]
-        model = disk.get("model", "N/A").strip()
-        tran = disk.get("tran", "N/A")
-        serial = disk.get("serial", "N/A").strip()
-        slot = disk.get("slot", "N/A")
-        size = disk.get("size", "N/A")
-
-        disk_lines = [
-            f"/dev/{disk_name}",
-            model,
-            tran,
-            f"SN: {serial}",
-            f"Slot: {slot}",
-            f"Размер: {size}",
-        ]
-        disk_info_text = "\n".join(disk_lines)
-
-        inner = Table(box=SIMPLE, show_header=True, show_edge=False)
-        inner.add_column("Профиль теста", min_width=18)
-        inner.add_column("Блок", justify="center")
-        inner.add_column("IOPS", justify="right")
-        inner.add_column("Скорость (МБ/с)", justify="right")
-        inner.add_column("Lat Avg (мс)", justify="right")
-        inner.add_column("Lat P99 (мс)", justify="right")
-        inner.add_column("Статус", justify="center")
-
-        disk_results = results[idx - 1] if idx - 1 < len(results) else {}
-        test_order = ["seq_read", "seq_write", "rand_read", "rand_write"]
-        for test_id in test_order:
-            res = disk_results.get(test_id, {})
-            test_name = TEST_NAMES.get(test_id, test_id)
-            if "error" in res:
-                inner.add_row(
-                    test_name, "—", "—", "—", "—", "—", _status_style("undone"),
-                )
-            else:
-                iops = f"{res.get('iops', 0):,.0f}"
-                bw = f"{res.get('bw_mb', 0):.1f}"
-                lat_avg = f"{res.get('lat_avg', 0):.2f}"
-                lat_p99 = f"{res.get('lat_p99', 0):.2f}"
-                status = res.get("status", "undone")
-                inner.add_row(
-                    test_name, res.get("bs", "4k"), iops, bw, lat_avg, lat_p99,
-                    _status_style(status),
-                )
-
-        outer.add_row(str(idx), disk_info_text, inner)
-
-    return outer
-
-
 def process_task_result(results, idx, disk, t, fio_args, res):
     """Обрабатывает результат задачи и записывает его в общий словарь результатов."""
     bs = "4k"
@@ -624,7 +553,7 @@ def main():
             pool.shutdown(wait=False, cancel_futures=True)
 
     # Вывод результатов
-    table = build_results_table(disks, results)
+    table = build_results_table(disks, results, TEST_NAMES, gap=0)
     console.print()
     console.print(table)
 
