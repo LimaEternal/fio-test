@@ -6,12 +6,13 @@ fio-test.py — Автоматический бенчмаркинг несист
 и выводит результаты в консоль + MD-отчёт.
 
 Использование:
-    python fio-test.py              — сканирование (dry-run)
-    python fio-test.py -c           — тестирование
-    python fio-test.py -c -p        — с прекондишнингом
-    python fio-test.py -c -s        — последовательный режим
-    python fio-test.py -c -r 60     — 60 сек на тест
-    python fio-test.py -c -o my.md  — свой путь отчёта
+    python fio-test.py              — тестирование (параллельно)
+    python fio-test.py -s           — тестирование (последовательно)
+    python fio-test.py -c           — тестирование с подтверждением
+    python fio-test.py -c -s        — с подтверждением, последовательно
+    python fio-test.py -c -p        — с подтверждением и прекондишнингом
+    python fio-test.py -r 60        — 60 сек на тест
+    python fio-test.py -o my.md     — свой путь отчёта
 """
 
 import argparse
@@ -71,19 +72,20 @@ def parse_args():
         description="Тестирование производительности NVMe/SAS/SATA накопителей через fio",
         epilog=(
             "Примеры:\n"
-            "  python fio-test.py                           — dry-run (сканирование)\n"
-            "  python fio-test.py -c                        — запуск тестов\n"
-            "  python fio-test.py -c -s                     — последовательный режим (для VM)\n"
-            "  python fio-test.py -c -p                     — с прекондишнингом\n"
-            "  python fio-test.py -c -r 60                  — 60 секунд на каждый тест\n"
-            "  python fio-test.py -c -o reports/custom.md   — свой путь отчёта\n"
+            "  python fio-test.py                           — тестирование (параллельно)\n"
+            "  python fio-test.py -s                        — тестирование (последовательно)\n"
+            "  python fio-test.py -c                        — с подтверждением перед стартом\n"
+            "  python fio-test.py -c -s                     — с подтверждением, последовательно\n"
+            "  python fio-test.py -c -p                     — с подтверждением и прекондишнингом\n"
+            "  python fio-test.py -r 60                     — 60 секунд на каждый тест\n"
+            "  python fio-test.py -o reports/custom.md       — свой путь отчёта\n"
             "  python fio-test.py -c --threshold-nvme \"seq_read=15000:seq_write=12000\""
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "-c", "--confirm", action="store_true",
-        help="Запуск тестов; без этого флага — dry-run",
+        help="Запрос подтверждения перед стартом тестов",
     )
     parser.add_argument(
         "-s", "--sequential", action="store_true",
@@ -523,28 +525,24 @@ def main():
         model = d.get("model", "N/A").strip()
         console.print(f"  [green]{i}. /dev/{name}[/green] {model}")
 
-    if not args.confirm:
-        console.print(
-            "\n[bold yellow]Режим dry-run.[/bold yellow] "
-            "Используйте флаг -c для запуска тестов."
-        )
-        sys.exit(0)
-
     if not disks:
         console.print("[bold yellow]Целевые диски не найдены.[/bold yellow]")
         sys.exit(0)
 
-    # Интерактивное подтверждение
-    target_names = ", ".join(f"/dev/{d['name']}" for d in disks)
-    console.print(f"\n[bold yellow]Будут протестированы:[/bold yellow] {target_names}")
-    try:
-        answer = input("Начать тестирование? [y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[bold yellow]Отменено.[/bold yellow]")
-        sys.exit(0)
-    if answer not in ("y", "yes", "д", "да"):
-        console.print("[bold yellow]Отменено пользователем.[/bold yellow]")
-        sys.exit(0)
+    mode = "sequential" if args.sequential else "parallel"
+    console.print(f"\n[bold]Режим: {mode}[/bold]")
+
+    if args.confirm:
+        target_names = ", ".join(f"/dev/{d['name']}" for d in disks)
+        console.print(f"\n[bold yellow]Будут протестированы:[/bold yellow] {target_names}")
+        try:
+            answer = input("Начать тестирование? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[bold yellow]Отменено.[/bold yellow]")
+            sys.exit(0)
+        if answer not in ("y", "yes", "д", "да"):
+            console.print("[bold yellow]Отменено пользователем.[/bold yellow]")
+            sys.exit(0)
 
     cancel_event = threading.Event()
 
@@ -562,9 +560,6 @@ def main():
 
     if args.runtime != 30:
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")
-
-    mode = "sequential" if args.sequential else "parallel"
-    console.print(f"\n[bold]Режим: {mode}[/bold]")
 
     # Подготовка задач
     results = [{} for _ in disks]
