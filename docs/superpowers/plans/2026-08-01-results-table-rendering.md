@@ -1,125 +1,73 @@
-# Results Table Rendering Implementation Plan
+# Flat Results Hypertable Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Вывести каждый накопитель отдельной таблицей с собственной шапкой, без промежутков между таблицами, и вынести представление в `utils`.
+**Goal:** Заменить отдельные и вложенные таблицы дисков одной плоской таблицей с повторяемыми строками названий колонок.
 
-**Architecture:** Новый модуль `utils/table_renderer.py` получает уже подготовленные диски, результаты и отображаемые имена тестов. Он строит паспорт, вложенную таблицу тестов, блок одного диска и итоговую группу Rich; `fio-test.py` только вызывает публичную функцию.
+**Architecture:** `utils/table_renderer.py` строит одну внешнюю Rich `Table` без стандартной шапки. Каждый диск добавляется одной многострочной строкой: первая визуальная строка каждой ячейки содержит название колонки, последующие строки — паспорт и произвольное количество тестов.
 
-**Tech Stack:** Python 3.8+, Rich, стандартный `unittest`.
+**Tech Stack:** Python, Rich, стандартный `unittest`.
 
 ## Global Constraints
 
-- Каждый диск имеет собственную шапку `№ | Накопитель | Результаты тестирования накопителя (FIO)`.
-- Блоки дисков выводятся подряд без пустой строки; промежуток задаётся одним параметром.
-- Цвет применяется только к `done` и `undone`.
-- Форматы значений, порядок тестов и Markdown-отчёт не меняются.
+- Во всём выводе должна быть одна внешняя рамка и ни одной вложенной таблицы.
+- Общая плашка или заголовок отсутствует.
+- Названия всех девяти колонок повторяются перед каждым диском.
+- Между дисками нет пустых строк и горизонтальных секционных линий.
+- Количество результатов тестов определяется входным словарём, а не фиксированной четвёркой.
+- Цвет используется только для `done` и `undone`.
+- Сканирование, запуск FIO и Markdown-отчёт не изменяются.
 
 ---
 
-### Task 1: Модуль отрисовки
+### Task 1: Плоский динамический рендерер
 
 **Files:**
-- Create: `utils/table_renderer.py`
-- Create: `tests/test_table_renderer.py`
+- Modify: `utils/table_renderer.py`
+- Modify: `tests/test_table_renderer.py`
+- Modify: `fio-test.py`
 
 **Interfaces:**
-- Consumes: `disks: list[dict]`, `results: list[dict]`, `test_names: dict[str, str]`.
-- Produces: `build_results_table(disks, results, test_names, gap=0)` — Rich renderable с отдельным блоком на диск.
+- Consumes: `build_results_table(disks, results, test_names)`.
+- Produces: одна Rich `Table`; порядок тестов берётся из ключей `test_names`, присутствующих в результатах, с сохранением порядка отображаемых имён.
 
-- [ ] **Step 1: Написать падающие тесты публичного рендера и статусов**
+- [ ] **Step 1: Заменить ожидания тестов на поведение плоской таблицы**
 
-```python
-from rich.console import Console
-from utils.table_renderer import build_results_table, format_status
-
-def render(renderable):
-    console = Console(file=StringIO(), width=140, color_system=None)
-    console.print(renderable)
-    return console.file.getvalue()
-
-def test_each_disk_has_own_header_and_blocks_have_no_blank_line():
-    output = render(build_results_table(DISKS, RESULTS, TEST_NAMES))
-    assert output.count("Результаты тестирования накопителя (FIO)") == 2
-    lines = output.splitlines()
-    first_bottom = next(i for i, line in enumerate(lines) if i > 0 and line.startswith("╰"))
-    assert lines[first_bottom + 1].startswith("╭")
-
-def test_only_status_values_are_styled():
-    assert format_status("done").style == "bold green"
-    assert format_status("undone").style == "bold red"
-```
+Добавить проверки текстового рендера: одна верхняя и нижняя граница, `Профиль теста` встречается по одному разу на диск, между последним результатом первого диска и шапкой второго нет пустой строки или рамки. Добавить пятый тест в fixture и проверить его присутствие, чтобы рендер не зависел от четырёх фиксированных ID.
 
 - [ ] **Step 2: Запустить тесты и подтвердить ожидаемое падение**
 
 Run: `python -m unittest tests.test_table_renderer -v`
 
-Expected: `ModuleNotFoundError: No module named 'utils.table_renderer'`.
+Expected: FAIL — текущий рендер создаёт отдельную верхнюю и нижнюю рамку для каждого диска и вложенную таблицу результатов.
 
-- [ ] **Step 3: Реализовать минимальный модуль**
+- [ ] **Step 3: Реализовать одну таблицу из многострочных ячеек**
 
-Создать функции `format_status`, `build_disk_info`, `build_test_results_table`, `build_disk_table` и `build_results_table`. Для каждой внешней таблицы использовать `box=ROUNDED`, `header_style=None`; для вложенной — рамку с видимой шапкой. Итог собирать через `Group`, а при `gap > 0` вставлять `Text("\n" * gap)` между блоками.
+Удалить `build_test_results_table`, `build_disk_table`, `Group` и параметр `gap`. Добавить функции построения простых и статусных многострочных `Text`; создать одну `Table(show_header=False, box=ROUNDED, expand=True)`. На каждый диск добавлять одну строку из девяти ячеек, где первая строка — название колонки, затем данные.
 
-- [ ] **Step 4: Запустить тесты до зелёного результата**
-
-Run: `python -m unittest tests.test_table_renderer -v`
-
-Expected: все тесты `OK`.
-
-- [ ] **Step 5: Проверить модуль статически**
-
-Run: `python -m py_compile utils/table_renderer.py tests/test_table_renderer.py`
-
-Expected: код возврата `0`, вывода нет.
-
-### Task 2: Подключение к точке входа
-
-**Files:**
-- Modify: `fio-test.py:20-45,390-465`
-- Modify: `tests/test_table_renderer.py`
-
-**Interfaces:**
-- Consumes: `utils.table_renderer.build_results_table(disks, results, TEST_NAMES, gap=0)`.
-- Produces: прежний вызов `console.print(table)` без локальной логики построения таблиц.
-
-- [ ] **Step 1: Добавить падающий тест отсутствия дублирующей реализации**
+- [ ] **Step 4: Обновить вызов точки входа**
 
 ```python
-def test_entrypoint_uses_shared_renderer():
-    source = Path("fio-test.py").read_text(encoding="utf-8")
-    assert "from utils.table_renderer import build_results_table" in source
-    assert "def build_results_table(" not in source
+table = build_results_table(disks, results, TEST_NAMES)
 ```
 
-- [ ] **Step 2: Запустить тест и подтвердить ожидаемое падение**
-
-Run: `python -m unittest tests.test_table_renderer.TableRendererTests.test_entrypoint_uses_shared_renderer -v`
-
-Expected: FAIL, потому что функция пока определена в `fio-test.py`.
-
-- [ ] **Step 3: Подключить модуль и удалить локальную отрисовку**
-
-Добавить импорт `from utils.table_renderer import build_results_table`, удалить импорт `Table`, локальные `_status_style` и `build_results_table`, а вызов заменить на:
-
-```python
-table = build_results_table(disks, results, TEST_NAMES, gap=0)
-```
-
-- [ ] **Step 4: Запустить весь набор тестов**
+- [ ] **Step 5: Запустить полный набор тестов**
 
 Run: `python -m unittest discover -s tests -v`
 
 Expected: все тесты `OK`.
 
-- [ ] **Step 5: Проверить синтаксис всего проекта**
+- [ ] **Step 6: Проверить синтаксис и фактический рендер**
 
 Run: `python -m compileall -q fio-test.py configs utils tests`
 
-Expected: код возврата `0`, вывода нет.
+Expected: код возврата `0`. Затем отрендерить fixture из трёх дисков при ширине 150 символов и визуально подтвердить отсутствие вложенных рамок, горизонтальных секций и промежутков.
 
-- [ ] **Step 6: Просмотреть текстовый рендер двух дисков**
+- [ ] **Step 7: Закоммитить, слить в main и отправить**
 
-Run: `python -m unittest tests.test_table_renderer.TableRendererTests.test_each_disk_has_own_header_and_blocks_have_no_blank_line -v`
-
-Expected: `OK`; обе шапки присутствуют, нижняя рамка первого блока непосредственно соседствует с верхней рамкой второго.
-
+```bash
+git add fio-test.py utils/table_renderer.py tests/test_table_renderer.py docs/superpowers/plans/2026-08-01-results-table-rendering.md
+git commit -m "fix: сделать таблицу результатов плоской"
+git merge --ff-only codex/flat-results-table
+git push origin main
+```
