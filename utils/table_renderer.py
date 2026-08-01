@@ -6,6 +6,7 @@ from rich.text import Text
 
 
 COLUMN_HEADERS = (
+    "№",
     "Накопитель",
     "Профиль теста",
     "Блок",
