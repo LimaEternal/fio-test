@@ -17,8 +17,11 @@ fio-test.py — Автоматический бенчмаркинг несист
 import argparse
 import concurrent.futures
 import json
+import os
+import signal
 import subprocess
 import sys
+import threading
 
 from rich.console import Console
 from rich.table import Table
@@ -206,8 +209,8 @@ def validate_configs():
             sys.exit(1)
 
 
-def run_fio_test(disk_info, test_id, base_args):
-    """Запускает fio-тест и возвращает результат или словарь с ошибкой."""
+def run_fio_test(disk_info, test_id, base_args, cancel_event=None):
+    """Запускает fio-тест. Поддерживает отмену через cancel_event."""
     disk_path = disk_info["path"]
     fio_args = list(base_args)
     cmd = [
@@ -221,21 +224,45 @@ def run_fio_test(disk_info, test_id, base_args):
         "--output-format=json",
     ] + fio_args
 
+    proc = None
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,
         )
+        while proc.poll() is None:
+            if cancel_event and cancel_event.is_set():
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+                return {"error": "Тест отменён пользователем"}
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                continue
+
+        stdout, stderr = proc.communicate()
+        stdout = stdout.decode() if stdout else ""
+        stderr = stderr.decode() if stderr else ""
+
     except FileNotFoundError:
         return {"error": "Утилита fio не найдена. Установите fio и повторите попытку."}
     except Exception as exc:
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         return {"error": str(exc)}
 
-    if result.returncode != 0:
-        hint = (result.stderr or "").strip()[:200]
-        return {"error": f"fio завершился с кодом {result.returncode}: {hint}"}
+    if proc.returncode != 0:
+        hint = stderr.strip()[:200] if stderr else ""
+        return {"error": f"fio завершился с кодом {proc.returncode}: {hint}"}
 
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(stdout)
     except json.JSONDecodeError as exc:
         return {"error": f"Ошибка разбора JSON: {exc}"}
 
@@ -258,7 +285,7 @@ def run_fio_test(disk_info, test_id, base_args):
     return {"iops": iops, "bw_mb": bw_mb, "lat_avg": lat_avg, "lat_p99": lat_p99}
 
 
-def run_precondition(disk_info):
+def run_precondition(disk_info, cancel_event=None):
     """Запускает прекондишнинг (полная запись) диска. Возвращает True при успехе."""
     disk_path = disk_info["path"]
     cmd = [
@@ -274,12 +301,31 @@ def run_precondition(disk_info):
         "--group_reporting",
         "--output-format=json",
     ]
+    proc = None
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,
         )
-        return result.returncode == 0
+        while proc.poll() is None:
+            if cancel_event and cancel_event.is_set():
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+                return False
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                continue
+        return proc.returncode == 0
     except Exception:
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         return False
 
 
@@ -484,13 +530,31 @@ def main():
         )
         sys.exit(0)
 
+    if not disks:
+        console.print("[bold yellow]Целевые диски не найдены.[/bold yellow]")
+        sys.exit(0)
+
+    # Интерактивное подтверждение
+    target_names = ", ".join(f"/dev/{d['name']}" for d in disks)
+    console.print(f"\n[bold yellow]Будут протестированы:[/bold yellow] {target_names}")
+    try:
+        answer = input("Начать тестирование? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[bold yellow]Отменено.[/bold yellow]")
+        sys.exit(0)
+    if answer not in ("y", "yes", "д", "да"):
+        console.print("[bold yellow]Отменено пользователем.[/bold yellow]")
+        sys.exit(0)
+
+    cancel_event = threading.Event()
+
     # Прекондишнинг
     if args.precond:
         console.print("\n[bold]Прекондишнинг...[/bold]")
         for d in disks:
             name = d["name"]
             console.print(f"  Прекондишнинг /dev/{name}...")
-            ok = run_precondition(d)
+            ok = run_precondition(d, cancel_event=cancel_event)
             if ok:
                 console.print(f"  [green]Готово[/green] /dev/{name}")
             else:
@@ -537,22 +601,34 @@ def main():
 
     # Запуск тестов
     if args.sequential:
-        for disk_idx, disk, t, fio_args in tasks:
-            name = disk["name"]
-            console.print(f"  {name}/{t}...")
-            res = run_fio_test(disk, t, fio_args)
-            process_task_result(results, disk_idx, disk, t, fio_args, res)
+        try:
+            for disk_idx, disk, t, fio_args in tasks:
+                name = disk["name"]
+                console.print(f"  {name}/{t}...")
+                res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event)
+                process_task_result(results, disk_idx, disk, t, fio_args, res)
+        except KeyboardInterrupt:
+            cancel_event.set()
+            console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
+            sys.exit(130)
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        try:
             future_map = {}
             for disk_idx, disk, t, fio_args in tasks:
-                fut = pool.submit(run_fio_test, disk, t, fio_args)
+                fut = pool.submit(run_fio_test, disk, t, fio_args, cancel_event=cancel_event)
                 future_map[fut] = (disk_idx, disk, t, fio_args)
 
             for fut in concurrent.futures.as_completed(future_map):
                 disk_idx, disk, t, fio_args = future_map[fut]
                 res = fut.result()
                 process_task_result(results, disk_idx, disk, t, fio_args, res)
+        except KeyboardInterrupt:
+            cancel_event.set()
+            console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
+            sys.exit(130)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     # Вывод результатов
     table = build_results_table(disks, results)
