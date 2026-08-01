@@ -4,3 +4,4 @@ venv
 tools
 nvk
 reports/
+.worktrees/
