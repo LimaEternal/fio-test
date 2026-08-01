@@ -94,6 +94,7 @@ def build_results_table(disks, results, test_names):
         box=box.ROUNDED,
         expand=True,
         show_header=False,
+        show_lines=True,
         border_style="",
         padding=(0, 1),
     )
