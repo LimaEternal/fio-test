@@ -88,16 +88,17 @@ def load_entrypoint():
 
 
 class TableRendererTests(unittest.TestCase):
-    def test_single_outer_table_with_heavy_head_and_section_between_disks(self):
+    def test_single_outer_table_with_simple_box_and_section_between_disks(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 
         lines = output.splitlines()
-        self.assertEqual(sum(line.startswith("┏") for line in lines), 1)
-        self.assertEqual(sum(line.startswith("└") for line in lines), 1)
-        self.assertFalse(any(line.startswith("┡") for line in lines))
-        sections = [line for line in lines if line.startswith("├")]
-        self.assertEqual(len(sections), 1)
-        self.assertIn("┼", sections[0])
+        self.assertEqual(sum(line.startswith("╭") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("╰") for line in lines), 1)
+        self.assertFalse(any(line.startswith("┏") for line in lines))
+        separators = [line for line in lines if line.startswith("├")]
+        self.assertEqual(len(separators), 2)  # под шапкой + между дисками
+        for separator in separators:
+            self.assertIn("┼", separator)
 
     def test_numeric_result_columns_are_centered_under_headers(self):
         columns = {header: justify for header, justify, _ in RESULT_HEADERS}
@@ -184,7 +185,7 @@ class TableRendererTests(unittest.TestCase):
             entrypoint.build_results_table(DISKS, RESULTS, TEST_NAMES)
         )
 
-        self.assertEqual(output.count("┏"), 1)
+        self.assertEqual(output.count("╭"), 1)
         self.assertEqual(output.count("Профиль теста"), 2)
 
     def test_only_status_values_receive_color_styles(self):

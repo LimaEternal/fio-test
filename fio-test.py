@@ -558,7 +558,8 @@ def main():
     console.print()
     console.print(table)
 
-    generate_report(disks, results, TEST_NAMES, output_path=args.output)
+    report_path = generate_report(disks, results, TEST_NAMES, output_path=args.output)
+    console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
 
 
 if __name__ == "__main__":
