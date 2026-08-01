@@ -48,6 +48,21 @@ INTERFACE_THRESHOLDS = {
 }
 
 
+_SHORT_FLAGS = {"c", "s", "p"}
+
+
+def _expand_short_flags(argv: list[str]) -> list[str]:
+    """Расширяет комбинированные короткие флаги: -sc → -s -c, -cp → -c -p."""
+    expanded = []
+    for arg in argv:
+        if len(arg) > 2 and arg.startswith("-") and not arg.startswith("--") and all(ch in _SHORT_FLAGS for ch in arg[1:]):
+            for ch in arg[1:]:
+                expanded.append(f"-{ch}")
+        else:
+            expanded.append(arg)
+    return expanded
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Тестирование производительности NVMe/SAS/SATA накопителей через fio",
@@ -95,7 +110,7 @@ def parse_args():
         "--threshold-sata", type=str, default=None,
         help="Пороговые значения SATA (формат: seq_read=400:rand_read=10000)",
     )
-    return parser.parse_args()
+    return parser.parse_args(_expand_short_flags(sys.argv[1:]))
 
 
 def check_threshold(test_id, res, thresholds):
