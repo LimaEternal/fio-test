@@ -133,7 +133,7 @@ class TableRendererTests(unittest.TestCase):
 
     def test_long_test_names_fold_to_several_lines(self):
         output = render_table(
-            build_results_table(DISKS, RESULTS, TEST_NAMES), width=110
+            build_results_table(DISKS, RESULTS, TEST_NAMES), width=100
         )
 
         lines = output.splitlines()

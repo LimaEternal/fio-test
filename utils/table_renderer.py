@@ -92,14 +92,13 @@ def build_results_table(disks, results, test_names):
     """Строит одну непрерывную таблицу для всех накопителей."""
     table = Table(
         box=box.HEAVY_HEAD,
-        expand=True,
         show_header=True,
         header_style="",
         border_style="",
         padding=(0, 1),
     )
-    table.add_column(header="\n№\n", justify="center", width=4)
-    table.add_column(header="\nНакопитель\n", min_width=24)
+    table.add_column(header="\n№\n", justify="center", width=3)
+    table.add_column(header="\nНакопитель\n", min_width=16, overflow="fold")
     table.add_column(header=f"\n{TITLE}\n")
 
     for index, disk in enumerate(disks, 1):
