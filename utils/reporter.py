@@ -15,6 +15,16 @@ def _strip_rich(text: str) -> str:
     return re.sub(r"\[.*?\]", "", text)
 
 
+TEST_NAMES = {
+    "seq_read": "1. Послед. Чтение",
+    "seq_write": "2. Послед. Запись",
+    "rand_read": "3. Случ. Чтение 4k",
+    "rand_write": "4. Случ. Запись 4k",
+}
+
+TEST_ORDER = ["seq_read", "seq_write", "rand_read", "rand_write"]
+
+
 def generate_report(
     disks: List[dict],
     results: List[dict],
@@ -25,7 +35,7 @@ def generate_report(
 
     Параметры:
         disks       — список словарей с данными дисков
-        results     — список словарей с результатами тестов
+        results     — список словарей с результатами тестов (по одному на диск)
         output_path — путь для выходного файла (по умолчанию fio_report_<timestamp>.md)
 
     Возвращает:
@@ -43,15 +53,15 @@ def generate_report(
 
         lines = []
 
-        lines.append("# Отчёт тестирования накопителей (FIO)")
+        lines.append("# Результаты тестирования накопителей (FIO)")
         lines.append("")
         lines.append(f"> Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("")
 
         lines.append("## Обнаруженные диски")
         lines.append("")
-        lines.append("| Диск | Модель | Серийный номер | Интерфейс / Шина | Объём | Физ. сектор |")
-        lines.append("|------|--------|----------------|------------------|-------|-------------|")
+        lines.append("| Диск | Модель | Серийный номер | Интерфейс | Объём |")
+        lines.append("|------|--------|----------------|-----------|-------|")
 
         for d in disks:
             pcie_str = ""
@@ -60,48 +70,44 @@ def generate_report(
 
             lines.append(
                 f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
-                f"| {d['tran']}{pcie_str} | {d['size']} | {d['phy_sec']}B |"
+                f"| {d['tran']}{pcie_str} | {d['size']} |"
             )
 
         lines.append("")
         lines.append("## Результаты тестирования")
         lines.append("")
 
-        current_disk = None
+        for idx, (disk, disk_results) in enumerate(zip(disks, results), 1):
+            lines.append(f"### {idx}. /dev/{disk['name']} ({disk['model']})")
+            lines.append("")
+            lines.append(
+                "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat P99 (мс) | Статус |"
+            )
+            lines.append(
+                "|---------------|------|------|-----------------|--------------|--------------|--------|"
+            )
 
-        for r in results:
-            disk_key = r["disk"]
+            for test_id in TEST_ORDER:
+                res = disk_results.get(test_id, {})
+                test_name = TEST_NAMES.get(test_id, test_id)
 
-            if disk_key != current_disk:
-                current_disk = disk_key
-                lines.append(f"### /dev/{disk_key} ({r['model']})")
-                lines.append("")
-                lines.append(
-                    "| Тест | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat p99 (мс) | Статус |"
-                )
-                lines.append(
-                    "|------|------|------|-----------------|--------------|--------------|--------|"
-                )
+                if "error" in res:
+                    lines.append(
+                        f"| {test_name} | {res.get('bs', '—')} | — | — | — | — | undone |"
+                    )
+                else:
+                    iops = f"{res.get('iops', 0):,.0f}"
+                    bw = f"{res.get('bw_mb', 0):.1f}"
+                    lat_avg = f"{res.get('lat_avg', 0):.2f}"
+                    lat_p99 = f"{res.get('lat_p99', 0):.2f}"
+                    status = res.get("status", "undone")
+                    lines.append(
+                        f"| {test_name} | {res.get('bs', '4k')} | {iops} | {bw} "
+                        f"| {lat_avg} | {lat_p99} | {status} |"
+                    )
 
-            status_label = r.get("status", "...")
-            if status_label == "done":
-                status_display = "done"
-            elif status_label == "undone":
-                status_display = "undone"
-            else:
-                status_display = status_label
+            lines.append("")
 
-            if "ERR" in str(r.get("iops", "")):
-                lines.append(
-                    f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | — | — | — | — | {status_display} |"
-                )
-            else:
-                lines.append(
-                    f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | {r['iops']} | {r['bw']} "
-                    f"| {r['lat_avg']} | {r['lat_p99']} | {status_display} |"
-                )
-
-        lines.append("")
         lines.append("---")
         lines.append("*Отчёт сгенерирован автоматически*")
 

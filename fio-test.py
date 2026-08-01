@@ -39,6 +39,11 @@ INTERFACE_CONFIGS = {
     "sata": sata.TESTS,
 }
 
+TEST_NAMES = {}
+for _mod in [nvme, sas, sata]:
+    for _test in _mod.TESTS:
+        TEST_NAMES[_test["id"]] = _test["name"]
+
 INTERFACE_DESCRIPTIONS = {
     "nvme": nvme.DESCRIPTION,
     "sas": sas.DESCRIPTION,
@@ -385,11 +390,6 @@ def optimize_nvme_args(test_id, args_list, pcie_info):
     return new_args
 
 
-try:
-    from rich.box import SIMPLE as _HLINE_BOX
-except ImportError:
-    _HLINE_BOX = None
-
 
 def _status_style(status):
     """Форматирует статус теста тегами rich."""
@@ -400,13 +400,15 @@ def _status_style(status):
 
 def build_results_table(disks, results):
     """Строит таблицу результатов с внешней таблицей и внутренними таблицами по дискам."""
+    from rich.box import ROUNDED, SIMPLE
+
     outer = Table(
         show_header=True,
-        box=None,
+        box=ROUNDED,
     )
-    outer.add_column("№", justify="right", style="bold")
+    outer.add_column("№", justify="right", style="bold", width=4)
     outer.add_column("Накопитель", min_width=30)
-    outer.add_column("Результаты тестирования", min_width=70)
+    outer.add_column("Результаты тестирования накопителей (FIO)", min_width=70)
 
     for idx, disk in enumerate(disks, 1):
         disk_name = disk["name"]
@@ -416,44 +418,42 @@ def build_results_table(disks, results):
         slot = disk.get("slot", "N/A")
         size = disk.get("size", "N/A")
 
-        pcie_info = disk.get("pcie_info") or {}
-        pcie_str = ""
-        gen = pcie_info.get("gen")
-        width = pcie_info.get("width")
-        if gen and width:
-            pcie_str = f"PCIe Gen{gen} x{width}"
+        disk_lines = [
+            f"/dev/{disk_name}",
+            model,
+            tran,
+            f"SN: {serial}",
+            f"Slot: {slot}",
+            f"Размер: {size}",
+        ]
+        disk_info_text = "\n".join(disk_lines)
 
-        disk_info_text = (
-            f"/dev/{disk_name} | {model} | {tran}"
-            + (f" ({pcie_str})" if pcie_str else "")
-            + f" | SN: {serial} | Slot: {slot} | {size}"
-        )
-
-        inner = Table(box=_HLINE_BOX, show_header=True, show_edge=False)
-        inner.add_column("Тест")
-        inner.add_column("Блок")
+        inner = Table(box=SIMPLE, show_header=True, show_edge=False)
+        inner.add_column("Профиль теста", min_width=18)
+        inner.add_column("Блок", justify="center")
         inner.add_column("IOPS", justify="right")
-        inner.add_column("Скорость", justify="right")
-        inner.add_column("Lat Avg", justify="right")
-        inner.add_column("Lat P99", justify="right")
+        inner.add_column("Скорость (МБ/с)", justify="right")
+        inner.add_column("Lat Avg (мс)", justify="right")
+        inner.add_column("Lat P99 (мс)", justify="right")
         inner.add_column("Статус", justify="center")
 
         disk_results = results[idx - 1] if idx - 1 < len(results) else {}
         test_order = ["seq_read", "seq_write", "rand_read", "rand_write"]
         for test_id in test_order:
             res = disk_results.get(test_id, {})
+            test_name = TEST_NAMES.get(test_id, test_id)
             if "error" in res:
                 inner.add_row(
-                    test_id, "—", "—", "—", "—", "—", _status_style("undone"),
+                    test_name, "—", "—", "—", "—", "—", _status_style("undone"),
                 )
             else:
-                iops = f"{res.get('iops', 0):.0f}"
-                bw = f"{res.get('bw_mb', 0):.1f} MB/s"
-                lat_avg = f"{res.get('lat_avg', 0):.2f} ms"
-                lat_p99 = f"{res.get('lat_p99', 0):.2f} ms"
+                iops = f"{res.get('iops', 0):,.0f}"
+                bw = f"{res.get('bw_mb', 0):.1f}"
+                lat_avg = f"{res.get('lat_avg', 0):.2f}"
+                lat_p99 = f"{res.get('lat_p99', 0):.2f}"
                 status = res.get("status", "undone")
                 inner.add_row(
-                    test_id, res.get("bs", "4k"), iops, bw, lat_avg, lat_p99,
+                    test_name, res.get("bs", "4k"), iops, bw, lat_avg, lat_p99,
                     _status_style(status),
                 )
 
@@ -598,8 +598,6 @@ def main():
     if args.sequential:
         try:
             for disk_idx, disk, t, fio_args in tasks:
-                name = disk["name"]
-                console.print(f"  {name}/{t}...")
                 res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event)
                 process_task_result(results, disk_idx, disk, t, fio_args, res)
         except KeyboardInterrupt:
