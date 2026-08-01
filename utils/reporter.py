@@ -31,75 +31,84 @@ def generate_report(
     Возвращает:
         Path к созданному файлу
     """
-    if output_path is None:
-        reports_dir = Path("reports")
-        reports_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_path = reports_dir / f"fio_report_{timestamp}.md"
-    else:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    lines = []
-
-    lines.append("# Отчёт тестирования накопителей (FIO)")
-    lines.append("")
-    lines.append(f"> Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append("")
-
-    lines.append("## Обнаруженные диски")
-    lines.append("")
-    lines.append("| Диск | Модель | Серийный номер | Интерфейс | Объём | Физ. сектор |")
-    lines.append("|------|--------|----------------|-----------|-------|-------------|")
-
-    for d in disks:
-        lines.append(
-            f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
-            f"| {d['tran']} | {d['size']} | {d['phy_sec']}B |"
-        )
-
-    lines.append("")
-    lines.append("## Результаты тестирования")
-    lines.append("")
-
-    current_disk = None
-
-    for r in results:
-        disk_key = r["disk"]
-
-        if disk_key != current_disk:
-            current_disk = disk_key
-            lines.append(f"### /dev/{disk_key} ({r['model']})")
-            lines.append("")
-            lines.append(
-                "| Тест | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat p99 (мс) | Статус |"
-            )
-            lines.append(
-                "|------|------|------|-----------------|--------------|--------------|--------|"
-            )
-
-        status_label = r.get("status", "...")
-        if status_label == "done":
-            status_display = "done"
-        elif status_label == "undone":
-            status_display = "undone"
+    try:
+        if output_path is None:
+            reports_dir = Path("reports")
+            reports_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            output_path = reports_dir / f"fio_report_{timestamp}.md"
         else:
-            status_display = status_label
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if "ERR" in str(r.get("iops", "")):
+        lines = []
+
+        lines.append("# Отчёт тестирования накопителей (FIO)")
+        lines.append("")
+        lines.append(f"> Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("")
+
+        lines.append("## Обнаруженные диски")
+        lines.append("")
+        lines.append("| Диск | Модель | Серийный номер | Интерфейс / Шина | Объём | Физ. сектор |")
+        lines.append("|------|--------|----------------|------------------|-------|-------------|")
+
+        for d in disks:
+            pcie_str = ""
+            if d.get("pcie_info") and d["pcie_info"].get("gen"):
+                pcie_str = f" (PCIe Gen{d['pcie_info']['gen']} x{d['pcie_info'].get('width', '?')})"
+
             lines.append(
-                f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | — | — | — | — | {status_display} |"
-            )
-        else:
-            lines.append(
-                f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | {r['iops']} | {r['bw']} "
-                f"| {r['lat_avg']} | {r['lat_p99']} | {status_display} |"
+                f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
+                f"| {d['tran']}{pcie_str} | {d['size']} | {d['phy_sec']}B |"
             )
 
-    lines.append("")
-    lines.append("---")
-    lines.append(f"*Отчёт сгенерирован автоматически*")
+        lines.append("")
+        lines.append("## Результаты тестирования")
+        lines.append("")
 
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+        current_disk = None
 
-    return output_path
+        for r in results:
+            disk_key = r["disk"]
+
+            if disk_key != current_disk:
+                current_disk = disk_key
+                lines.append(f"### /dev/{disk_key} ({r['model']})")
+                lines.append("")
+                lines.append(
+                    "| Тест | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat p99 (мс) | Статус |"
+                )
+                lines.append(
+                    "|------|------|------|-----------------|--------------|--------------|--------|"
+                )
+
+            status_label = r.get("status", "...")
+            if status_label == "done":
+                status_display = "done"
+            elif status_label == "undone":
+                status_display = "undone"
+            else:
+                status_display = status_label
+
+            if "ERR" in str(r.get("iops", "")):
+                lines.append(
+                    f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | — | — | — | — | {status_display} |"
+                )
+            else:
+                lines.append(
+                    f"| {_strip_rich(r['test_name'])} | {r.get('bs', '—')} | {r['iops']} | {r['bw']} "
+                    f"| {r['lat_avg']} | {r['lat_p99']} | {status_display} |"
+                )
+
+        lines.append("")
+        lines.append("---")
+        lines.append("*Отчёт сгенерирован автоматически*")
+
+        output_path.write_text("\n".join(lines), encoding="utf-8")
+
+        return output_path
+    except PermissionError:
+        raise RuntimeError(f"Отказано в доступе при попытке записи отчёта по пути '{output_path}'.")
+    except Exception as e:
+        raise RuntimeError(f"Ошибка при создании файла отчёта '{output_path}': {e}")
