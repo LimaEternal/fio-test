@@ -19,7 +19,8 @@ from configs import nvme, sas, sata
 from utils.reporter import generate_report
 from utils.scanner import get_non_system_disks
 
-console = Console()
+# Инициализация консоли без цветных тегов и подсветки для совместимости с Jenkins и любыми терминалами
+console = Console(color_system=None, highlight=False)
 
 INTERFACE_CONFIGS = {
     "NVME": nvme.TESTS,
@@ -46,10 +47,20 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Примеры:\n"
-            "  python fio-test.py                  — базовое тестирование\n"
-            "  python fio-test.py --precond         — с прекондишнингом\n"
-            "  python fio-test.py --output my.md    — свой путь для отчёта\n"
+            "  python fio-test.py                  — параллельное тестирование (по умолчанию)\n"
+            "  python fio-test.py -s               — последовательное тестирование (по одному диску)\n"
+            "  python fio-test.py --precond        — с прекондишнингом\n"
+            "  python fio-test.py --output my.md   — свой путь для отчёта\n"
             "  python fio-test.py --threshold-nvme 2000,1500,100000,80000\n"
+        ),
+    )
+
+    parser.add_argument(
+        "-s", "--sequential",
+        action="store_true",
+        help=(
+            "Запускать тесты последовательно (диск за диском) вместо параллельного. "
+            "Рекомендуется для виртуальных машин и дисков с общим HBA-контроллером."
         ),
     )
 
@@ -126,13 +137,13 @@ def parse_custom_thresholds(raw: str) -> dict:
     """
     vals = [x.strip() for x in raw.split(",")]
     if len(vals) != 4:
-        console.print("[red]Ошибка: нужно ровно 4 значения через запятую[/red]")
+        console.print("Ошибка: нужно ровно 4 значения через запятую")
         sys.exit(1)
 
     try:
         seq_read_bw, seq_write_bw, rand_read_iops, rand_write_iops = [float(v) for v in vals]
     except ValueError:
-        console.print("[red]Ошибка: все значения должны быть числами[/red]")
+        console.print("Ошибка: все значения должны быть числами")
         sys.exit(1)
 
     return {
@@ -146,7 +157,7 @@ def parse_custom_thresholds(raw: str) -> dict:
 def validate_configs() -> None:
     """Валидация конфигов FIO-тестов. Вызывается при старте до сканирования дисков."""
     if not isinstance(INTERFACE_CONFIGS, dict):
-        console.print("[red]INTERFACE_CONFIGS должен быть словарём[/red]")
+        console.print("INTERFACE_CONFIGS должен быть словарём")
         sys.exit(1)
 
     required_test_keys = {"id", "name", "args"}
@@ -156,18 +167,18 @@ def validate_configs() -> None:
 
     for iface, tests in INTERFACE_CONFIGS.items():
         if not isinstance(tests, list) or len(tests) == 0:
-            console.print(f"[red]Ошибка в конфиге {iface}: TESTS должен быть непустым списком[/red]")
+            console.print(f"Ошибка в конфиге {iface}: TESTS должен быть непустым списком")
             sys.exit(1)
 
         for idx, test in enumerate(tests):
             missing = required_test_keys - set(test.keys())
             if missing:
-                console.print(f"[red]Ошибка в конфиге {iface}, тест {idx}: отсутствуют ключи {missing}[/red]")
+                console.print(f"Ошибка в конфиге {iface}, тест {idx}: отсутствуют ключи {missing}")
                 sys.exit(1)
 
             args = test["args"]
             if not isinstance(args, list):
-                console.print(f"[red]Ошибка в конфиге {iface}, тест {test['id']}: args должен быть списком[/red]")
+                console.print(f"Ошибка в конфиге {iface}, тест {test['id']}: args должен быть списком")
                 sys.exit(1)
 
             for arg in args:
@@ -176,8 +187,8 @@ def validate_configs() -> None:
                         continue
                     if not arg.startswith("--") and not arg.startswith("-"):
                         console.print(
-                            f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
-                            f"неожиданный аргумент '{arg}'[/red]"
+                            f"Ошибка в конфиге {iface}, тест {test['id']}: "
+                            f"неожиданный аргумент '{arg}'"
                         )
                         sys.exit(1)
 
@@ -189,65 +200,65 @@ def validate_configs() -> None:
 
             if bs_val is None:
                 console.print(
-                    f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
-                    f"отсутствует параметр --bs[/red]"
+                    f"Ошибка в конфиге {iface}, тест {test['id']}: "
+                    f"отсутствует параметр --bs"
                 )
                 sys.exit(1)
 
             if bs_val not in valid_bs:
                 console.print(
-                    f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
-                    f"некорректный bs='{bs_val}'[/red]"
+                    f"Ошибка в конфиге {iface}, тест {test['id']}: "
+                    f"некорректный bs='{bs_val}'"
                 )
                 sys.exit(1)
 
             if not any(a.startswith("--runtime=") for a in args):
                 console.print(
-                    f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
-                    f"отсутствует --runtime[/red]"
+                    f"Ошибка в конфиге {iface}, тест {test['id']}: "
+                    f"отсутствует --runtime"
                 )
                 sys.exit(1)
 
             if "--time_based" not in args:
                 console.print(
-                    f"[red]Ошибка в конфиге {iface}, тест {test['id']}: "
-                    f"отсутствует --time_based[/red]"
+                    f"Ошибка в конфиге {iface}, тест {test['id']}: "
+                    f"отсутствует --time_based"
                 )
                 sys.exit(1)
 
     for iface, thresholds in INTERFACE_THRESHOLDS.items():
         if not isinstance(thresholds, dict):
-            console.print(f"[red]Ошибка в конфиге {iface}: THRESHOLDS должен быть словарём[/red]")
+            console.print(f"Ошибка в конфиге {iface}: THRESHOLDS должен быть словарём")
             sys.exit(1)
 
         if iface not in INTERFACE_CONFIGS:
-            console.print(f"[red]Ошибка в конфиге {iface}: интерфейс не найден в INTERFACE_CONFIGS[/red]")
+            console.print(f"Ошибка в конфиге {iface}: интерфейс не найден в INTERFACE_CONFIGS")
             sys.exit(1)
 
         test_ids = {t["id"] for t in INTERFACE_CONFIGS[iface]}
         for tid, vals in thresholds.items():
             if tid not in test_ids:
                 console.print(
-                    f"[red]Ошибка в THRESHOLDS[{iface}]: тест '{tid}' не найден в TESTS[/red]"
+                    f"Ошибка в THRESHOLDS[{iface}]: тест '{tid}' не найден в TESTS"
                 )
                 sys.exit(1)
             if "min_bw_mb" not in vals and "min_iops" not in vals:
                 console.print(
-                    f"[red]Ошибка в THRESHOLDS[{iface}]['{tid}']: "
-                    f"нужен min_bw_mb или min_iops[/red]"
+                    f"Ошибка в THRESHOLDS[{iface}]['{tid}']: "
+                    f"нужен min_bw_mb или min_iops"
                 )
                 sys.exit(1)
 
         if len(thresholds) != len(test_ids):
             console.print(
-                f"[red]Ошибка в THRESHOLDS[{iface}]: "
-                f"количество порогов ({len(thresholds)}) != количество тестов ({len(test_ids)})[/red]"
+                f"Ошибка в THRESHOLDS[{iface}]: "
+                f"количество порогов ({len(thresholds)}) != количество тестов ({len(test_ids)})"
             )
             sys.exit(1)
 
     for iface, desc in INTERFACE_DESCRIPTIONS.items():
         if not isinstance(desc, str) or not desc.strip():
-            console.print(f"[red]Ошибка в конфиге {iface}: DESCRIPTION должен быть непустой строкой[/red]")
+            console.print(f"Ошибка в конфиге {iface}: DESCRIPTION должен быть непустой строкой")
             sys.exit(1)
 
 
@@ -335,10 +346,10 @@ def run_precondition(disk_info: dict) -> bool:
         res = subprocess.run(cmd, capture_output=True, text=True)
         return res.returncode == 0
     except FileNotFoundError:
-        console.print("[red]Ошибка: утилита 'fio' не найдена. Пожалуйста, установите 'fio' в систему.[/red]")
+        console.print("Ошибка: утилита 'fio' не найдена. Пожалуйста, установите 'fio' в систему.")
         return False
     except Exception as e:
-        console.print(f"[red]Непредвиденная ошибка при запуске прекондишинга: {e}[/red]")
+        console.print(f"Непредвиденная ошибка при запуске прекондишинга: {e}")
         return False
 
 
@@ -362,23 +373,20 @@ def optimize_nvme_args(test_id: str, args_list: list[str], pcie_info: dict) -> l
         new_args.append(f"{prefix}{val}")
 
     if gen >= 5:
-        # Для Gen5 дисков (например, KIOXIA CM7-V):
-        # Паспортная скорость чтения 14 ГБ/с требует многопоточности для исключения CPU Bottleneck
         if test_id == "seq_read":
             set_arg("--numjobs=", "4")
             set_arg("--iodepth=", "16")
-            set_arg("--bs=", "256k")  # блок 256k раскрывает пропускную способность шины PCIe Gen5
+            set_arg("--bs=", "256k")
         elif test_id == "seq_write":
             set_arg("--numjobs=", "2")
             set_arg("--iodepth=", "16")
         elif test_id == "rand_read":
-            set_arg("--numjobs=", "16")  # Сверхвысокие IOPS (до 2.7M) на чтение
+            set_arg("--numjobs=", "16")
             set_arg("--iodepth=", "16")
         elif test_id == "rand_write":
             set_arg("--numjobs=", "8")
             set_arg("--iodepth=", "16")
     elif gen == 4:
-        # Для Gen4 дисков:
         if test_id == "seq_read":
             set_arg("--numjobs=", "2")
             set_arg("--iodepth=", "16")
@@ -389,7 +397,6 @@ def optimize_nvme_args(test_id: str, args_list: list[str], pcie_info: dict) -> l
     return new_args
 
 
-# Custom box for inner table — horizontal lines only, no vertical separators
 _HLINE_BOX = None
 try:
     from rich.box import SIMPLE as _HLINE_BOX
@@ -398,16 +405,12 @@ except (ImportError, Exception):
 
 
 def _status_style(status: str) -> str:
-    """Возвращает styled строку статуса."""
-    if status == "done":
-        return "[bold green]done[/bold green]"
-    elif status == "undone":
-        return "[bold red]undone[/bold red]"
+    """Возвращает чистую строку статуса без цветовых тегов."""
     return status
 
 
 def build_results_table(disks: list, results: list) -> Table:
-    """Строит общую внешнюю таблицу, где инфо о диске расположена в отдельном столбце слева."""
+    """Строит общую внешнюю таблицу без цветовых стилей (чистый белый текст)."""
     grouped = []
     for disk in disks:
         disk_results = [r for r in results if r["disk"] == disk["name"]]
@@ -421,7 +424,7 @@ def build_results_table(disks: list, results: list) -> Table:
         padding=(1, 1),
     )
     outer.add_column("№", justify="center", width=4)
-    outer.add_column("Накопитель", justify="left", width=35, style="cyan")
+    outer.add_column("Накопитель", justify="left", width=35)
     outer.add_column("Результаты тестирования накопителей (FIO)", justify="left")
 
     for disk_num, (disk, disk_results) in enumerate(grouped, 1):
@@ -431,9 +434,9 @@ def build_results_table(disks: list, results: list) -> Table:
             pcie_str = f" (PCIe Gen{disk['pcie_info']['gen']} x{disk['pcie_info'].get('width', '?')})"
         
         disk_info_text = (
-            f"[bold]/dev/{disk['name']}[/bold]\n"
+            f"/dev/{disk['name']}\n"
             f"{disk['model']}\n"
-            f"[white]{disk['tran']}{pcie_str}[/white]\n"
+            f"{disk['tran']}{pcie_str}\n"
             f"SN: {disk['serial']}\n"
             f"{slot_str}"
             f"Размер: {disk['size']}"
@@ -445,10 +448,10 @@ def build_results_table(disks: list, results: list) -> Table:
             show_lines=True,
             padding=(0, 2),
         )
-        inner.add_column("Профиль теста", style="yellow")
+        inner.add_column("Профиль теста")
         inner.add_column("Блок", justify="right")
-        inner.add_column("IOPS", justify="right", style="green")
-        inner.add_column("Скорость (МБ/с)", justify="right", style="green")
+        inner.add_column("IOPS", justify="right")
+        inner.add_column("Скорость (МБ/с)", justify="right")
         inner.add_column("Lat Avg (мс)", justify="right")
         inner.add_column("Lat p99 (мс)", justify="right")
         inner.add_column("Статус", justify="center")
@@ -482,24 +485,24 @@ def main() -> None:
     if args.threshold_sata:
         thresholds["SATA"] = parse_custom_thresholds(args.threshold_sata)
 
-    console.print("[bold blue]Сканирование системы на несистемные диски...[/bold blue]")
+    console.print("Сканирование системы на несистемные диски...")
     
     try:
         disks = get_non_system_disks(INTERFACE_CONFIGS)
     except Exception as e:
-        console.print(f"\n[bold red]Критическая ошибка при сканировании устройств:[/bold red]")
-        console.print(f"[red]{e}[/red]\n")
+        console.print(f"\nКритическая ошибка при сканировании устройств:")
+        console.print(f"{e}\n")
         sys.exit(1)
 
     if not disks:
         console.print(
-            "[bold red]Безопасные несистемные диски для тестов не найдены![/bold red]\n"
-            "[yellow]Все подключенные диски содержат активные системные разделы (/, /boot и др.) и были отфильтрованы для защиты данных.[/yellow]"
+            "Безопасные несистемные диски для тестов не найдены!\n"
+            "Все подключенные диски содержат активные системные разделы (/, /boot и др.) и были отфильтрованы для защиты данных."
         )
         sys.exit(1)
 
     console.print(
-        f"Обнаружено целевых дисков: [bold green]{len(disks)}[/bold green]\n"
+        f"Обнаружено целевых дисков: {len(disks)}\n"
     )
 
     for i, d in enumerate(disks, 1):
@@ -509,38 +512,38 @@ def main() -> None:
             pcie_str = f", PCIe Gen{d['pcie_info']['gen']} x{d['pcie_info'].get('width', '?')}"
             
         console.print(
-            f"  [cyan]{i}. /dev/{d['name']}[/cyan] — {d['model']} "
-            f"([white]{d['tran']}{pcie_str}[/white], SN: [white]{d['serial']}[/white]{slot_str})"
+            f"  {i}. /dev/{d['name']} — {d['model']} "
+            f"({d['tran']}{pcie_str}, SN: {d['serial']}{slot_str})"
         )
     console.print()
 
     if args.precond:
         console.print(
-            "[bold yellow]Прекондишнинг: "
-            "запись 100% объёма каждого диска (bs=1M, --direct=1)...[/bold yellow]\n"
+            "Прекондишнинг: запись 100% объёма каждого диска (bs=1M, --direct=1)...\n"
         )
 
         for disk in disks:
             console.print(
-                f"  [cyan]Прекондишнинг /dev/{disk['name']}...[/cyan]"
+                f"  Прекондишнинг /dev/{disk['name']}..."
             )
             ok = run_precondition(disk)
             if ok:
                 console.print(
-                    f"  [green]✓ /dev/{disk['name']} готов[/green]"
+                    f"  ✓ /dev/{disk['name']} готов"
                 )
             else:
                 console.print(
-                    f"  [red]✗ Ошибка прекондишинга /dev/{disk['name']}[/red]"
+                    f"  ✗ Ошибка прекондишинга /dev/{disk['name']}"
                 )
         console.print()
 
     if args.runtime != 30:
         console.print(
-            f"[grey50]Длительность теста: {args.runtime}с[/grey50]\n"
+            f"Длительность теста: {args.runtime}с\n"
         )
 
-    console.print("[cyan]Выполнение бенчмарка...[/cyan]")
+    mode_desc = "последовательный (-s)" if args.sequential else "параллельный"
+    console.print(f"Выполнение бенчмарка (режим: {mode_desc})...")
 
     results = []
     tasks = []
@@ -568,7 +571,6 @@ def main() -> None:
 
             fio_args = list(t["args"])
             
-            # Применяем оптимизацию параметров FIO под поколение PCIe для NVMe накопителей
             if disk["tran"] == "NVME" and disk.get("pcie_info"):
                 fio_args = optimize_nvme_args(t["id"], fio_args, disk["pcie_info"])
 
@@ -584,87 +586,86 @@ def main() -> None:
 
             tasks.append((idx, disk, t, fio_args))
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(disks)
-    ) as executor:
-        future_to_info = {}
-        for idx, disk, t, fio_args in tasks:
-            future = executor.submit(
-                run_fio_test, disk, t["id"], fio_args
+    def process_task_result(idx, disk, t, fio_args, res):
+        bs = "4k"
+        for a in fio_args:
+            if a.startswith("--bs="):
+                bs = a.split("=", 1)[1]
+                break
+
+        if "error" in res:
+            results[idx]["test_name"] = f"{t['name']} (ERR)"
+            results[idx]["iops"] = "ERR"
+            results[idx]["bw"] = "—"
+            results[idx]["lat_avg"] = "—"
+            results[idx]["lat_p99"] = "—"
+            results[idx]["error_msg"] = res["error"]
+            results[idx]["bs"] = bs
+            results[idx]["status"] = "undone"
+            console.print(f"Ошибка теста '{t['name']}' на /dev/{disk['name']}: {res['error']}")
+        else:
+            results[idx]["test_name"] = t["name"]
+            results[idx]["iops"] = f"{res['iops']:,}"
+            results[idx]["bw"] = res["bw_mb"]
+            results[idx]["lat_avg"] = res["lat_avg"]
+            results[idx]["lat_p99"] = res["lat_p99"]
+            results[idx]["error_msg"] = None
+            results[idx]["bs"] = bs
+            results[idx]["status"] = check_threshold(
+                t["id"], res, thresholds[disk["tran"]]
             )
-            future_to_info[future] = (idx, disk, t, fio_args)
 
-        for future in concurrent.futures.as_completed(
-            future_to_info
-        ):
-            idx, disk, t, fio_args = future_to_info[future]
-            
-            try:
-                res = future.result()
-            except Exception as e:
-                res = {"error": f"Непредвиденный сбой потока выполнения теста: {e}"}
+    if args.sequential:
+        # Последовательный запуск тестов по одному
+        for idx, disk, t, fio_args in tasks:
+            res = run_fio_test(disk, t["id"], fio_args)
+            process_task_result(idx, disk, t, fio_args, res)
+    else:
+        # Параллельный запуск тестов на всех дисках (по умолчанию)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(disks)
+        ) as executor:
+            future_to_info = {}
+            for idx, disk, t, fio_args in tasks:
+                future = executor.submit(
+                    run_fio_test, disk, t["id"], fio_args
+                )
+                future_to_info[future] = (idx, disk, t, fio_args)
 
-            bs = "4k"
-            for a in fio_args:
-                if a.startswith("--bs="):
-                    bs = a.split("=", 1)[1]
-                    break
+            for future in concurrent.futures.as_completed(
+                future_to_info
+            ):
+                idx, disk, t, fio_args = future_to_info[future]
+                try:
+                    res = future.result()
+                except Exception as e:
+                    res = {"error": f"Непредвиденный сбой потока выполнения теста: {e}"}
 
-            if "error" in res:
-                results[idx]["test_name"] = (
-                    f"[red]{t['name']}[/red]"
-                )
-                results[idx]["iops"] = "ERR"
-                results[idx]["bw"] = "—"
-                results[idx]["lat_avg"] = "—"
-                results[idx]["lat_p99"] = "—"
-                results[idx]["error_msg"] = res["error"]
-                results[idx]["bs"] = bs
-                results[idx]["status"] = "undone"
-                
-                # Дополнительно выведем человекочитаемую ошибку выполнения теста
-                console.print(f"[bold red]Ошибка теста '{t['name']}' на /dev/{disk['name']}:[/bold red] {res['error']}")
-            else:
-                results[idx]["test_name"] = (
-                    f"[green]{t['name']}[/green]"
-                )
-                results[idx]["iops"] = f"{res['iops']:,}"
-                results[idx]["bw"] = res["bw_mb"]
-                results[idx]["lat_avg"] = res["lat_avg"]
-                results[idx]["lat_p99"] = res["lat_p99"]
-                results[idx]["error_msg"] = None
-                results[idx]["bs"] = bs
-                results[idx]["status"] = check_threshold(
-                    t["id"], res, thresholds[disk["tran"]]
-                )
+                process_task_result(idx, disk, t, fio_args, res)
 
     console.print()
-    console.print("[bold green]Результаты тестирования накопителей (FIO)[/bold green]")
+    console.print("Результаты тестирования накопителей (FIO)")
     
     try:
         console.print(build_results_table(disks, results))
     except Exception as e:
-        console.print(f"[bold red]Ошибка построения результирующей таблицы:[/bold red] {e}")
+        console.print(f"Ошибка построения результирующей таблицы: {e}")
         
-    console.print(
-        "\n[bold green]Все тесты завершены.[/bold green]"
-    )
+    console.print("\nВсе тесты завершены.")
 
     try:
         report_path = generate_report(disks, results, args.output)
-        console.print(
-            f"[bold green]Отчёт сохранён: {report_path}[/bold green]"
-        )
+        console.print(f"Отчёт сохранён: {report_path}")
     except Exception as e:
-        console.print(f"[bold red]Не удалось сгенерировать или сохранить MD-отчёт:[/bold red] {e}")
+        console.print(f"Не удалось сгенерировать или сохранить MD-отчёт: {e}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]Тестирование прервано пользователем.[/bold yellow]")
+        console.print("\nТестирование прервано пользователем.")
         sys.exit(1)
     except Exception as e:
-        console.print(f"\n[bold red]Произошел непредвиденный сбой скрипта:[/bold red] {e}")
+        console.print(f"\nПроизошел непредвиденный сбой скрипта: {e}")
         sys.exit(1)
