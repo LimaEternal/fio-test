@@ -11,7 +11,12 @@ from rich.console import Console
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.table_renderer import TITLE, build_results_table, format_status
+from utils.table_renderer import (
+    RESULT_HEADERS,
+    TITLE,
+    build_results_table,
+    format_status,
+)
 
 
 DISKS = [
@@ -89,10 +94,16 @@ class TableRendererTests(unittest.TestCase):
         lines = output.splitlines()
         self.assertEqual(sum(line.startswith("┏") for line in lines), 1)
         self.assertEqual(sum(line.startswith("└") for line in lines), 1)
-        self.assertEqual(sum(line.startswith("┡") for line in lines), 1)
+        self.assertFalse(any(line.startswith("┡") for line in lines))
         sections = [line for line in lines if line.startswith("├")]
         self.assertEqual(len(sections), 1)
         self.assertIn("┼", sections[0])
+
+    def test_numeric_result_columns_are_centered_under_headers(self):
+        columns = {header: justify for header, justify, _ in RESULT_HEADERS}
+
+        for header in ("IOPS", "Скорость (МБ/с)", "Lat Avg (мс)", "Lat p99 (мс)"):
+            self.assertEqual(columns[header], "center")
 
     def test_content_lines_have_three_columns(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))

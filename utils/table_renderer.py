@@ -1,25 +1,38 @@
 """Построение плоской консольной таблицы с результатами FIO.
 
 Внешняя таблица — три колонки (№, Накопитель, результаты тестов)
-с единой шапкой (box.HEAVY_HEAD). Строки дисков разделяются
-горизонтальными линиями (add_section), результаты собраны во
-вложенную таблицу с собственным заголовком и переносом колонок.
+с единой шапкой. Линия под шапкой убрана (HEAVY_HEAD_NO_LINE),
+строки дисков разделяются горизонтальными линиями (add_section),
+результаты собраны во вложенную таблицу с собственным заголовком,
+переносом колонок и данными, отцентрированными под заголовками.
 """
 
 from rich import box
+from rich.box import Box
 from rich.table import Table
 from rich.text import Text
 
 
 TITLE = "Результаты тестирования накопителей (FIO)"
 
+HEAVY_HEAD_NO_LINE = Box(
+    "┏━┳┓\n"
+    "┃ ┃┃\n"
+    "    \n"
+    "│ ││\n"
+    "├─┼┤\n"
+    "├─┼┤\n"
+    "│ ││\n"
+    "└─┴┘"
+)
+
 RESULT_HEADERS = (
     ("Профиль теста", "left", 9),
     ("Блок", "center", 5),
-    ("IOPS", "right", 7),
-    ("Скорость (МБ/с)", "right", 8),
-    ("Lat Avg (мс)", "right", 11),
-    ("Lat p99 (мс)", "right", 10),
+    ("IOPS", "center", 7),
+    ("Скорость (МБ/с)", "center", 8),
+    ("Lat Avg (мс)", "center", 11),
+    ("Lat p99 (мс)", "center", 10),
     ("Статус", "center", 6),
 )
 
@@ -91,7 +104,7 @@ def _results_cell(disk_results, test_names):
 def build_results_table(disks, results, test_names):
     """Строит одну непрерывную таблицу для всех накопителей."""
     table = Table(
-        box=box.HEAVY_HEAD,
+        box=HEAVY_HEAD_NO_LINE,
         show_header=True,
         header_style="",
         border_style="",
