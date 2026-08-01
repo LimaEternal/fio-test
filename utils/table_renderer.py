@@ -1,9 +1,9 @@
 """Построение плоской консольной таблицы с результатами FIO.
 
-Внешняя таблица содержит ровно две колонки: паспорт накопителя
-(№ + Накопитель) и результаты тестов. Это гарантирует единственный
-вертикальный разделитель между группами, а горизонтальные линии
-(add_section) разделяют блоки разных дисков.
+Внешняя таблица — три колонки (№, Накопитель, результаты тестов)
+с единой шапкой (box.HEAVY_HEAD). Строки дисков разделяются
+горизонтальными линиями (add_section), результаты собраны во
+вложенную таблицу с собственным заголовком и переносом колонок.
 """
 
 from rich import box
@@ -11,23 +11,24 @@ from rich.table import Table
 from rich.text import Text
 
 
+TITLE = "Результаты тестирования накопителей (FIO)"
+
+RESULT_HEADERS = (
+    ("Профиль теста", "left", 9),
+    ("Блок", "center", 5),
+    ("IOPS", "right", 7),
+    ("Скорость (МБ/с)", "right", 8),
+    ("Lat Avg (мс)", "right", 11),
+    ("Lat p99 (мс)", "right", 10),
+    ("Статус", "center", 6),
+)
+
+
 def format_status(status):
     """Возвращает статус с единственной цветовой разметкой таблицы."""
     if status == "done":
         return Text("done", style="bold green")
     return Text("undone", style="bold red")
-
-
-def _multiline_cell(header, values, formatter=None):
-    """Формирует ячейку с жирной шапкой и строками значений."""
-    cell = Text(header, style="bold")
-    for value in values:
-        cell.append("\n")
-        if formatter:
-            cell.append_text(formatter(value))
-        else:
-            cell.append(str(value))
-    return cell
 
 
 def _disk_details(disk):
@@ -42,90 +43,70 @@ def _disk_details(disk):
     )
 
 
-def _test_columns(disk_results, test_names):
-    """Преобразует произвольный набор настроенных тестов в колонки."""
-    columns = {
-        "names": [],
-        "blocks": [],
-        "iops": [],
-        "bandwidth": [],
-        "lat_avg": [],
-        "lat_p99": [],
-        "statuses": [],
-    }
+def _test_rows(disk_results, test_names):
+    """Преобразует результаты тестов в строки вложенной таблицы.
 
+    Имя теста завершается переводом строки: перенос имени даёт
+    пустую строку после каждого теста (включая последний).
+    """
+    rows = []
     for test_id, test_name in test_names.items():
         result = disk_results.get(test_id, {})
-        columns["names"].append(test_name)
         if "error" in result:
-            columns["blocks"].append("—")
-            columns["iops"].append("—")
-            columns["bandwidth"].append("—")
-            columns["lat_avg"].append("—")
-            columns["lat_p99"].append("—")
-            columns["statuses"].append("undone")
-            continue
-
-        columns["blocks"].append(result.get("bs", "4k"))
-        columns["iops"].append(f"{result.get('iops', 0):,.0f}")
-        columns["bandwidth"].append(f"{result.get('bw_mb', 0):.1f}")
-        columns["lat_avg"].append(f"{result.get('lat_avg', 0):.2f}")
-        columns["lat_p99"].append(f"{result.get('lat_p99', 0):.2f}")
-        columns["statuses"].append(result.get("status", "undone"))
-
-    return columns
-
-
-def _cell_grid(columns, padding=(0, 1)):
-    """Строит grid без рамок из списка (header, values, formatter, justify, min_width)."""
-    grid = Table.grid(padding=padding)
-    cells = []
-    for header, values, formatter, justify, min_width in columns:
-        grid.add_column(justify=justify, min_width=min_width)
-        cells.append(_multiline_cell(header, values, formatter))
-    grid.add_row(*cells)
-    return grid
-
-
-def _passport_cell(index, disk):
-    """Строит ячейку паспорта: номер и данные накопителя в одной колонке."""
-    details = list(_disk_details(disk))
-    lines = [f"{index}. {details[0]}"] + [f"   {line}" for line in details[1:]]
-    return _cell_grid([
-        ("Накопитель", lines, None, "left", 20),
-    ])
+            rows.append((test_name + "\n", "—", "—", "—", "—", "—", "undone"))
+        else:
+            rows.append((
+                test_name + "\n",
+                result.get("bs", "4k"),
+                f"{result.get('iops', 0):,.0f}",
+                f"{result.get('bw_mb', 0):.1f}",
+                f"{result.get('lat_avg', 0):.2f}",
+                f"{result.get('lat_p99', 0):.2f}",
+                result.get("status", "undone"),
+            ))
+    return rows
 
 
 def _results_cell(disk_results, test_names):
-    """Строит ячейку с результатами всех настроенных тестов."""
-    columns = _test_columns(disk_results, test_names)
-    return _cell_grid([
-        ("Профиль теста", columns["names"], None, "left", 18),
-        ("Блок", columns["blocks"], None, "center", None),
-        ("IOPS", columns["iops"], None, "right", None),
-        ("Скорость (МБ/с)", columns["bandwidth"], None, "right", None),
-        ("Lat Avg (мс)", columns["lat_avg"], None, "right", None),
-        ("Lat P99 (мс)", columns["lat_p99"], None, "right", None),
-        ("Статус", columns["statuses"], format_status, "center", None),
-    ], padding=(0, 2))
+    """Строит вложенную таблицу результатов с собственным заголовком."""
+    sub = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="",
+        padding=0,
+        collapse_padding=True,
+    )
+    for header, justify, min_width in RESULT_HEADERS:
+        sub.add_column(
+            header=header, justify=justify,
+            min_width=min_width, overflow="fold",
+        )
+
+    for row in _test_rows(disk_results, test_names):
+        sub.add_row(*row[:-1], format_status(row[-1]))
+
+    return sub
 
 
 def build_results_table(disks, results, test_names):
     """Строит одну непрерывную таблицу для всех накопителей."""
     table = Table(
-        box=box.ROUNDED,
+        box=box.HEAVY_HEAD,
         expand=True,
-        show_header=False,
+        show_header=True,
+        header_style="",
         border_style="",
         padding=(0, 1),
     )
-    table.add_column(min_width=24)
-    table.add_column()
+    table.add_column(header="\n№\n", justify="center", width=4)
+    table.add_column(header="\nНакопитель\n", min_width=24)
+    table.add_column(header=f"\n{TITLE}\n")
 
     for index, disk in enumerate(disks, 1):
         disk_results = results[index - 1] if index - 1 < len(results) else {}
         table.add_row(
-            _passport_cell(index, disk),
+            Text(f"\n{index}"),
+            Text("\n" + "\n".join(_disk_details(disk))),
             _results_cell(disk_results, test_names),
         )
         table.add_section()

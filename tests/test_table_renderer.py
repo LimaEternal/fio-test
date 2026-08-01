@@ -1,6 +1,7 @@
 from io import StringIO
 import importlib.util
 from pathlib import Path
+import re
 import sys
 import unittest
 
@@ -10,7 +11,7 @@ from rich.console import Console
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.table_renderer import build_results_table, format_status
+from utils.table_renderer import TITLE, build_results_table, format_status
 
 
 DISKS = [
@@ -59,11 +60,11 @@ TEST_NAMES = {
 }
 
 
-def render_table(renderable):
+def render_table(renderable, width=160):
     stream = StringIO()
     console = Console(
         file=stream,
-        width=160,
+        width=width,
         color_system=None,
         highlight=False,
         legacy_windows=False,
@@ -82,18 +83,18 @@ def load_entrypoint():
 
 
 class TableRendererTests(unittest.TestCase):
-    def test_all_disks_share_one_outer_table_with_section_lines_between(self):
+    def test_single_outer_table_with_heavy_head_and_section_between_disks(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 
         lines = output.splitlines()
-        self.assertEqual(sum(line.startswith("╭") for line in lines), 1)
-        self.assertEqual(sum(line.startswith("╰") for line in lines), 1)
-        separators = [line for line in lines if line.startswith("├")]
-        self.assertEqual(len(separators), 1)
-        self.assertIn("┼", separators[0])
-        self.assertNotIn("", lines)
+        self.assertEqual(sum(line.startswith("┏") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("└") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("┡") for line in lines), 1)
+        sections = [line for line in lines if line.startswith("├")]
+        self.assertEqual(len(sections), 1)
+        self.assertIn("┼", sections[0])
 
-    def test_only_one_vertical_separator_between_groups(self):
+    def test_content_lines_have_three_columns(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 
         content = [
@@ -102,15 +103,46 @@ class TableRendererTests(unittest.TestCase):
         ]
         self.assertTrue(content)
         for line in content:
-            self.assertEqual(line.count("│"), 3)
+            self.assertEqual(line.count("│"), 4)
 
-    def test_column_names_repeat_for_every_disk_without_global_title(self):
+    def test_single_header_row_with_number_disk_and_global_title(self):
+        output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+
+        header_rows = [
+            line for line in output.splitlines()
+            if "№" in line and "Накопитель" in line and TITLE in line
+        ]
+        self.assertEqual(len(header_rows), 1)
+        self.assertEqual(output.count("№"), 1)
+        self.assertEqual(output.count(TITLE), 1)
+
+    def test_number_in_own_column_without_disk_name_prefix(self):
+        output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+
+        self.assertNotIn("1. /dev/sda", output)
+        self.assertIn("/dev/sda", output)
+        self.assertTrue(re.search(r"│\s+1\s+│", output))
+        self.assertTrue(re.search(r"│\s+2\s+│", output))
+
+    def test_sub_table_headers_repeat_for_every_disk(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 
         self.assertEqual(output.count("Профиль теста"), 2)
         self.assertEqual(output.count("Скорость (МБ/с)"), 2)
-        self.assertEqual(output.count("Накопитель"), 2)
-        self.assertNotIn("Результаты тестирования накопителя", output)
+        self.assertEqual(output.count("Lat p99 (мс)"), 2)
+
+    def test_long_test_names_fold_to_several_lines(self):
+        output = render_table(
+            build_results_table(DISKS, RESULTS, TEST_NAMES), width=110
+        )
+
+        lines = output.splitlines()
+        self.assertTrue(any(
+            "Послед." in line and "Чтение" not in line for line in lines
+        ))
+        self.assertTrue(any(
+            "Чтение" in line and "Послед." not in line for line in lines
+        ))
 
     def test_renderer_uses_every_configured_test_without_fixed_test_order(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
@@ -119,21 +151,20 @@ class TableRendererTests(unittest.TestCase):
         self.assertIn("12,345", output)
         self.assertIn("96.5", output)
 
-    def test_passport_uses_numbered_disk_name_without_no_sign(self):
+    def test_passport_details_are_in_disk_column(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 
-        self.assertIn("1. /dev/sda", output)
-        self.assertIn("2. /dev/sdb", output)
-        self.assertNotIn("№", output)
+        for needle in (
+            "/dev/sda", "SN: drive-scsi0", "Slot: 2:0:0:0", "Размер: 32G",
+            "/dev/sdb", "SN: drive-scsi1",
+        ):
+            self.assertIn(needle, output)
 
-    def test_disk_details_and_test_results_are_direct_cells(self):
+    def test_statuses_appear_once_per_test_per_disk(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 
-        self.assertIn("/dev/sda", output)
-        self.assertIn("SN: drive-scsi0", output)
-        self.assertIn("/dev/sdb", output)
-        self.assertIn("SN: drive-scsi1", output)
-        self.assertEqual(output.count("╭"), 1)
+        self.assertEqual(len(re.findall(r"\bdone\b", output)), 4)
+        self.assertEqual(len(re.findall(r"\bundone\b", output)), 6)
 
     def test_entrypoint_exposes_flat_renderer(self):
         entrypoint = load_entrypoint()
@@ -142,7 +173,7 @@ class TableRendererTests(unittest.TestCase):
             entrypoint.build_results_table(DISKS, RESULTS, TEST_NAMES)
         )
 
-        self.assertEqual(output.count("╭"), 1)
+        self.assertEqual(output.count("┏"), 1)
         self.assertEqual(output.count("Профиль теста"), 2)
 
     def test_only_status_values_receive_color_styles(self):
