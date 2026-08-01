@@ -15,20 +15,12 @@ from utils.table_renderer import build_results_table, format_status
 
 DISKS = [
     {
-        "name": "sda",
-        "model": "QEMU HARDDISK",
-        "tran": "SATA",
-        "serial": "drive-scsi0",
-        "slot": "2:0:0:0",
-        "size": "32G",
+        "name": "sda", "model": "QEMU HARDDISK", "tran": "SATA",
+        "serial": "drive-scsi0", "slot": "2:0:0:0", "size": "32G",
     },
     {
-        "name": "sdb",
-        "model": "QEMU HARDDISK",
-        "tran": "SATA",
-        "serial": "drive-scsi1",
-        "slot": "3:0:0:1",
-        "size": "32G",
+        "name": "sdb", "model": "QEMU HARDDISK", "tran": "SATA",
+        "serial": "drive-scsi1", "slot": "3:0:0:1", "size": "32G",
     },
 ]
 
@@ -50,6 +42,10 @@ RESULTS = [
             "bs": "4k", "iops": 20322, "bw_mb": 79.4,
             "lat_avg": 1.53, "lat_p99": 0.0, "status": "undone",
         },
+        "mixed": {
+            "bs": "8k", "iops": 12345, "bw_mb": 96.5,
+            "lat_avg": 0.81, "lat_p99": 2.25, "status": "done",
+        },
     },
     {},
 ]
@@ -59,6 +55,7 @@ TEST_NAMES = {
     "seq_write": "2. Послед. Запись",
     "rand_read": "3. Случ. Чтение 4k",
     "rand_write": "4. Случ. Запись 4k",
+    "mixed": "5. Смешанная нагрузка",
 }
 
 
@@ -66,7 +63,7 @@ def render_table(renderable):
     stream = StringIO()
     console = Console(
         file=stream,
-        width=150,
+        width=160,
         color_system=None,
         highlight=False,
         legacy_windows=False,
@@ -85,56 +82,50 @@ def load_entrypoint():
 
 
 class TableRendererTests(unittest.TestCase):
-    def test_entrypoint_exposes_per_disk_tables(self):
+    def test_all_disks_share_one_outer_table_without_section_lines(self):
+        output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+
+        lines = output.splitlines()
+        self.assertEqual(sum(line.startswith("╭") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("╰") for line in lines), 1)
+        self.assertFalse(any(line.startswith(("├", "┼", "┤")) for line in lines))
+        self.assertNotIn("", lines)
+
+    def test_column_names_repeat_for_every_disk_without_global_title(self):
+        output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+
+        self.assertEqual(output.count("Профиль теста"), 2)
+        self.assertEqual(output.count("Скорость (МБ/с)"), 2)
+        self.assertEqual(output.count("Накопитель"), 2)
+        self.assertNotIn("Результаты тестирования накопителя", output)
+
+    def test_renderer_uses_every_configured_test_without_fixed_test_order(self):
+        output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+
+        self.assertEqual(output.count("5. Смешанная нагрузка"), 2)
+        self.assertIn("12,345", output)
+        self.assertIn("96.5", output)
+
+    def test_disk_details_and_test_results_are_direct_cells(self):
+        output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+
+        self.assertIn("/dev/sda", output)
+        self.assertIn("SN: drive-scsi0", output)
+        self.assertIn("/dev/sdb", output)
+        self.assertIn("SN: drive-scsi1", output)
+        self.assertEqual(output.count("╭"), 1)
+
+    def test_entrypoint_exposes_flat_renderer(self):
         entrypoint = load_entrypoint()
 
         output = render_table(
-            entrypoint.build_results_table(DISKS, RESULTS, TEST_NAMES, gap=0)
+            entrypoint.build_results_table(DISKS, RESULTS, TEST_NAMES)
         )
 
-        self.assertEqual(
-            output.count("Результаты тестирования накопителя (FIO)"), 2
-        )
+        self.assertEqual(output.count("╭"), 1)
+        self.assertEqual(output.count("Профиль теста"), 2)
 
-    def test_each_disk_has_own_header_and_blocks_touch(self):
-        output = render_table(
-            build_results_table(DISKS, RESULTS, TEST_NAMES, gap=0)
-        )
-
-        self.assertEqual(
-            output.count("Результаты тестирования накопителя (FIO)"), 2
-        )
-        self.assertIn("/dev/sda", output)
-        self.assertIn("/dev/sdb", output)
-
-        lines = output.splitlines()
-        first_bottom = next(
-            index for index, line in enumerate(lines) if line.startswith("╰")
-        )
-        self.assertTrue(lines[first_bottom + 1].startswith("╭"))
-
-    def test_positive_gap_is_centralized_rendering_option(self):
-        output = render_table(
-            build_results_table(DISKS, RESULTS, TEST_NAMES, gap=1)
-        )
-
-        lines = output.splitlines()
-        first_bottom = next(
-            index for index, line in enumerate(lines) if line.startswith("╰")
-        )
-        self.assertEqual(lines[first_bottom + 1], "")
-        self.assertTrue(lines[first_bottom + 2].startswith("╭"))
-
-    def test_all_disk_blocks_use_the_full_available_width(self):
-        output = render_table(
-            build_results_table(DISKS, RESULTS, TEST_NAMES, gap=0)
-        )
-
-        top_borders = [line for line in output.splitlines() if line.startswith("╭")]
-        self.assertEqual(len(top_borders), 2)
-        self.assertEqual({len(line) for line in top_borders}, {150})
-
-    def test_only_status_values_receive_explicit_styles(self):
+    def test_only_status_values_receive_color_styles(self):
         done = format_status("done")
         undone = format_status("undone")
 

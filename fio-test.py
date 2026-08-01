@@ -553,7 +553,7 @@ def main():
             pool.shutdown(wait=False, cancel_futures=True)
 
     # Вывод результатов
-    table = build_results_table(disks, results, TEST_NAMES, gap=0)
+    table = build_results_table(disks, results, TEST_NAMES)
     console.print()
     console.print(table)
 

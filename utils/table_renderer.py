@@ -1,15 +1,21 @@
-"""Построение консольных таблиц с результатами FIO."""
+"""Построение плоской консольной таблицы с результатами FIO."""
 
 from rich import box
-from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 
 
-TEST_ORDER = ("seq_read", "seq_write", "rand_read", "rand_write")
-DEFAULT_GAP = 0
-DISK_TABLE_BOX = box.ROUNDED
-RESULTS_TABLE_BOX = box.ROUNDED
+COLUMN_HEADERS = (
+    "№",
+    "Накопитель",
+    "Профиль теста",
+    "Блок",
+    "IOPS",
+    "Скорость (МБ/с)",
+    "Lat Avg (мс)",
+    "Lat P99 (мс)",
+    "Статус",
+)
 
 
 def format_status(status):
@@ -19,89 +25,102 @@ def format_status(status):
     return Text("undone", style="bold red")
 
 
-def build_disk_info(disk):
-    """Формирует многострочный паспорт накопителя без цветовых стилей."""
-    lines = [
+def _multiline_cell(header, values):
+    """Формирует ячейку с названием колонки и строками обычного текста."""
+    cell = Text(header, style="bold")
+    for value in values:
+        cell.append("\n")
+        cell.append(str(value))
+    return cell
+
+
+def _status_cell(statuses):
+    """Формирует колонку статусов, сохраняя цвет только у значений статуса."""
+    cell = Text(COLUMN_HEADERS[-1], style="bold")
+    for status in statuses:
+        cell.append("\n")
+        cell.append_text(format_status(status))
+    return cell
+
+
+def _disk_details(disk):
+    """Возвращает строки паспорта накопителя."""
+    return (
         f"/dev/{disk['name']}",
         disk.get("model", "N/A").strip(),
         disk.get("tran", "N/A"),
         f"SN: {disk.get('serial', 'N/A').strip()}",
         f"Slot: {disk.get('slot', 'N/A')}",
         f"Размер: {disk.get('size', 'N/A')}",
-    ]
-    return Text("\n".join(lines))
-
-
-def build_test_results_table(disk_results, test_names):
-    """Строит замкнутую таблицу результатов одного накопителя."""
-    table = Table(
-        box=RESULTS_TABLE_BOX,
-        show_header=True,
-        header_style="",
-        border_style="",
-        padding=(0, 1),
     )
-    table.add_column("Профиль теста", min_width=18)
-    table.add_column("Блок", justify="center")
-    table.add_column("IOPS", justify="right")
-    table.add_column("Скорость (МБ/с)", justify="right")
-    table.add_column("Lat Avg (мс)", justify="right")
-    table.add_column("Lat P99 (мс)", justify="right")
-    table.add_column("Статус", justify="center")
 
-    for test_id in TEST_ORDER:
+
+def _test_columns(disk_results, test_names):
+    """Преобразует произвольный набор настроенных тестов в колонки."""
+    columns = {
+        "names": [],
+        "blocks": [],
+        "iops": [],
+        "bandwidth": [],
+        "lat_avg": [],
+        "lat_p99": [],
+        "statuses": [],
+    }
+
+    for test_id, test_name in test_names.items():
         result = disk_results.get(test_id, {})
-        test_name = test_names.get(test_id, test_id)
+        columns["names"].append(test_name)
         if "error" in result:
-            table.add_row(
-                test_name, "—", "—", "—", "—", "—", format_status("undone")
-            )
+            columns["blocks"].append("—")
+            columns["iops"].append("—")
+            columns["bandwidth"].append("—")
+            columns["lat_avg"].append("—")
+            columns["lat_p99"].append("—")
+            columns["statuses"].append("undone")
             continue
 
-        table.add_row(
-            test_name,
-            result.get("bs", "4k"),
-            f"{result.get('iops', 0):,.0f}",
-            f"{result.get('bw_mb', 0):.1f}",
-            f"{result.get('lat_avg', 0):.2f}",
-            f"{result.get('lat_p99', 0):.2f}",
-            format_status(result.get("status", "undone")),
-        )
+        columns["blocks"].append(result.get("bs", "4k"))
+        columns["iops"].append(f"{result.get('iops', 0):,.0f}")
+        columns["bandwidth"].append(f"{result.get('bw_mb', 0):.1f}")
+        columns["lat_avg"].append(f"{result.get('lat_avg', 0):.2f}")
+        columns["lat_p99"].append(f"{result.get('lat_p99', 0):.2f}")
+        columns["statuses"].append(result.get("status", "undone"))
 
-    return table
+    return columns
 
 
-def build_disk_table(index, disk, disk_results, test_names):
-    """Строит самостоятельный рамочный блок одного накопителя."""
+def build_results_table(disks, results, test_names):
+    """Строит одну непрерывную таблицу для всех накопителей."""
     table = Table(
-        box=DISK_TABLE_BOX,
+        box=box.ROUNDED,
         expand=True,
-        show_header=True,
-        header_style="",
+        show_header=False,
         border_style="",
         padding=(0, 1),
     )
-    table.add_column("№", justify="right", width=4)
-    table.add_column("Накопитель", min_width=30)
-    table.add_column(
-        "Результаты тестирования накопителя (FIO)", min_width=70
-    )
-    table.add_row(
-        str(index),
-        build_disk_info(disk),
-        build_test_results_table(disk_results, test_names),
-    )
-    return table
+    table.add_column(justify="right", width=4)
+    table.add_column(min_width=28)
+    table.add_column(min_width=18)
+    table.add_column(justify="center")
+    table.add_column(justify="right")
+    table.add_column(justify="right")
+    table.add_column(justify="right")
+    table.add_column(justify="right")
+    table.add_column(justify="center")
 
-
-def build_results_table(disks, results, test_names, gap=DEFAULT_GAP):
-    """Объединяет самостоятельные таблицы дисков в один Rich renderable."""
-    renderables = []
     for index, disk in enumerate(disks, 1):
-        if renderables and gap > 0:
-            renderables.append(Text("\n" * (gap - 1)))
         disk_results = results[index - 1] if index - 1 < len(results) else {}
-        renderables.append(
-            build_disk_table(index, disk, disk_results, test_names)
+        test_columns = _test_columns(disk_results, test_names)
+        table.add_row(
+            _multiline_cell(COLUMN_HEADERS[0], (index,)),
+            _multiline_cell(COLUMN_HEADERS[1], _disk_details(disk)),
+            _multiline_cell(COLUMN_HEADERS[2], test_columns["names"]),
+            _multiline_cell(COLUMN_HEADERS[3], test_columns["blocks"]),
+            _multiline_cell(COLUMN_HEADERS[4], test_columns["iops"]),
+            _multiline_cell(COLUMN_HEADERS[5], test_columns["bandwidth"]),
+            _multiline_cell(COLUMN_HEADERS[6], test_columns["lat_avg"]),
+            _multiline_cell(COLUMN_HEADERS[7], test_columns["lat_p99"]),
+            _status_cell(test_columns["statuses"]),
         )
-    return Group(*renderables)
+
+    return table
