@@ -4,11 +4,6 @@ fio-test.py — Автоматический бенчмаркинг несист
 Сканирует систему на несистемные диски, классифицирует их по интерфейсу
 (NVMe/SAS/SATA), запускает FIO-тесты с оптимальными параметрами для каждого типа
 и выводит результаты в реальном времени через rich, а по завершении — в MD-отчёт.
-
-Использование:
-    python fio-test.py
-    python fio-test.py --precond
-    python fio-test.py --output report.md
 """
 
 import argparse
@@ -272,28 +267,52 @@ def run_fio_test(disk_info: dict, test_id: str, base_args: list[str]) -> dict:
         "--output-format=json",
     ] + fio_args
 
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return {"error": "Утилита 'fio' не установлена в системе. Пожалуйста, установите 'fio' (например, 'apt install fio')."}
+    except Exception as e:
+        return {"error": f"Не удалось запустить утилиту FIO: {e}"}
+
     if res.returncode != 0:
-        return {"error": f"FIO Error (exit {res.returncode})"}
+        stderr_hint = f" ({res.stderr.strip()})" if res.stderr else ""
+        return {"error": f"FIO завершился с ошибкой (код {res.returncode}){stderr_hint}"}
 
     try:
         fio_data = json.loads(res.stdout)
+        if "jobs" not in fio_data or not fio_data["jobs"]:
+            return {"error": "Вывод FIO не содержит результатов выполнения работы (jobs)."}
+            
         job = fio_data["jobs"][0]
-
         mode = "read" if "read" in test_id else "write"
+        
+        if mode not in job:
+            return {"error": f"В результатах FIO отсутствует статистика для режима '{mode}'."}
+            
         stats = job[mode]
 
-        avg_lat = stats["lat_ns"]["mean"] / 1_000_000
-        p99_lat = stats["clat_ns"]["percentile"]["99.000000"] / 1_000_000
+        iops = int(stats.get("iops", 0))
+        bw = float(stats.get("bw", 0))
+        
+        lat_ns = stats.get("lat_ns", {})
+        avg_lat = lat_ns.get("mean", 0) / 1_000_000
+        
+        clat_ns = stats.get("clat_ns", {})
+        percentiles = clat_ns.get("percentile", {})
+        p99_lat = percentiles.get("99.000000", 0) / 1_000_000
 
         return {
-            "iops": int(stats["iops"]),
-            "bw_mb": round(stats["bw"] / 1024, 2),
+            "iops": iops,
+            "bw_mb": round(bw / 1024, 2),
             "lat_avg": round(avg_lat, 2),
             "lat_p99": round(p99_lat, 2),
         }
+    except json.JSONDecodeError:
+        return {"error": "Не удалось декодировать JSON-вывод FIO. Возможно, запуск прервался или вывод поврежден."}
+    except KeyError as e:
+        return {"error": f"В выводе FIO отсутствует ожидаемый ключ статистики: {e}"}
     except Exception as e:
-        return {"error": f"Parse Error: {e}"}
+        return {"error": f"Ошибка обработки результатов FIO: {e}"}
 
 
 def run_precondition(disk_info: dict) -> bool:
@@ -312,12 +331,65 @@ def run_precondition(disk_info: dict) -> bool:
         "--group_reporting",
     ]
 
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return res.returncode == 0
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        return res.returncode == 0
+    except FileNotFoundError:
+        console.print("[red]Ошибка: утилита 'fio' не найдена. Пожалуйста, установите 'fio' в систему.[/red]")
+        return False
+    except Exception as e:
+        console.print(f"[red]Непредвиденная ошибка при запуске прекондишинга: {e}[/red]")
+        return False
+
+
+def optimize_nvme_args(test_id: str, args_list: list[str], pcie_info: dict) -> list[str]:
+    """
+    Динамически переопределяет параметры запуска FIO в зависимости от поколения PCIe.
+    Это помогает раскрыть потенциал высокопроизводительных Gen5 дисков и избежать 
+    бутылочного горлышка в виде CPU (однопоточных ограничений).
+    """
+    new_args = list(args_list)
+    gen = pcie_info.get("gen")
+    
+    if not gen:
+        return new_args
+
+    def set_arg(prefix: str, val: str):
+        for idx, arg in enumerate(new_args):
+            if arg.startswith(prefix):
+                new_args[idx] = f"{prefix}{val}"
+                return
+        new_args.append(f"{prefix}{val}")
+
+    if gen >= 5:
+        # Для Gen5 дисков (например, KIOXIA CM7-V):
+        # Паспортная скорость чтения 14 ГБ/с требует многопоточности для исключения CPU Bottleneck
+        if test_id == "seq_read":
+            set_arg("--numjobs=", "4")
+            set_arg("--iodepth=", "16")
+            set_arg("--bs=", "256k")  # блок 256k раскрывает пропускную способность шины PCIe Gen5
+        elif test_id == "seq_write":
+            set_arg("--numjobs=", "2")
+            set_arg("--iodepth=", "16")
+        elif test_id == "rand_read":
+            set_arg("--numjobs=", "16")  # Сверхвысокие IOPS (до 2.7M) на чтение
+            set_arg("--iodepth=", "16")
+        elif test_id == "rand_write":
+            set_arg("--numjobs=", "8")
+            set_arg("--iodepth=", "16")
+    elif gen == 4:
+        # Для Gen4 дисков:
+        if test_id == "seq_read":
+            set_arg("--numjobs=", "2")
+            set_arg("--iodepth=", "16")
+        elif test_id == "rand_read":
+            set_arg("--numjobs=", "8")
+            set_arg("--iodepth=", "32")
+            
+    return new_args
 
 
 # Custom box for inner table — horizontal lines only, no vertical separators
-# Try multiple approaches for compatibility with different rich versions
 _HLINE_BOX = None
 try:
     from rich.box import SIMPLE as _HLINE_BOX
@@ -335,8 +407,7 @@ def _status_style(status: str) -> str:
 
 
 def build_results_table(disks: list, results: list) -> Table:
-    """Строит внешнюю таблицу с вложенными таблицами для каждого диска."""
-    # Group results by disk (preserving order)
+    """Строит общую внешнюю таблицу, где инфо о диске расположена в отдельном столбце слева."""
     grouped = []
     for disk in disks:
         disk_results = [r for r in results if r["disk"] == disk["name"]]
@@ -344,15 +415,30 @@ def build_results_table(disks: list, results: list) -> Table:
             grouped.append((disk, disk_results))
 
     outer = Table(
-        show_header=False,
+        show_header=True,
         show_edge=True,
         show_lines=True,
-        padding=(0, 1),
+        padding=(1, 1),
     )
-    outer.add_column("№", justify="center", width=3)
-    outer.add_column("")
+    outer.add_column("№", justify="center", width=4)
+    outer.add_column("Накопитель", justify="left", width=35, style="cyan")
+    outer.add_column("Результаты тестирования накопителей (FIO)", justify="left")
 
     for disk_num, (disk, disk_results) in enumerate(grouped, 1):
+        slot_str = f"Slot: {disk['slot']}\n" if disk.get("slot") else ""
+        pcie_str = ""
+        if disk.get("pcie_info") and disk["pcie_info"].get("gen"):
+            pcie_str = f" (PCIe Gen{disk['pcie_info']['gen']} x{disk['pcie_info'].get('width', '?')})"
+        
+        disk_info_text = (
+            f"[bold]/dev/{disk['name']}[/bold]\n"
+            f"{disk['model']}\n"
+            f"[white]{disk['tran']}{pcie_str}[/white]\n"
+            f"SN: {disk['serial']}\n"
+            f"{slot_str}"
+            f"Размер: {disk['size']}"
+        )
+
         inner = Table(
             box=_HLINE_BOX,
             show_edge=False,
@@ -378,7 +464,7 @@ def build_results_table(disks: list, results: list) -> Table:
                 _status_style(r.get("status", "...")),
             )
 
-        outer.add_row(str(disk_num), inner)
+        outer.add_row(str(disk_num), disk_info_text, inner)
 
     return outer
 
@@ -397,11 +483,18 @@ def main() -> None:
         thresholds["SATA"] = parse_custom_thresholds(args.threshold_sata)
 
     console.print("[bold blue]Сканирование системы на несистемные диски...[/bold blue]")
-    disks = get_non_system_disks(INTERFACE_CONFIGS)
+    
+    try:
+        disks = get_non_system_disks(INTERFACE_CONFIGS)
+    except Exception as e:
+        console.print(f"\n[bold red]Критическая ошибка при сканировании устройств:[/bold red]")
+        console.print(f"[red]{e}[/red]\n")
+        sys.exit(1)
 
     if not disks:
         console.print(
-            "[bold red]Безопасные несистемные диски для тестов не найдены![/bold red]"
+            "[bold red]Безопасные несистемные диски для тестов не найдены![/bold red]\n"
+            "[yellow]Все подключенные диски содержат активные системные разделы (/, /boot и др.) и были отфильтрованы для защиты данных.[/yellow]"
         )
         sys.exit(1)
 
@@ -411,9 +504,13 @@ def main() -> None:
 
     for i, d in enumerate(disks, 1):
         slot_str = f", Slot: {d['slot']}" if d.get("slot") else ""
+        pcie_str = ""
+        if d.get("pcie_info") and d["pcie_info"].get("gen"):
+            pcie_str = f", PCIe Gen{d['pcie_info']['gen']} x{d['pcie_info'].get('width', '?')}"
+            
         console.print(
             f"  [cyan]{i}. /dev/{d['name']}[/cyan] — {d['model']} "
-            f"([white]{d['tran']}[/white], SN: [white]{d['serial']}[/white]{slot_str})"
+            f"([white]{d['tran']}{pcie_str}[/white], SN: [white]{d['serial']}[/white]{slot_str})"
         )
     console.print()
 
@@ -470,6 +567,11 @@ def main() -> None:
             })
 
             fio_args = list(t["args"])
+            
+            # Применяем оптимизацию параметров FIO под поколение PCIe для NVMe накопителей
+            if disk["tran"] == "NVME" and disk.get("pcie_info"):
+                fio_args = optimize_nvme_args(t["id"], fio_args, disk["pcie_info"])
+
             if args.runtime != 30:
                 fio_args = [
                     (
@@ -496,7 +598,11 @@ def main() -> None:
             future_to_info
         ):
             idx, disk, t, fio_args = future_to_info[future]
-            res = future.result()
+            
+            try:
+                res = future.result()
+            except Exception as e:
+                res = {"error": f"Непредвиденный сбой потока выполнения теста: {e}"}
 
             bs = "4k"
             for a in fio_args:
@@ -515,6 +621,9 @@ def main() -> None:
                 results[idx]["error_msg"] = res["error"]
                 results[idx]["bs"] = bs
                 results[idx]["status"] = "undone"
+                
+                # Дополнительно выведем человекочитаемую ошибку выполнения теста
+                console.print(f"[bold red]Ошибка теста '{t['name']}' на /dev/{disk['name']}:[/bold red] {res['error']}")
             else:
                 results[idx]["test_name"] = (
                     f"[green]{t['name']}[/green]"
@@ -531,16 +640,31 @@ def main() -> None:
 
     console.print()
     console.print("[bold green]Результаты тестирования накопителей (FIO)[/bold green]")
-    console.print(build_results_table(disks, results))
+    
+    try:
+        console.print(build_results_table(disks, results))
+    except Exception as e:
+        console.print(f"[bold red]Ошибка построения результирующей таблицы:[/bold red] {e}")
+        
     console.print(
         "\n[bold green]Все тесты завершены.[/bold green]"
     )
 
-    report_path = generate_report(disks, results, args.output)
-    console.print(
-        f"[bold green]Отчёт сохранён: {report_path}[/bold green]"
-    )
+    try:
+        report_path = generate_report(disks, results, args.output)
+        console.print(
+            f"[bold green]Отчёт сохранён: {report_path}[/bold green]"
+        )
+    except Exception as e:
+        console.print(f"[bold red]Не удалось сгенерировать или сохранить MD-отчёт:[/bold red] {e}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Тестирование прервано пользователем.[/bold yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"\n[bold red]Произошел непредвиденный сбой скрипта:[/bold red] {e}")
+        sys.exit(1)
