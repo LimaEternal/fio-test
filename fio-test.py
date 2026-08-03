@@ -24,8 +24,6 @@ import signal
 import subprocess
 import sys
 import threading
-from datetime import datetime
-from pathlib import Path
 
 from rich.console import Console
 
@@ -107,8 +105,8 @@ def parse_args():
     )
     parser.add_argument(
         "-d", "--diagnostic", action="store_true",
-        help="Диагностический режим: временные логи fio, сэмплинг линка/"
-             "температуры/нагрузки, артефакты в каталоге logs/",
+        help="Диагностический режим: сэмплинг линка/температуры/нагрузки "
+             "в пер-секундные таблицы отчёта",
     )
     parser.add_argument(
         "-t", "--test", action="store_true",
@@ -368,13 +366,12 @@ def _parse_fio_result(test_id, stdout):
     return res
 
 
-def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_dir=None):
+def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=None):
     """Запускает fio-тест. Поддерживает отмену через cancel_event.
 
-    В диагностическом режиме (diag_dir) дополнительно включает временные
-    логи fio (--write_bw_log/--write_iops_log/--write_lat_log), сохраняет
-    сырой JSON в raw.json и параллельно сэмплирует линк, температуру
-    и реальную нагрузку на диск.
+    В диагностическом режиме (diag_store) параллельно сэмплирует линк,
+    температуру и реальную нагрузку на диск; сэмплы и сводка сохраняются
+    в памяти и попадают в единый файл отчёта.
     """
     disk_path = disk_info["path"]
     cmd = [
@@ -392,14 +389,7 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_dir=None
     sampler = None
     sampler_thread = None
 
-    if diag_dir:
-        diag_dir.mkdir(parents=True, exist_ok=True)
-        cmd += [
-            "--log_avg_msec=1000",
-            f"--write_bw_log={diag_dir / 'bw'}",
-            f"--write_iops_log={diag_dir / 'iops'}",
-            f"--write_lat_log={diag_dir / 'lat'}",
-        ]
+    if diag_store is not None:
         sampler = DiagnosticSampler(disk_info)
         sampler_thread = threading.Thread(
             target=sampler.run, args=(stop_event,), daemon=True
@@ -407,7 +397,6 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_dir=None
         sampler_thread.start()
 
     res = None
-    raw_stdout = ""
     try:
         try:
             result = _run_io_process(cmd, cancel_event)
@@ -423,7 +412,6 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_dir=None
                 proc, stdout, stderr = result
                 stdout = stdout.decode() if stdout else ""
                 stderr = stderr.decode() if stderr else ""
-                raw_stdout = stdout
                 if proc.returncode != 0:
                     hint = stderr.strip()[:200] if stderr else ""
                     res = {"error": f"fio завершился с кодом {proc.returncode}: {hint}"}
@@ -436,9 +424,12 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_dir=None
 
     if res is not None:
         if sampler:
-            res["diag"] = sampler.summary()
-        if diag_dir and "error" not in res and raw_stdout:
-            (diag_dir / "raw.json").write_text(raw_stdout, encoding="utf-8")
+            summary = sampler.summary()
+            res["diag"] = summary
+            diag_store.setdefault(disk_info["name"], {})[test_id] = {
+                "samples": sampler.samples,
+                "summary": summary,
+            }
 
     return res
 
@@ -546,15 +537,14 @@ def process_task_result(results, idx, disk, t, fio_args, res):
     results[idx][t] = res
 
 
-def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_dir=None):
+def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=None):
     """Запускает все тесты одного диска строго последовательно.
 
     Параллелизация идёт по дискам, а не по отдельным тестам: несколько fio,
     конкурирующих за один накопитель, делят его шину и занижают результаты.
     """
     for t, fio_args in plan:
-        test_dir = diag_dir / disk["name"] / t if diag_dir else None
-        res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event, diag_dir=test_dir)
+        res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event, diag_store=diag_store)
         process_task_result(results, disk_idx, disk, t, fio_args, res)
 
 
@@ -635,10 +625,11 @@ def main():
 
     cancel_event = threading.Event()
 
-    diag_dir = None
+    # Сбор диагностических сэмплов в памяти: {диск: {тест: {"samples", "summary"}}}
+    diag_store = {}
     if args.diagnostic:
-        diag_dir = Path("logs") / f"fio_diag_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-        console.print(f"\n[bold]Диагностика: артефакты в {diag_dir}[/bold]")
+        console.print("\n[bold]Диагностика: пер-секундные сэмплы линка/"
+                      "температуры/нагрузки — в единый файл отчёта[/bold]")
 
     # Прекондишнинг
     if args.precond:
@@ -695,7 +686,7 @@ def main():
     if args.sequential:
         try:
             for disk_idx, disk, plan in disk_plans:
-                run_disk_tests(disk_idx, disk, plan, results, cancel_event, diag_dir)
+                run_disk_tests(disk_idx, disk, plan, results, cancel_event, diag_store)
         except KeyboardInterrupt:
             cancel_event.set()
             console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
@@ -707,7 +698,7 @@ def main():
             for disk_idx, disk, plan in disk_plans:
                 fut = pool.submit(
                     run_disk_tests, disk_idx, disk, plan, results,
-                    cancel_event=cancel_event, diag_dir=diag_dir,
+                    cancel_event=cancel_event, diag_store=diag_store,
                 )
                 future_map[fut] = disk_idx
 
@@ -725,7 +716,9 @@ def main():
     console.print()
     console.print(table)
 
-    report_path = generate_report(disks, results, TEST_NAMES, output_path=args.output)
+    report_path = generate_report(
+        disks, results, TEST_NAMES, output_path=args.output, diag_store=diag_store
+    )
     console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
 
 

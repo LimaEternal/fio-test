@@ -25,11 +25,48 @@ TEST_NAMES = {
 }
 
 
+def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_names: dict) -> List[str]:
+    """Строит пер-секундные таблицы сэмплера для диска (из diag_store)."""
+    lines: List[str] = []
+    store = (diag_store or {}).get(disk_name)
+    if not store:
+        return lines
+
+    for test_id, test_name in test_names.items():
+        entry = store.get(test_id)
+        if not entry:
+            continue
+        samples = entry.get("samples") or []
+        if not samples:
+            continue
+
+        lines.append(f"**Сэмплы линка/температуры/нагрузки — {test_name}**")
+        lines.append("")
+        lines.append("| Сек | Линк | t°C | Чтение МБ/с | Запись МБ/с | IOPS | avgqu-sz |")
+        lines.append("|-----|------|-----|-------------|-------------|------|----------|")
+        for i, s in enumerate(samples, 1):
+            link = "—"
+            if s.get("gts") is not None:
+                link = f"{s['gts']:g} GT/s x{s.get('width') or '?'}"
+            temp = _fmt(s.get("temp"), ".1f") if s.get("temp") is not None else "—"
+            read_mbs = _fmt(s.get("read_mbs"), ".1f") if s.get("read_mbs") is not None else "—"
+            write_mbs = _fmt(s.get("write_mbs"), ".1f") if s.get("write_mbs") is not None else "—"
+            iops = _fmt(s.get("iops"), ",.0f") if s.get("iops") is not None else "—"
+            avgqu = _fmt(s.get("avgqu_sz"), ".1f") if s.get("avgqu_sz") is not None else "—"
+            lines.append(
+                f"| {i} | {link} | {temp} | {read_mbs} | {write_mbs} | {iops} | {avgqu} |"
+            )
+        lines.append("")
+
+    return lines
+
+
 def generate_report(
     disks: List[dict],
     results: List[dict],
     test_names: Optional[dict] = None,
     output_path: Optional[Union[str, Path]] = None,
+    diag_store: Optional[dict] = None,
 ) -> Path:
     """
     Генерирует MD-файл с таблицей результатов.
@@ -39,6 +76,8 @@ def generate_report(
         results     — список словарей с результатами тестов (по одному на диск)
         test_names  — порядок и отображаемые имена тестов (по умолчанию TEST_NAMES)
         output_path — путь для выходного файла (по умолчанию fio_report_<timestamp>.md)
+        diag_store  — диагностические данные {диск: {тест: {"samples", "summary"}}};
+                      при наличии добавляет пер-секундные таблицы сэмплера
 
     Возвращает:
         Path к созданному файлу
@@ -184,6 +223,7 @@ def generate_report(
                         f"{clat} | {res.get('slat_avg_ms', '—')} | {iod} | {gb} |"
                     )
                 lines.append("")
+                lines.extend(_render_sampler_tables(diag_store, disk["name"], test_names))
 
         lines.append("---")
         lines.append("*Отчёт сгенерирован автоматически*")

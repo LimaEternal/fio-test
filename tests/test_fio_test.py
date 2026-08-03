@@ -30,7 +30,7 @@ class RunDiskTestsTests(unittest.TestCase):
         results = [{"_thresholds": {}}]
         call_log = []
 
-        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_dir=None):
+        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_store=None):
             call_log.append(test_id)
             return {"iops": 1, "bw_mb": 1, "lat_avg": 0.1, "lat_p99": 0.2}
 
@@ -50,7 +50,7 @@ class RunDiskTestsTests(unittest.TestCase):
         results = [{"_thresholds": {}}]
         call_log = []
 
-        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_dir=None):
+        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_store=None):
             call_log.append(test_id)
             if test_id == "seq_read":
                 return {"error": "fio не найден"}
@@ -144,10 +144,10 @@ class MainParallelModeTests(unittest.TestCase):
             self.assertEqual([t for t, _ in plan], NVME_TEST_IDS)
             self.assertEqual(kwargs.get("cancel_event") is not None, True)
 
-    def test_diagnostic_mode_passes_diag_dir_to_runner(self):
+    def test_diagnostic_mode_passes_diag_store_to_runner_and_report(self):
         disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
         with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
-             mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
              mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-d"]), \
              mock.patch.object(fio_test, "collect_static_info",
@@ -157,7 +157,73 @@ class MainParallelModeTests(unittest.TestCase):
 
         self.assertEqual(fake_runner.call_count, 1)
         _, kwargs = fake_runner.call_args
-        self.assertIsNotNone(kwargs.get("diag_dir"))
+        self.assertIsNotNone(kwargs.get("diag_store"))
+        _, report_kwargs = fake_report.call_args
+        self.assertIsNotNone(report_kwargs.get("diag_store"))
+
+    def test_non_diagnostic_mode_passes_empty_diag_store(self):
+        disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
+             mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test.sys, "argv", ["fio-test.py"]), \
+             mock.patch.object(fio_test, "run_disk_tests") as fake_runner:
+            fio_test.main()
+
+        _, kwargs = fake_runner.call_args
+        self.assertEqual(kwargs.get("diag_store"), {})
+        _, report_kwargs = fake_report.call_args
+        self.assertEqual(report_kwargs.get("diag_store"), {})
+
+
+class RunFioTestDiagStoreTests(unittest.TestCase):
+    """run_fio_test в диагностическом режиме заполняет diag_store сэмплами."""
+
+    def test_diag_store_filled_with_samples_and_summary(self):
+        raw = json.dumps({
+            "jobs": [{
+                "read": {"bw_bytes": 1000, "iops": 1},
+                "usage": {"user": 0.1, "sys": 0.2},
+            }]
+        })
+        fake = (mock.Mock(returncode=0), raw.encode(), b"")
+        diag_store = {}
+        samples = [{
+            "gts": 32.0, "width": 4, "temp": 41.0,
+            "read_mbs": 1000.0, "write_mbs": 0.0, "iops": 100, "avgqu_sz": 10.0,
+        }]
+        with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
+             mock.patch.object(fio_test, "DiagnosticSampler") as fake_sampler_cls:
+            fake_sampler = fake_sampler_cls.return_value
+            fake_sampler.samples = samples
+            fake_sampler.summary.return_value = {
+                "link_gts_min": 32.0, "link_width_min": 4, "temp_max_c": 41.0,
+                "read_mbs_avg": 1000.0, "write_mbs_avg": 0.0, "iops_avg": 100,
+                "avgqu_sz_max": 10.0, "samples": 1,
+            }
+            res = fio_test.run_fio_test(
+                DISK, "seq_read", ["--rw=read"], diag_store=diag_store
+            )
+
+        self.assertIn("diag", res)
+        self.assertIn("nvme0n1", diag_store)
+        self.assertIn("seq_read", diag_store["nvme0n1"])
+        self.assertEqual(
+            diag_store["nvme0n1"]["seq_read"]["samples"], samples
+        )
+        self.assertEqual(
+            diag_store["nvme0n1"]["seq_read"]["summary"]["temp_max_c"], 41.0
+        )
+
+    def test_no_diag_store_means_no_sampler(self):
+        raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})
+        fake = (mock.Mock(returncode=0), raw.encode(), b"")
+        with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
+             mock.patch.object(fio_test, "DiagnosticSampler") as fake_sampler_cls:
+            res = fio_test.run_fio_test(DISK, "seq_read", ["--rw=read"])
+
+        self.assertNotIn("diag", res)
+        fake_sampler_cls.assert_not_called()
 
 
 if __name__ == "__main__":

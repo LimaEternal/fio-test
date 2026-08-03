@@ -1,0 +1,106 @@
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.reporter import _render_sampler_tables, generate_report
+
+DISK = {
+    "name": "nvme1n1", "path": "/dev/nvme1n1", "model": "KIOXIA KCMY1VUG3T20",
+    "serial": "SN", "tran": "NVME", "size": "3.2T", "phy_sec": 4096,
+    "pcie_info": {"gen": 5, "width": 4, "speed_gts": 32.0},
+}
+
+TEST_NAMES = {
+    "seq_read": "1. Послед. Чтение",
+    "seq_write": "2. Послед. Запись",
+    "rand_read": "3. Случ. Чтение 4k",
+    "rand_write": "4. Случ. Запись 4k",
+}
+
+SAMPLE = {
+    "gts": 32.0, "width": 4, "temp": 41.0,
+    "read_mbs": 12400.5, "write_mbs": 0.0, "iops": 47694, "avgqu_sz": 63.5,
+}
+
+
+def make_diag_store(samples):
+    return {
+        "nvme1n1": {
+            "seq_read": {
+                "samples": samples,
+                "summary": {
+                    "link_gts_min": 32.0, "link_width_min": 4, "temp_max_c": 41.0,
+                    "read_mbs_avg": 12400.5, "write_mbs_avg": 0.0, "iops_avg": 47694,
+                    "avgqu_sz_max": 63.5, "samples": len(samples),
+                },
+            }
+        }
+    }
+
+
+def make_results():
+    res = {
+        "iops": 47694, "bw_mb": 12400.5, "lat_avg": 1.33, "lat_p99": 1.83,
+        "cpu_user": 2.0, "cpu_sys": 16.0, "status": "ok",
+        "clat_p50_ms": 1.2, "clat_p90_ms": 1.5, "clat_p99_ms": 1.83,
+        "clat_p99_9_ms": 2.1, "slat_avg_ms": 0.002, "iodepth": 16, "io_kb": 500000,
+    }
+    return [
+        {"_thresholds": {}, "seq_read": {**res, "diag": {"temp_max_c": 41.0}}},
+    ]
+
+
+class RenderSamplerTablesTests(unittest.TestCase):
+    def test_renders_per_second_rows(self):
+        samples = [SAMPLE, {**SAMPLE, "temp": 42.0, "iops": 47700}]
+        lines = _render_sampler_tables(make_diag_store(samples), "nvme1n1", TEST_NAMES)
+
+        text = "\n".join(lines)
+        self.assertIn("Сэмплы линка/температуры/нагрузки", text)
+        self.assertIn("| Сек | Линк | t°C |", text)
+        self.assertIn("| 1 | 32 GT/s x4 | 41.0 | 12400.5 | 0.0 | 47,694 | 63.5 |", text)
+        self.assertIn("| 2 | 32 GT/s x4 | 42.0 | 12400.5 | 0.0 | 47,700 | 63.5 |", text)
+
+    def test_unknown_disk_renders_nothing(self):
+        lines = _render_sampler_tables(make_diag_store([SAMPLE]), "nvmeX", TEST_NAMES)
+        self.assertEqual(lines, [])
+
+    def test_none_values_rendered_as_dash(self):
+        sample = {"gts": None, "width": None, "temp": None,
+                  "read_mbs": 0.0, "write_mbs": 0.0, "iops": 0, "avgqu_sz": 0.0}
+        lines = _render_sampler_tables(make_diag_store([sample]), "nvme1n1", TEST_NAMES)
+        text = "\n".join(lines)
+        self.assertIn("| 1 | — | — | 0.0 | 0.0 | 0 | 0.0 |", text)
+
+
+class GenerateReportDiagStoreTests(unittest.TestCase):
+    def test_report_contains_sampler_tables_with_diag_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+                diag_store=make_diag_store([SAMPLE]),
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("Сэмплы линка/температуры/нагрузки", text)
+        self.assertIn("32 GT/s x4", text)
+        self.assertIn("**Диагностика — nvme1n1**", text)
+
+    def test_report_without_diag_store_has_no_sampler_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("Сэмплы линка/температуры/нагрузки", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
