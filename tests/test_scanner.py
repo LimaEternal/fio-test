@@ -1,16 +1,87 @@
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.scanner import _detect_interface, scan_disks
+from utils.scanner import _detect_interface, _link_generation, get_nvme_pcie_info, scan_disks
 
 
 KNOWN_INTERFACES = {"nvme": [], "sas": [], "sata": []}
+
+
+class LinkGenerationTests(unittest.TestCase):
+    def test_generation_mapping(self):
+        self.assertEqual(_link_generation(64.0), 6)
+        self.assertEqual(_link_generation(32.0), 5)
+        self.assertEqual(_link_generation(16.0), 4)
+        self.assertEqual(_link_generation(8.0), 3)
+        self.assertEqual(_link_generation(5.0), 2)
+        self.assertEqual(_link_generation(2.5), 1)
+
+
+class GetNvmePcieInfoTests(unittest.TestCase):
+    """Тесты поиска линк-файлов в sysfs (включая сценарий Intel VMD)."""
+
+    def _patch_sys_root(self, sys_dir):
+        """Перенаправляет обращения к /sys/... на временный каталог."""
+        root = str(sys_dir)
+
+        def _mapped(path):
+            p = str(path)
+            if p.startswith("/sys"):
+                return Path(root) / p[len("/sys"):].lstrip("/")
+            return Path(p)
+
+        return mock.patch("utils.scanner.Path", side_effect=_mapped)
+
+    def test_found_via_class_nvme_when_block_device_path_is_dead_end(self):
+        """VMD: /sys/block/<name>/device ведёт в тупик без линк-файлов,
+        но /sys/class/nvme/<nvmeN>/device указывает на реальную PCI-функцию."""
+        tmp = Path(tempfile.mkdtemp())
+        # Реальная PCI-функция: линк-файлы рядом с каталогом nvme/nvme1
+        pci_dir = tmp / "sys" / "class" / "nvme" / "nvme1" / "device"
+        (pci_dir / "nvme" / "nvme1").mkdir(parents=True)
+        (pci_dir / "current_link_speed").write_text("32.0 GT/s PCIe", encoding="utf-8")
+        (pci_dir / "current_link_width").write_text("4", encoding="utf-8")
+        # Тупик под /sys/block: линк-файлов нет нигде выше
+        (tmp / "sys" / "block" / "nvme1n1" / "device").mkdir(parents=True)
+
+        with self._patch_sys_root(tmp / "sys"):
+            info = get_nvme_pcie_info("nvme1n1")
+
+        self.assertEqual(info, {"gen": 5, "width": 4, "speed_gts": 32.0})
+
+    def test_walk_up_finds_link_files_in_parent(self):
+        """Линк-файлы лежат уровнем выше каталога, в который ведёт device."""
+        tmp = Path(tempfile.mkdtemp())
+        pci_dir = tmp / "sys" / "class" / "nvme" / "nvme2" / "device" / "pci-fn"
+        pci_dir.mkdir(parents=True)
+        (pci_dir.parent / "current_link_speed").write_text("32.0 GT/s", encoding="utf-8")
+        (pci_dir.parent / "current_link_width").write_text("4", encoding="utf-8")
+
+        with self._patch_sys_root(tmp / "sys"):
+            info = get_nvme_pcie_info("nvme2n1")
+
+        self.assertEqual(info, {"gen": 5, "width": 4, "speed_gts": 32.0})
+
+    def test_no_link_files_returns_empty_info(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "sys" / "class" / "nvme" / "nvme3" / "device").mkdir(parents=True)
+        (tmp / "sys" / "block" / "nvme3n1" / "device").mkdir(parents=True)
+
+        with self._patch_sys_root(tmp / "sys"):
+            info = get_nvme_pcie_info("nvme3n1")
+
+        self.assertEqual(info, {"gen": None, "width": None, "speed_gts": None})
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 class DetectInterfaceTests(unittest.TestCase):

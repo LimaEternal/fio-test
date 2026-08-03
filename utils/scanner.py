@@ -93,37 +93,78 @@ def _find_root_mount_name(node: dict) -> Optional[str]:
     return None
 
 
+def _link_generation(speed_gts: float) -> int:
+    """Сопоставляет скорость линка (GT/s) с поколением PCIe."""
+    if speed_gts >= 64.0:
+        return 6
+    if speed_gts >= 32.0:
+        return 5
+    if speed_gts >= 16.0:
+        return 4
+    if speed_gts >= 8.0:
+        return 3
+    if speed_gts >= 5.0:
+        return 2
+    return 1
+
+
+def _find_link_files(start_dir: Path):
+    """Ищет current_link_speed/current_link_width, поднимаясь от start_dir вверх.
+
+    Возвращает (speed_file, width_file) или None. Лимит в 8 уровней
+    защищает от бесконечного подъёма к корню ФС.
+    """
+    current_dir = start_dir
+    for _ in range(8):
+        speed_file = current_dir / "current_link_speed"
+        width_file = current_dir / "current_link_width"
+        if speed_file.exists() and width_file.exists():
+            return speed_file, width_file
+        parent = current_dir.parent
+        if parent == current_dir:
+            break
+        current_dir = parent
+    return None
+
+
 def get_nvme_pcie_info(disk_name: str) -> dict:
     """
     Определяет поколение PCIe и ширину шины (width) для NVMe диска на Linux.
     Возвращает словарь: {'gen': int|None, 'width': int|None, 'speed_gts': float|None}
+
+    Под Intel VMD /sys/block/<name>/device ведёт в виртуальный каталог
+    nvme-subsystem без линк-файлов, поэтому первым пробуется реальная
+    PCI-функция /sys/class/nvme/<nvmeN>/device.
     """
     info = {"gen": None, "width": None, "speed_gts": None}
 
-    sys_path = Path(f"/sys/block/{disk_name}/device")
-    if not sys_path.exists():
-        sys_path = Path(f"/sys/class/block/{disk_name}/device")
+    nvme_match = re.match(r"(nvme\d+)", disk_name)
+    nvme_dev = nvme_match.group(1) if nvme_match else None
 
-    if not sys_path.exists():
-        return info
+    start_dirs = []
+    if nvme_dev:
+        start_dirs.append(Path(f"/sys/class/nvme/{nvme_dev}/device"))
+    start_dirs.append(Path(f"/sys/block/{disk_name}/device"))
+    start_dirs.append(Path(f"/sys/class/block/{disk_name}/device"))
 
-    try:
-        real_path = sys_path.resolve()
-        current_dir = real_path
-        speed_file = None
-        width_file = None
+    for start in start_dirs:
+        if not start.exists():
+            continue
+        try:
+            real_path = start.resolve()
+        except Exception:
+            continue
 
-        for _ in range(5):
-            if ((current_dir / "current_link_speed").exists()
-                    and (current_dir / "current_link_width").exists()):
-                speed_file = current_dir / "current_link_speed"
-                width_file = current_dir / "current_link_width"
-                break
-            current_dir = current_dir.parent
-            if current_dir == current_dir.parent or current_dir.name in ("", "sys", "devices"):
-                break
+        try:
+            found = _find_link_files(real_path)
+        except Exception:
+            continue
 
-        if speed_file and width_file:
+        if not found:
+            continue
+
+        speed_file, width_file = found
+        try:
             speed_str = speed_file.read_text(encoding="utf-8").strip()
             width_str = width_file.read_text(encoding="utf-8").strip()
 
@@ -131,25 +172,13 @@ def get_nvme_pcie_info(disk_name: str) -> dict:
             if speed_match:
                 speed_gts = float(speed_match.group(1))
                 info["speed_gts"] = speed_gts
-
-                if speed_gts >= 64.0:
-                    info["gen"] = 6
-                elif speed_gts >= 32.0:
-                    info["gen"] = 5
-                elif speed_gts >= 16.0:
-                    info["gen"] = 4
-                elif speed_gts >= 8.0:
-                    info["gen"] = 3
-                elif speed_gts >= 5.0:
-                    info["gen"] = 2
-                else:
-                    info["gen"] = 1
+                info["gen"] = _link_generation(speed_gts)
 
             if width_str.isdigit():
                 info["width"] = int(width_str)
-
-    except Exception:
-        pass
+        except Exception:
+            pass
+        break
 
     return info
 

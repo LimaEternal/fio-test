@@ -463,6 +463,17 @@ def process_task_result(results, idx, disk, t, fio_args, res):
     results[idx][t] = res
 
 
+def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None):
+    """Запускает все тесты одного диска строго последовательно.
+
+    Параллелизация идёт по дискам, а не по отдельным тестам: несколько fio,
+    конкурирующих за один накопитель, делят его шину и занижают результаты.
+    """
+    for t, fio_args in plan:
+        res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event)
+        process_task_result(results, disk_idx, disk, t, fio_args, res)
+
+
 def main():
     args = parse_args()
     validate_configs()
@@ -551,9 +562,9 @@ def main():
     if args.runtime != 30:
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")
 
-    # Подготовка задач
+    # Подготовка задач: по одному плану тестов на диск (тесты диска — подряд)
     results = [{} for _ in disks]
-    tasks = []
+    disk_plans = []
 
     for disk_idx, disk in enumerate(disks):
         tran = disk.get("tran", "").lower()
@@ -566,7 +577,9 @@ def main():
 
         tests = INTERFACE_CONFIGS.get(tran_key, INTERFACE_CONFIGS["sata"])
         pcie_info = disk.get("pcie_info") if "nvme" in tran else None
+        results[disk_idx]["_thresholds"] = thresholds.get(tran_key, {})
 
+        plan = []
         for test in tests:
             t = test["id"]
             fio_args = list(test["args"])
@@ -581,15 +594,15 @@ def main():
             if "nvme" in tran and pcie_info:
                 fio_args = optimize_nvme_args(t, fio_args, pcie_info)
 
-            results[disk_idx]["_thresholds"] = thresholds.get(tran_key, {})
-            tasks.append((disk_idx, disk, t, fio_args))
+            plan.append((t, fio_args))
+
+        disk_plans.append((disk_idx, disk, plan))
 
     # Запуск тестов
     if args.sequential:
         try:
-            for disk_idx, disk, t, fio_args in tasks:
-                res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event)
-                process_task_result(results, disk_idx, disk, t, fio_args, res)
+            for disk_idx, disk, plan in disk_plans:
+                run_disk_tests(disk_idx, disk, plan, results, cancel_event)
         except KeyboardInterrupt:
             cancel_event.set()
             console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
@@ -598,14 +611,15 @@ def main():
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         try:
             future_map = {}
-            for disk_idx, disk, t, fio_args in tasks:
-                fut = pool.submit(run_fio_test, disk, t, fio_args, cancel_event=cancel_event)
-                future_map[fut] = (disk_idx, disk, t, fio_args)
+            for disk_idx, disk, plan in disk_plans:
+                fut = pool.submit(
+                    run_disk_tests, disk_idx, disk, plan, results,
+                    cancel_event=cancel_event,
+                )
+                future_map[fut] = disk_idx
 
             for fut in concurrent.futures.as_completed(future_map):
-                disk_idx, disk, t, fio_args = future_map[fut]
-                res = fut.result()
-                process_task_result(results, disk_idx, disk, t, fio_args, res)
+                fut.result()
         except KeyboardInterrupt:
             cancel_event.set()
             console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
