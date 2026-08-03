@@ -74,7 +74,7 @@ def generate_report(
 
             lines.append(
                 f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
-                f"| {d['tran']}{pcie_str} | {d['size']} |"
+                f"| {d['tran'].upper()}{pcie_str} | {d['size']} |"
             )
 
         lines.append("")

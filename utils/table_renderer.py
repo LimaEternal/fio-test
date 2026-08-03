@@ -40,7 +40,7 @@ def _disk_details(disk):
     return (
         f"/dev/{disk['name']}",
         disk.get("model", "N/A").strip(),
-        disk.get("tran", "N/A"),
+        disk.get("tran", "N/A").upper(),
         f"SN: {disk.get('serial', 'N/A').strip()}",
         f"Slot: {disk.get('slot', 'N/A')}",
         f"Размер: {disk.get('size', 'N/A')}",

@@ -18,15 +18,20 @@ def _detect_interface(disk_name: str, raw_tran: Optional[str]) -> str:
     """
     Определяет тип интерфейса диска.
 
-    Если lsblk не вернул поле tran (бывает на старых ядрах),
-    пытаемся угадать по имени устройства: nvme* → NVME, иначе → SATA.
+    Имя устройства (nvme*) имеет приоритет — на системах с Intel VMD
+    lsblk может отдавать в поле tran нестандартные значения (например,
+    "pcie"), при этом диск остаётся NVMe. Если tran известен (sas/sata),
+    используем его, иначе считаем диск SATA.
     """
-    tran = (raw_tran or "").upper()
+    if "nvme" in disk_name:
+        return "nvme"
 
-    if not tran:
-        return "NVME" if "nvme" in disk_name else "SATA"
+    tran = (raw_tran or "").lower()
 
-    return tran
+    if tran in ("sas", "sata"):
+        return tran
+
+    return "sata"
 
 
 def _is_system_mount(mp: str) -> bool:
@@ -200,7 +205,7 @@ def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict
 
         tran = _detect_interface(d["name"], d.get("tran"))
         if tran not in known_interfaces:
-            tran = "SATA"
+            tran = "sata"
 
         slot = d.get("hctl") or ""
         if not slot and "nvme" in d["name"]:
@@ -209,7 +214,7 @@ def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict
                 slot = m.group(1)
 
         pcie_info = {"gen": None, "width": None, "speed_gts": None}
-        if tran == "NVME":
+        if tran == "nvme":
             pcie_info = get_nvme_pcie_info(d["name"])
 
         disk_info = {
