@@ -13,6 +13,7 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -c -p        — с подтверждением и прекондишнингом
     python fio-test.py -r 60        — 60 сек на тест
     python fio-test.py -o my.md     — свой путь отчёта
+    python fio-test.py -t           — тестовый режим (пробные данные без fio)
 """
 
 import argparse
@@ -57,7 +58,7 @@ INTERFACE_THRESHOLDS = {
 }
 
 
-_SHORT_FLAGS = {"c", "s", "p"}
+_SHORT_FLAGS = {"c", "s", "p", "t"}
 
 
 def _expand_short_flags(argv: list[str]) -> list[str]:
@@ -83,6 +84,7 @@ def parse_args():
             "  python fio-test.py -c -s                     — с подтверждением, последовательно\n"
             "  python fio-test.py -c -p                     — с подтверждением и прекондишнингом\n"
             "  python fio-test.py -r 60                     — 60 секунд на каждый тест\n"
+            "  python fio-test.py -t                        — тестовый режим (пробные данные)\n"
             "  python fio-test.py -o reports/custom.md       — свой путь отчёта\n"
             "  python fio-test.py -c --threshold-nvme \"seq_read=15000:seq_write=12000\""
         ),
@@ -99,6 +101,10 @@ def parse_args():
     parser.add_argument(
         "-p", "--precond", action="store_true",
         help="Прекондишнинг перед тестами",
+    )
+    parser.add_argument(
+        "-t", "--test", action="store_true",
+        help="Тестовый режим: заполнить таблицу пробными значениями без запуска fio",
     )
     parser.add_argument(
         "-o", "--output", type=str, default=None,
@@ -152,6 +158,49 @@ def parse_custom_thresholds(raw):
             elif k.startswith("rand_"):
                 result.setdefault(k, {})["min_iops"] = v
     return result
+
+
+def build_fake_disks() -> list:
+    """Фейковые диски (5 шт., разные интерфейсы) для проверки вёрстки таблицы."""
+    return [
+        {
+            "name": "nvme0n1", "path": "/dev/nvme0n1",
+            "model": "SAMSUNG MZWLO1T9HCJR-00A07", "serial": "S795NC0Y101175",
+            "tran": "NVME", "size": "1.7T", "phy_sec": 512, "slot": "nvme0",
+            "pcie_info": {"gen": 5, "width": 4, "speed_gts": 32.0}, "root_partition": None,
+        },
+        {
+            "name": "nvme1n1", "path": "/dev/nvme1n1",
+            "model": "SAMSUNG MZWLO1T9HCJR-00A07", "serial": "S795NC0Y101184",
+            "tran": "NVME", "size": "1.7T", "phy_sec": 512, "slot": "nvme1",
+            "pcie_info": {"gen": 4, "width": 4, "speed_gts": 16.0}, "root_partition": None,
+        },
+        {
+            "name": "sda", "path": "/dev/sda",
+            "model": "SEAGATE ST1800MM0129", "serial": "ABC12345",
+            "tran": "SAS", "size": "1.8T", "phy_sec": 512, "slot": "0:2:0:0",
+            "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+        },
+        {
+            "name": "sdb", "path": "/dev/sdb",
+            "model": "SAMSUNG PM883 960GB", "serial": "S3Z7NB0T0000001",
+            "tran": "SATA", "size": "960G", "phy_sec": 512, "slot": "1:0:0:0",
+            "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+        },
+        {
+            "name": "sdc", "path": "/dev/sdc",
+            "model": "WDC WD4004FZWX", "serial": "WD-WCC4E0TST01",
+            "tran": "SATA", "size": "4T", "phy_sec": 4096, "slot": "1:0:0:1",
+            "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+        },
+    ]
+
+
+def build_fake_results(disks: list) -> list:
+    """Пробные результаты: во всех ячейках значение 'test'."""
+    fake = {"bs": "test", "iops": "test", "bw_mb": "test",
+            "lat_avg": "test", "lat_p99": "test", "status": "test"}
+    return [{test_id: dict(fake) for test_id in TEST_NAMES} for _ in disks]
 
 
 def validate_configs():
@@ -430,6 +479,17 @@ def main():
         thresholds["sas"].update(parse_custom_thresholds(args.threshold_sas))
     if args.threshold_sata:
         thresholds["sata"].update(parse_custom_thresholds(args.threshold_sata))
+
+    if args.test:
+        disks = build_fake_disks()
+        results = build_fake_results(disks)
+        console.print("[bold]Тестовый режим: пробные данные, fio не запускается[/bold]")
+        console.print()
+        table = build_results_table(disks, results, TEST_NAMES)
+        console.print(table)
+        report_path = generate_report(disks, results, TEST_NAMES, output_path=args.output)
+        console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
+        return
 
     console.print("[bold]Сканирование дисков...[/bold]")
 

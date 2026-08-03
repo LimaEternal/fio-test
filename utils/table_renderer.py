@@ -14,22 +14,25 @@ from rich.text import Text
 
 TITLE = "Результаты тестирования накопителей (FIO)"
 
-RESULT_HEADERS = (
-    ("Профиль теста", "left", 9),
-    ("Блок", "center", 5),
-    ("IOPS", "center", 7),
-    ("Скорость (МБ/с)", "center", 8),
-    ("Lat Avg (мс)", "center", 11),
-    ("Lat p99 (мс)", "center", 10),
-    ("Статус", "center", 6),
+# Поставьте True, чтобы вернуть колонку Lat p99
+# (метрика по-прежнему парсится в fio-test.py, скрыт только вывод).
+SHOW_LAT_P99 = False
+
+RESULT_HEADERS = tuple(
+    [("Профиль теста", "left", 9), ("Блок", "center", 5), ("IOPS", "center", 7),
+     ("Скорость (МБ/с)", "center", 8), ("Lat Avg (мс)", "center", 11)]
+    + ([("Lat p99 (мс)", "center", 10)] if SHOW_LAT_P99 else [])
+    + [("Статус", "center", 6)]
 )
 
 
 def format_status(status):
-    """Возвращает статус с единственной цветовой разметкой таблицы."""
+    """Возвращает статус с цветовой разметкой; неизвестные значения — как есть."""
     if status == "done":
         return Text("done", style="bold green")
-    return Text("undone", style="bold red")
+    if status == "undone":
+        return Text("undone", style="bold red")
+    return Text(str(status))
 
 
 def _disk_details(disk):
@@ -44,6 +47,14 @@ def _disk_details(disk):
     )
 
 
+def _fmt(value, spec):
+    """Форматирует число; строки (например, 'test') пропускает как есть."""
+    try:
+        return f"{float(value):{spec}}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _test_rows(disk_results, test_names):
     """Преобразует результаты тестов в строки вложенной таблицы.
 
@@ -54,17 +65,22 @@ def _test_rows(disk_results, test_names):
     for test_id, test_name in test_names.items():
         result = disk_results.get(test_id, {})
         if "error" in result:
-            rows.append((test_name + "\n", "—", "—", "—", "—", "—", "undone"))
+            row = [test_name + "\n", "—", "—", "—", "—"]
+            if SHOW_LAT_P99:
+                row.append("—")
+            row.append("undone")
         else:
-            rows.append((
+            row = [
                 test_name + "\n",
                 result.get("bs", "4k"),
-                f"{result.get('iops', 0):,.0f}",
-                f"{result.get('bw_mb', 0):.1f}",
-                f"{result.get('lat_avg', 0):.2f}",
-                f"{result.get('lat_p99', 0):.2f}",
-                result.get("status", "undone"),
-            ))
+                _fmt(result.get("iops", 0), ",.0f"),
+                _fmt(result.get("bw_mb", 0), ".1f"),
+                _fmt(result.get("lat_avg", 0), ".2f"),
+            ]
+            if SHOW_LAT_P99:
+                row.append(_fmt(result.get("lat_p99", 0), ".2f"))
+            row.append(result.get("status", "undone"))
+        rows.append(tuple(row))
     return rows
 
 

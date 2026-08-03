@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Union
 
+from utils.table_renderer import SHOW_LAT_P99, _fmt
+
 
 def _strip_rich(text: str) -> str:
     """Удаляет rich-разметку [tag]...[/tag] из строки."""
@@ -82,30 +84,41 @@ def generate_report(
         for idx, (disk, disk_results) in enumerate(zip(disks, results), 1):
             lines.append(f"### {idx}. /dev/{disk['name']} ({disk['model']})")
             lines.append("")
-            lines.append(
-                "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat P99 (мс) | Статус |"
-            )
-            lines.append(
-                "|---------------|------|------|-----------------|--------------|--------------|--------|"
-            )
+            if SHOW_LAT_P99:
+                lines.append(
+                    "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat P99 (мс) | Статус |"
+                )
+                lines.append(
+                    "|---------------|------|------|-----------------|--------------|--------------|--------|"
+                )
+            else:
+                lines.append(
+                    "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Статус |"
+                )
+                lines.append(
+                    "|---------------|------|------|-----------------|--------------|--------|"
+                )
 
             for test_id, test_name in test_names.items():
                 res = disk_results.get(test_id, {})
 
                 if "error" in res:
-                    lines.append(
-                        f"| {test_name} | {res.get('bs', '—')} | — | — | — | — | undone |"
-                    )
+                    cells = [test_name, res.get("bs", "—"), "—", "—", "—"]
+                    if SHOW_LAT_P99:
+                        cells.append("—")
+                    cells.append("undone")
                 else:
-                    iops = f"{res.get('iops', 0):,.0f}"
-                    bw = f"{res.get('bw_mb', 0):.1f}"
-                    lat_avg = f"{res.get('lat_avg', 0):.2f}"
-                    lat_p99 = f"{res.get('lat_p99', 0):.2f}"
-                    status = res.get("status", "undone")
-                    lines.append(
-                        f"| {test_name} | {res.get('bs', '4k')} | {iops} | {bw} "
-                        f"| {lat_avg} | {lat_p99} | {status} |"
-                    )
+                    cells = [
+                        test_name,
+                        res.get("bs", "4k"),
+                        _fmt(res.get("iops", 0), ",.0f"),
+                        _fmt(res.get("bw_mb", 0), ".1f"),
+                        _fmt(res.get("lat_avg", 0), ".2f"),
+                    ]
+                    if SHOW_LAT_P99:
+                        cells.append(_fmt(res.get("lat_p99", 0), ".2f"))
+                    cells.append(res.get("status", "undone"))
+                lines.append("| " + " | ".join(cells) + " |")
 
             lines.append("")
 

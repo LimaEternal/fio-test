@@ -34,23 +34,23 @@ RESULTS = [
     {
         "seq_read": {
             "bs": "64k", "iops": 73390, "bw_mb": 4586.9,
-            "lat_avg": 0.44, "lat_p99": 0.0, "status": "done",
+            "lat_avg": 0.44, "status": "done",
         },
         "seq_write": {
             "bs": "64k", "iops": 8169, "bw_mb": 510.6,
-            "lat_avg": 3.8, "lat_p99": 0.0, "status": "done",
+            "lat_avg": 3.8, "status": "done",
         },
         "rand_read": {
             "bs": "4k", "iops": 170566, "bw_mb": 666.3,
-            "lat_avg": 0.19, "lat_p99": 0.0, "status": "done",
+            "lat_avg": 0.19, "status": "done",
         },
         "rand_write": {
             "bs": "4k", "iops": 20322, "bw_mb": 79.4,
-            "lat_avg": 1.53, "lat_p99": 0.0, "status": "undone",
+            "lat_avg": 1.53, "status": "undone",
         },
         "mixed": {
             "bs": "8k", "iops": 12345, "bw_mb": 96.5,
-            "lat_avg": 0.81, "lat_p99": 2.25, "status": "done",
+            "lat_avg": 0.81, "status": "done",
         },
     },
     {},
@@ -103,7 +103,7 @@ class TableRendererTests(unittest.TestCase):
     def test_numeric_result_columns_are_centered_under_headers(self):
         columns = {header: justify for header, justify, _ in RESULT_HEADERS}
 
-        for header in ("IOPS", "Скорость (МБ/с)", "Lat Avg (мс)", "Lat p99 (мс)"):
+        for header in ("IOPS", "Скорость (МБ/с)", "Lat Avg (мс)"):
             self.assertEqual(columns[header], "center")
 
     def test_content_lines_have_three_columns(self):
@@ -141,7 +141,7 @@ class TableRendererTests(unittest.TestCase):
 
         self.assertEqual(output.count("Профиль теста"), 2)
         self.assertEqual(output.count("Скорость (МБ/с)"), 2)
-        self.assertEqual(output.count("Lat p99 (мс)"), 2)
+        self.assertEqual(output.count("Lat Avg (мс)"), 2)
 
     def test_long_test_names_fold_to_several_lines(self):
         output = render_table(
@@ -196,6 +196,21 @@ class TableRendererTests(unittest.TestCase):
         self.assertEqual(str(done.style), "bold green")
         self.assertEqual(undone.plain, "undone")
         self.assertEqual(str(undone.style), "bold red")
+
+    def test_fake_test_mode_data_renders_without_errors(self):
+        entrypoint = load_entrypoint()
+        disks = entrypoint.build_fake_disks()
+        results = entrypoint.build_fake_results(disks)
+
+        output = render_table(
+            build_results_table(disks, results, entrypoint.TEST_NAMES)
+        )
+
+        self.assertEqual(len(disks), 5)
+        for name in ("nvme0n1", "nvme1n1", "sda", "sdb", "sdc"):
+            self.assertIn(f"/dev/{name}", output)
+        self.assertGreaterEqual(output.count("test"), 100)
+        self.assertNotIn("Lat p99 (мс)", output)
 
 
 if __name__ == "__main__":
