@@ -24,10 +24,13 @@ import signal
 import subprocess
 import sys
 import threading
+from datetime import datetime
+from pathlib import Path
 
 from rich.console import Console
 
 from configs import nvme, sas, sata
+from utils.diagnostics import DiagnosticSampler, collect_static_info
 from utils.reporter import generate_report
 from utils.scanner import scan_disks
 from utils.table_renderer import build_results_table
@@ -58,7 +61,7 @@ INTERFACE_THRESHOLDS = {
 }
 
 
-_SHORT_FLAGS = {"c", "s", "p", "t"}
+_SHORT_FLAGS = {"c", "s", "p", "t", "d"}
 
 
 def _expand_short_flags(argv: list[str]) -> list[str]:
@@ -101,6 +104,11 @@ def parse_args():
     parser.add_argument(
         "-p", "--precond", action="store_true",
         help="Прекондишнинг перед тестами",
+    )
+    parser.add_argument(
+        "-d", "--diagnostic", action="store_true",
+        help="Диагностический режим: временные логи fio, сэмплинг линка/"
+             "температуры/нагрузки, артефакты в каталоге logs/",
     )
     parser.add_argument(
         "-t", "--test", action="store_true",
@@ -304,38 +312,17 @@ def _run_io_process(cmd, cancel_event):
         return None
 
 
-def run_fio_test(disk_info, test_id, base_args, cancel_event=None):
-    """Запускает fio-тест. Поддерживает отмену через cancel_event."""
-    disk_path = disk_info["path"]
-    cmd = [
-        "fio",
-        "--name", test_id,
-        "--filename", disk_path,
-        "--direct=1",
-        "--ioengine=libaio",
-        "--group_reporting",
-        "--norandommap",
-        "--output-format=json",
-    ] + list(base_args)
+def _max_iodepth(iodepth_level: dict):
+    """Возвращает максимальную достигнутую глубину очереди из гистограммы fio."""
+    best = None
+    for depth, count in iodepth_level.items():
+        if count:
+            best = depth
+    return int(best) if best is not None else None
 
-    try:
-        result = _run_io_process(cmd, cancel_event)
-    except FileNotFoundError:
-        return {"error": "Утилита fio не найдена. Установите fio и повторите попытку."}
 
-    if result is None:
-        if cancel_event and cancel_event.is_set():
-            return {"error": "Тест отменён пользователем"}
-        return {"error": "Ошибка запуска fio"}
-
-    proc, stdout, stderr = result
-    stdout = stdout.decode() if stdout else ""
-    stderr = stderr.decode() if stderr else ""
-
-    if proc.returncode != 0:
-        hint = stderr.strip()[:200] if stderr else ""
-        return {"error": f"fio завершился с кодом {proc.returncode}: {hint}"}
-
+def _parse_fio_result(test_id, stdout):
+    """Разбирает stdout fio (JSON) в результат + диагностические метрики."""
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -357,7 +344,103 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None):
     lat_p99 = lat.get("percentile", {}).get("99.000000", 0) / 1e6
     bw_mb = bw_bytes / (1024 * 1024)
 
-    return {"iops": iops, "bw_mb": bw_mb, "lat_avg": lat_avg, "lat_p99": lat_p99}
+    res = {"iops": iops, "bw_mb": bw_mb, "lat_avg": lat_avg, "lat_p99": lat_p99}
+
+    # Диагностика из fio-JSON (заполняется при --diagnostic и без него)
+    usage = job.get("usage") or {}
+    res["cpu_user"] = round(usage.get("user", 0), 1)
+    res["cpu_sys"] = round(usage.get("sys", 0), 1)
+
+    lat_perc = lat.get("percentile") or {}
+    for key, pkey in (("p50", "50.000000"), ("p90", "90.000000"),
+                      ("p99", "99.000000"), ("p99_9", "99.900000")):
+        val = lat_perc.get(pkey)
+        if val:
+            res[f"clat_{key}_ms"] = round(val / 1e6, 3)
+
+    slat = mode.get("slat_ns") or {}
+    if slat.get("mean"):
+        res["slat_avg_ms"] = round(slat["mean"] / 1e6, 4)
+
+    res["io_kb"] = int(mode.get("io_kbytes", 0))
+    res["iodepth"] = _max_iodepth(job.get("iodepth_level") or {})
+
+    return res
+
+
+def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_dir=None):
+    """Запускает fio-тест. Поддерживает отмену через cancel_event.
+
+    В диагностическом режиме (diag_dir) дополнительно включает временные
+    логи fio (--write_bw_log/--write_iops_log/--write_lat_log), сохраняет
+    сырой JSON в raw.json и параллельно сэмплирует линк, температуру
+    и реальную нагрузку на диск.
+    """
+    disk_path = disk_info["path"]
+    cmd = [
+        "fio",
+        "--name", test_id,
+        "--filename", disk_path,
+        "--direct=1",
+        "--ioengine=libaio",
+        "--group_reporting",
+        "--norandommap",
+        "--output-format=json",
+    ] + list(base_args)
+
+    stop_event = threading.Event()
+    sampler = None
+    sampler_thread = None
+
+    if diag_dir:
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        cmd += [
+            "--log_avg_msec=1000",
+            f"--write_bw_log={diag_dir / 'bw'}",
+            f"--write_iops_log={diag_dir / 'iops'}",
+            f"--write_lat_log={diag_dir / 'lat'}",
+        ]
+        sampler = DiagnosticSampler(disk_info)
+        sampler_thread = threading.Thread(
+            target=sampler.run, args=(stop_event,), daemon=True
+        )
+        sampler_thread.start()
+
+    res = None
+    raw_stdout = ""
+    try:
+        try:
+            result = _run_io_process(cmd, cancel_event)
+        except FileNotFoundError:
+            res = {"error": "Утилита fio не найдена. Установите fio и повторите попытку."}
+        else:
+            if result is None:
+                if cancel_event and cancel_event.is_set():
+                    res = {"error": "Тест отменён пользователем"}
+                else:
+                    res = {"error": "Ошибка запуска fio"}
+            else:
+                proc, stdout, stderr = result
+                stdout = stdout.decode() if stdout else ""
+                stderr = stderr.decode() if stderr else ""
+                raw_stdout = stdout
+                if proc.returncode != 0:
+                    hint = stderr.strip()[:200] if stderr else ""
+                    res = {"error": f"fio завершился с кодом {proc.returncode}: {hint}"}
+                else:
+                    res = _parse_fio_result(test_id, stdout)
+    finally:
+        stop_event.set()
+        if sampler_thread:
+            sampler_thread.join(timeout=5)
+
+    if res is not None:
+        if sampler:
+            res["diag"] = sampler.summary()
+        if diag_dir and "error" not in res and raw_stdout:
+            (diag_dir / "raw.json").write_text(raw_stdout, encoding="utf-8")
+
+    return res
 
 
 def run_precondition(disk_info, cancel_event=None):
@@ -463,14 +546,15 @@ def process_task_result(results, idx, disk, t, fio_args, res):
     results[idx][t] = res
 
 
-def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None):
+def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_dir=None):
     """Запускает все тесты одного диска строго последовательно.
 
     Параллелизация идёт по дискам, а не по отдельным тестам: несколько fio,
     конкурирующих за один накопитель, делят его шину и занижают результаты.
     """
     for t, fio_args in plan:
-        res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event)
+        test_dir = diag_dir / disk["name"] / t if diag_dir else None
+        res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event, diag_dir=test_dir)
         process_task_result(results, disk_idx, disk, t, fio_args, res)
 
 
@@ -510,6 +594,10 @@ def main():
         console.print(f"[bold red]Ошибка сканирования:[/bold red] {exc}")
         sys.exit(1)
 
+    if args.diagnostic:
+        for d in disks:
+            d["diag_static"] = collect_static_info(d)
+
     if system_disks:
         console.print("\n[bold]Системные диски:[/bold]")
         for sd in system_disks:
@@ -546,6 +634,11 @@ def main():
             sys.exit(0)
 
     cancel_event = threading.Event()
+
+    diag_dir = None
+    if args.diagnostic:
+        diag_dir = Path("logs") / f"fio_diag_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        console.print(f"\n[bold]Диагностика: артефакты в {diag_dir}[/bold]")
 
     # Прекондишнинг
     if args.precond:
@@ -602,7 +695,7 @@ def main():
     if args.sequential:
         try:
             for disk_idx, disk, plan in disk_plans:
-                run_disk_tests(disk_idx, disk, plan, results, cancel_event)
+                run_disk_tests(disk_idx, disk, plan, results, cancel_event, diag_dir)
         except KeyboardInterrupt:
             cancel_event.set()
             console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
@@ -614,7 +707,7 @@ def main():
             for disk_idx, disk, plan in disk_plans:
                 fut = pool.submit(
                     run_disk_tests, disk_idx, disk, plan, results,
-                    cancel_event=cancel_event,
+                    cancel_event=cancel_event, diag_dir=diag_dir,
                 )
                 future_map[fut] = disk_idx
 

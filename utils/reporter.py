@@ -62,20 +62,42 @@ def generate_report(
         lines.append(f"> Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("")
 
+        has_diag = (
+            any(d.get("diag_static") for d in disks)
+            or any(
+                res.get("diag")
+                for disk_results in results
+                for res in disk_results.values()
+            )
+        )
+
         lines.append("## Обнаруженные диски")
         lines.append("")
-        lines.append("| Диск | Модель | Серийный номер | Интерфейс | Объём |")
-        lines.append("|------|--------|----------------|-----------|-------|")
+        if has_diag:
+            lines.append("| Диск | Модель | Серийный номер | Интерфейс | Объём | NUMA | CPU-аффинити |")
+            lines.append("|------|--------|----------------|-----------|-------|------|--------------|")
+        else:
+            lines.append("| Диск | Модель | Серийный номер | Интерфейс | Объём |")
+            lines.append("|------|--------|----------------|-----------|-------|")
 
         for d in disks:
             pcie_str = ""
             if d.get("pcie_info") and d["pcie_info"].get("gen"):
                 pcie_str = f" (PCIe Gen{d['pcie_info']['gen']} x{d['pcie_info'].get('width', '?')})"
 
-            lines.append(
-                f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
-                f"| {d['tran'].upper()}{pcie_str} | {d['size']} |"
-            )
+            if has_diag:
+                static = d.get("diag_static") or {}
+                numa = static.get("numa_node") or "—"
+                affinity = static.get("cpu_affinity") or "—"
+                lines.append(
+                    f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
+                    f"| {d['tran'].upper()}{pcie_str} | {d['size']} | {numa} | {affinity} |"
+                )
+            else:
+                lines.append(
+                    f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
+                    f"| {d['tran'].upper()}{pcie_str} | {d['size']} |"
+                )
 
         lines.append("")
         lines.append("## Результаты тестирования")
@@ -121,6 +143,47 @@ def generate_report(
                 lines.append("| " + " | ".join(cells) + " |")
 
             lines.append("")
+
+            if has_diag:
+                lines.append(f"**Диагностика — {disk['name']}**")
+                lines.append("")
+                lines.append(
+                    "| Тест | CPU user/sys (%) | Линк min | Tmax (°C) | avgqu-sz | "
+                    "clat p99/p99.9 (мс) | slat (мс) | iodepth | Объём (ГБ) |"
+                )
+                lines.append(
+                    "|------|------------------|----------|-----------|----------|"
+                    "--------------------|-----------|---------|-------------|"
+                )
+                for test_id, test_name in test_names.items():
+                    res = disk_results.get(test_id, {})
+                    if "error" in res:
+                        continue
+                    diag = res.get("diag") or {}
+
+                    cpu = f"{res.get('cpu_user', '—')} / {res.get('cpu_sys', '—')}"
+
+                    link = "—"
+                    if diag.get("link_gts_min") is not None:
+                        width = diag.get("link_width_min") or "?"
+                        link = f"{diag['link_gts_min']:g} GT/s x{width}"
+
+                    tmax = _fmt(diag["temp_max_c"], ".1f") if diag.get("temp_max_c") is not None else "—"
+                    qu = _fmt(diag["avgqu_sz_max"], ".1f") if diag.get("avgqu_sz_max") is not None else "—"
+
+                    p99 = res.get("clat_p99_ms", "—")
+                    p999 = res.get("clat_p99_9_ms", "—")
+                    clat = f"{p99} / {p999}" if p99 != "—" else "—"
+
+                    iod = res.get("iodepth", "—")
+                    io_kb = res.get("io_kb")
+                    gb = _fmt(io_kb / 1024 / 1024, ".1f") if io_kb else "—"
+
+                    lines.append(
+                        f"| {test_name} | {cpu} | {link} | {tmax} | {qu} | "
+                        f"{clat} | {res.get('slat_avg_ms', '—')} | {iod} | {gb} |"
+                    )
+                lines.append("")
 
         lines.append("---")
         lines.append("*Отчёт сгенерирован автоматически*")

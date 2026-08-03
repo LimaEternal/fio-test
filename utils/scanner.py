@@ -127,17 +127,16 @@ def _find_link_files(start_dir: Path):
     return None
 
 
-def get_nvme_pcie_info(disk_name: str) -> dict:
+def find_nvme_link_dir(disk_name: str) -> Optional[Path]:
     """
-    Определяет поколение PCIe и ширину шины (width) для NVMe диска на Linux.
-    Возвращает словарь: {'gen': int|None, 'width': int|None, 'speed_gts': float|None}
+    Находит каталог с current_link_speed/current_link_width для NVMe диска.
 
     Под Intel VMD /sys/block/<name>/device ведёт в виртуальный каталог
     nvme-subsystem без линк-файлов, поэтому первым пробуется реальная
     PCI-функция /sys/class/nvme/<nvmeN>/device.
-    """
-    info = {"gen": None, "width": None, "speed_gts": None}
 
+    Возвращает Path к каталогу с линк-файлами или None.
+    """
     nvme_match = re.match(r"(nvme\d+)", disk_name)
     nvme_dev = nvme_match.group(1) if nvme_match else None
 
@@ -154,31 +153,41 @@ def get_nvme_pcie_info(disk_name: str) -> dict:
             real_path = start.resolve()
         except Exception:
             continue
-
         try:
             found = _find_link_files(real_path)
         except Exception:
             continue
+        if found:
+            speed_file, _ = found
+            return speed_file.parent
+    return None
 
-        if not found:
-            continue
 
-        speed_file, width_file = found
-        try:
-            speed_str = speed_file.read_text(encoding="utf-8").strip()
-            width_str = width_file.read_text(encoding="utf-8").strip()
+def get_nvme_pcie_info(disk_name: str) -> dict:
+    """
+    Определяет поколение PCIe и ширину шины (width) для NVMe диска на Linux.
+    Возвращает словарь: {'gen': int|None, 'width': int|None, 'speed_gts': float|None}
+    """
+    info = {"gen": None, "width": None, "speed_gts": None}
 
-            speed_match = re.search(r"(\d+(?:\.\d+)?)\s*GT/s", speed_str)
-            if speed_match:
-                speed_gts = float(speed_match.group(1))
-                info["speed_gts"] = speed_gts
-                info["gen"] = _link_generation(speed_gts)
+    link_dir = find_nvme_link_dir(disk_name)
+    if not link_dir:
+        return info
 
-            if width_str.isdigit():
-                info["width"] = int(width_str)
-        except Exception:
-            pass
-        break
+    try:
+        speed_str = (link_dir / "current_link_speed").read_text(encoding="utf-8").strip()
+        width_str = (link_dir / "current_link_width").read_text(encoding="utf-8").strip()
+
+        speed_match = re.search(r"(\d+(?:\.\d+)?)\s*GT/s", speed_str)
+        if speed_match:
+            speed_gts = float(speed_match.group(1))
+            info["speed_gts"] = speed_gts
+            info["gen"] = _link_generation(speed_gts)
+
+        if width_str.isdigit():
+            info["width"] = int(width_str)
+    except Exception:
+        pass
 
     return info
 
