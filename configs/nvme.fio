@@ -10,7 +10,8 @@
 #   fio configs/nvme.fio --filename=/dev/nvme0n1
 
 [global]
-ioengine=libaio
+ioengine=io_uring
+hipri=1
 direct=1
 ramp_time=15
 runtime=60
@@ -23,7 +24,7 @@ output-format=json
 rw=read
 bs=128k
 iodepth=32
-numjobs=8    
+numjobs=16  
 
 [seq_write]
 rw=write
