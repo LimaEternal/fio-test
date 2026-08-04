@@ -21,24 +21,25 @@ output-format=json
 
 [seq_read]
 rw=read
-bs=128k
-iodepth=32
-numjobs=1
+bs=1m      
+iodepth=16      
+numjobs=4       
 
 [seq_write]
 rw=write
-bs=128k
-iodepth=32
-numjobs=1
+bs=1m            
+iodepth=16
+numjobs=4        
 
 [rand_read]
 rw=randread
-bs=4k
+bs=4k            
 iodepth=32
-numjobs=8
+numjobs=8        
 
 [rand_write]
 rw=randwrite
-bs=4k
+bs=4k            
 iodepth=32
 numjobs=8
+
