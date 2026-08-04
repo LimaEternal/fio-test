@@ -21,9 +21,9 @@ output-format=json
 
 [seq_read]
 rw=read
-bs=1m      
-iodepth=16      
-numjobs=4       
+bs=128k
+iodepth=32
+numjobs=8      
 
 [seq_write]
 rw=write
