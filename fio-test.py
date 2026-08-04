@@ -407,9 +407,6 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     температуру и реальную нагрузку на диск; сэмплы и сводка сохраняются
     в памяти и попадают в единый файл отчёта.
     """
-    if tuner:
-        tuner.drop_caches()
-
     disk_path = disk_info["path"]
     # Движок/direct/output-format приходят из .fio-конфига (секция [global]),
     # здесь добавляются только инфраструктурные параметры запуска.
@@ -423,9 +420,6 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         numa_cpus = tuner.get_numa_cpus(disk_info["name"])
         if numa_cpus:
             cmd.extend(["--cpus_allowed", numa_cpus])
-
-    # Отладочный вывод команды (можно убрать позже)
-    console.print(f"[dim]Команда fio: {' '.join(cmd)}[/dim]")
 
     stop_event = threading.Event()
     sampler = None
@@ -607,13 +601,60 @@ def main():
         thresholds["sata"].update(parse_custom_thresholds(args.threshold_sata))
 
     if args.test:
+        # 1. Реальное сканирование (read-only) для предпросмотра оптимизаций.
+        #    Ничего не применяется и не запускается — только показ "что будет".
+        real_disks = []
+        try:
+            _, real_disks = scan_disks(INTERFACE_CONFIGS)
+        except Exception:
+            real_disks = []
+
+        preview_rows = []
+        if real_disks and not args.no_tune:
+            tuner = SystemTuner(real_disks)
+            preview_rows = tuner.preview()
+            console.print(
+                "[bold]Тестовый режим: предпросмотр оптимизаций "
+                "(dry-run, система не меняется)[/bold]"
+            )
+            if preview_rows:
+                for p in preview_rows:
+                    if p.get("skipped_reason"):
+                        console.print(
+                            f"  [yellow]—[/yellow] {p['param']}: "
+                            f"пропущено ({p['skipped_reason']})"
+                        )
+                    else:
+                        console.print(
+                            f"  [green]✓[/green] {p['param']}: "
+                            f"{p['before']} → {p['after']}"
+                        )
+                    if p.get("target_disks"):
+                        console.print(f"      диски: {p['target_disks']}")
+            else:
+                console.print("  [dim]Оптимизации не требуются[/dim]")
+
+            temps = tuner.get_nvme_temps()
+            if temps:
+                temp_str = ", ".join(
+                    f"{name}: {t:.0f}°C"
+                    for name, t in sorted(temps.items())
+                    if t is not None
+                )
+                console.print(f"[bold]Температура NVMe:[/bold] {temp_str}")
+            console.print()
+
+        # 2. Фейковая таблица для проверки вёрстки (fio не запускается).
         disks = build_fake_disks()
         results = build_fake_results(disks)
         console.print("[bold]Тестовый режим: пробные данные, fio не запускается[/bold]")
         console.print()
         table = build_results_table(disks, results, TEST_NAMES)
         console.print(table)
-        report_path = generate_report(disks, results, TEST_NAMES, output_path=args.output)
+        report_path = generate_report(
+            disks, results, TEST_NAMES, output_path=args.output,
+            tuner_report=preview_rows or None,
+        )
         console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
         return
 
@@ -663,7 +704,7 @@ def main():
 
     tuner = None
     if not args.no_tune:
-        tuner = SystemTuner(disks)
+        tuner = SystemTuner(disks, system_disks)
         tuner.detect()
         tuner.apply()
         tuner.print_summary()

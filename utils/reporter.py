@@ -118,9 +118,17 @@ def generate_report(
             lines.append("| Параметр | Было | Стало | Статус |")
             lines.append("|----------|------|-------|--------|")
             for item in tuner_report:
-                status = "✓" if item.get("success") else f"✗ {item.get('error', '')}"
+                if "target_disks" in item and "success" not in item:
+                    if item.get("skipped_reason"):
+                        status = f"пропущено ({item['skipped_reason']})"
+                    else:
+                        status = "будет применено"
+                    param = f"{item['param']} ({item['target_disks']})"
+                else:
+                    status = "✓" if item.get("success") else f"✗ {item.get('error', '')}"
+                    param = item["param"]
                 lines.append(
-                    f"| {item['param']} | {item['before']} | {item['after']} | {status} |"
+                    f"| {param} | {item['before']} | {item['after']} | {status} |"
                 )
             lines.append("")
 

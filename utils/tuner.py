@@ -1,101 +1,116 @@
 """
-Модуль автоматической настройки системы для максимальной производительности NVMe.
+Модуль безопасной настройки системы для максимальной производительности NVMe.
 
-Проверяет и применяет параметры, влияющие на скорость SSD:
-- CPU governor → performance
-- CPU turbo → включён
-- NVMe power-saving → отключён
-- NVMe APST → отключён
-- Readahead → 2048 KB для NVMe
-- NUMA-привязка для fio
-- Предупреждения о PCIe ASPM, kernel cmdline, Intel VMD
+Применяет ТОЛЬКО безопасные, не требующие перезагрузки настройки и ТОЛЬКО
+к целевым (несистемным) дискам:
+- CPU governor → performance (с контролем температуры);
+- readahead → 2048 KB для целевых NVMe;
+- NVMe APST → отключён для целевых NVMe;
+- NUMA-привязка fio (--cpus_allowed) для целевых дисков.
+
+Ничего, что влияет на системные диски или требует перезагрузки
+(глобальный NVMe power-saving, CPU turbo, PCIe ASPM, kernel cmdline,
+Intel VMD), не применяется и даже не выводится в предупреждения.
 """
 
-import os
-import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import re
+import subprocess
+from typing import Dict, List, Optional
 
 from rich.console import Console
 
 console = Console(color_system=None, highlight=False)
 
+# Без этого порога governor не применяется (защита от перегрева).
+MAX_TEMP_BEFORE_TUNE_C = 75
+READAHEAD_KB = 2048
+VALID_CPULIST_RE = re.compile(r"^[\d,\-\s]+$")
+
 
 class SystemTuner:
-    """Автоматическая настройка системы для тестирования NVMe."""
+    """Безопасная настройка системы для тестирования накопителей."""
 
-    def __init__(self, disks: List[dict]):
+    def __init__(self, target_disks: List[dict], system_disks: Optional[List[dict]] = None):
         """
-        Инициализация тюнера.
-
         Параметры:
-            disks — список словарей с информацией о дисках (из scanner.py)
+            target_disks — целевые (несистемные) диски из scanner.py.
+            system_disks — системные диски (для справки, настройки их НЕ касаются).
         """
-        self.disks = disks
+        self.target_disks = target_disks
+        self.system_disks = system_disks or []
+        self._target_nvme = [
+            d for d in target_disks if d.get("tran", "").lower() == "nvme"
+        ]
         self.issues: List[Dict] = []
         self.applied: List[Dict] = []
-        self.warnings: List[Dict] = []
-        self._nvme_devices = [d for d in disks if d.get("tran", "").lower() == "nvme"]
 
-    def detect(self):
-        """Собирает информацию о текущих настройках и выявляет проблемы."""
+    # ------------------------------------------------------------------
+    # Публичный API
+    # ------------------------------------------------------------------
+
+    def detect(self) -> None:
+        """Read-only: собирает, какие оптимизации будут/могут быть применены."""
         self.issues = []
-        self.warnings = []
-
         self._detect_cpu_governor()
-        self._detect_cpu_turbo()
-        self._detect_nvme_power_save()
-        self._detect_nvme_apst()
         self._detect_readahead()
-        self._detect_pcie_aspm()
-        self._detect_kernel_cmdline()
-        self._detect_vmd()
+        self._detect_nvme_apst()
 
-    def apply(self):
-        """Применяет все исправления (кроме тех, что требуют reboot)."""
+    def preview(self) -> List[Dict]:
+        """
+        Возвращает список того, что БЫЛО БЫ применено (без применения).
+        Каждый элемент: {"param", "before", "after", "target_disks"}.
+        """
+        self.detect()
+        rows = []
+        for issue in self.issues:
+            rows.append({
+                "param": issue["param"],
+                "before": issue["current"],
+                "after": issue["target"],
+                "target_disks": issue.get("disks", ""),
+                "skipped_reason": issue.get("skipped_reason"),
+            })
+        return rows
+
+    def apply(self) -> None:
+        """Применяет безопасные оптимизации (только к целевым дискам)."""
         self.applied = []
+        self.detect()
 
         for issue in self.issues:
-            if issue.get("reboot_required"):
-                continue
-
-            try:
-                result = issue["apply_func"]()
-                if result:
-                    self.applied.append({
-                        "param": issue["param"],
-                        "before": issue["current"],
-                        "after": issue["target"],
-                        "success": True,
-                    })
-                else:
-                    self.applied.append({
-                        "param": issue["param"],
-                        "before": issue["current"],
-                        "after": issue["target"],
-                        "success": False,
-                        "error": "Не удалось применить",
-                    })
-            except Exception as e:
+            if "skipped_reason" in issue:
                 self.applied.append({
                     "param": issue["param"],
                     "before": issue["current"],
                     "after": issue["target"],
                     "success": False,
-                    "error": str(e),
+                    "error": issue["skipped_reason"],
                 })
+                continue
+            try:
+                result = issue["apply_func"]()
+            except Exception as exc:
+                result = False
+                err = str(exc)
+            else:
+                err = ""
 
-    def report(self) -> List[Dict]:
-        """Возвращает список применённых настроек для отчёта."""
-        return self.applied
+            self.applied.append({
+                "param": issue["param"],
+                "before": issue["current"],
+                "after": issue["target"],
+                "success": bool(result),
+                "error": err,
+            })
 
-    def print_summary(self):
-        """Выводит в консоль summary применённых настроек и предупреждений."""
-        if not self.applied and not self.warnings:
+    def print_summary(self) -> None:
+        """Выводит в консоль, что было применено."""
+        if not self.applied:
+            console.print("\n[bold]Оптимизация системы:[/bold] ничего не требуется")
             return
 
         console.print("\n[bold]Оптимизация системы...[/bold]")
-
         for item in self.applied:
             if item["success"]:
                 console.print(
@@ -104,255 +119,196 @@ class SystemTuner:
                 )
             else:
                 console.print(
-                    f"  [red]✗[/red] {item['param']}: "
-                    f"ошибка — {item.get('error', 'неизвестно')}"
+                    f"  [yellow]—[/yellow] {item['param']}: пропущено"
+                    + (f" ({item['error']})" if item["error"] else "")
                 )
-
-        for warning in self.warnings:
-            console.print(
-                f"  [yellow]⚠[/yellow] {warning['message']}"
-            )
-
         console.print()
 
-    def drop_caches(self):
-        """Сбрасывает page cache, dentries и inodes перед тестом."""
-        try:
-            with open("/proc/sys/vm/drop_caches", "w") as f:
-                f.write("3\n")
-        except Exception:
-            pass
+    def report(self) -> List[Dict]:
+        """Список применённых настроек для MD-отчёта."""
+        return self.applied
 
     def get_numa_cpus(self, disk_name: str) -> Optional[str]:
         """
-        Возвращает CPU-маску для NUMA-узла, на котором находится диск.
+        CPU-маска NUMA-узла, на котором находится диск, или None.
 
-        Параметры:
-            disk_name — имя диска (например, nvme0n1)
-
-        Возвращает:
-            Строка с CPU-маской (например, "0-11,24-35") или None
+        Возвращается только проверенная маска вида "0-11,24-35".
         """
-        for disk in self.disks:
-            if disk["name"] == disk_name:
-                numa_node = disk.get("numa_node")
-                if numa_node is None or numa_node < 0:
+        for disk in self.target_disks:
+            if disk["name"] != disk_name:
+                continue
+            numa_node = disk.get("numa_node")
+            if numa_node is None or numa_node < 0:
+                return None
+            try:
+                cpulist_path = Path(f"/sys/devices/system/node/node{numa_node}/cpulist")
+                if not cpulist_path.exists():
                     return None
-
-                try:
-                    cpulist_path = Path(f"/sys/devices/system/node/node{numa_node}/cpulist")
-                    if cpulist_path.exists():
-                        cpulist = cpulist_path.read_text().strip()
-                        if cpulist:
-                            return cpulist
-                except Exception:
-                    pass
-                break
+                cpulist = cpulist_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                return None
+            if cpulist and VALID_CPULIST_RE.match(cpulist):
+                return cpulist
+            return None
         return None
 
-    def _detect_cpu_governor(self):
-        """Проверяет CPU governor."""
-        try:
-            governor_path = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
-            if not governor_path.exists():
-                return
+    # ------------------------------------------------------------------
+    # Температура NVMe
+    # ------------------------------------------------------------------
 
+    def get_nvme_temps(self) -> Dict[str, Optional[float]]:
+        """
+        Текущие температуры NVMe в °C: {имя_контроллера: temp}.
+
+        Имя — nvme0, nvme1 и т.д. (sysfs-имена hwmon).
+        """
+        temps: Dict[str, Optional[float]] = {}
+        try:
+            for ctrl in Path("/sys/class/nvme").glob("nvme*"):
+                if not ctrl.is_dir():
+                    continue
+                for hwmon in (ctrl / "hwmon").glob("hwmon*") if (ctrl / "hwmon").is_dir() else []:
+                    temp_path = hwmon / "temp1_input"
+                    if temp_path.exists():
+                        try:
+                            raw = int(temp_path.read_text().strip())
+                            temps[ctrl.name] = raw / 1000.0
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return temps
+
+    # ------------------------------------------------------------------
+    # CPU governor
+    # ------------------------------------------------------------------
+
+    def _detect_cpu_governor(self) -> None:
+        governor_path = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        if not governor_path.exists():
+            return
+        try:
             current = governor_path.read_text().strip()
-            if current != "performance":
-                self.issues.append({
-                    "param": "CPU governor",
-                    "current": current,
-                    "target": "performance",
-                    "reboot_required": False,
-                    "apply_func": self._apply_cpu_governor,
-                })
         except Exception:
-            pass
-
-    def _apply_cpu_governor(self) -> bool:
-        """Переключает все CPU в performance."""
-        try:
-            cpu_dirs = Path("/sys/devices/system/cpu").glob("cpu*/cpufreq/scaling_governor")
-            for governor_path in cpu_dirs:
-                governor_path.write_text("performance\n")
-            return True
-        except Exception:
-            return False
-
-    def _detect_cpu_turbo(self):
-        """Проверяет состояние CPU turbo."""
-        try:
-            no_turbo_path = Path("/sys/devices/system/cpu/intel_pstate/no_turbo")
-            if not no_turbo_path.exists():
-                return
-
-            no_turbo = int(no_turbo_path.read_text().strip())
-            if no_turbo == 1:
-                self.issues.append({
-                    "param": "CPU turbo",
-                    "current": "disabled",
-                    "target": "enabled",
-                    "reboot_required": False,
-                    "apply_func": self._apply_cpu_turbo,
-                })
-        except Exception:
-            pass
-
-    def _apply_cpu_turbo(self) -> bool:
-        """Включает CPU turbo."""
-        try:
-            no_turbo_path = Path("/sys/devices/system/cpu/intel_pstate/no_turbo")
-            no_turbo_path.write_text("0\n")
-            return True
-        except Exception:
-            return False
-
-    def _detect_nvme_power_save(self):
-        """Проверяет NVMe power-saving."""
-        try:
-            ps_path = Path("/sys/module/nvme_core/parameters/default_ps_max_latency_us")
-            if not ps_path.exists():
-                return
-
-            current = int(ps_path.read_text().strip())
-            if current > 0:
-                self.issues.append({
-                    "param": "NVMe power-saving",
-                    "current": f"{current} us",
-                    "target": "0 us",
-                    "reboot_required": False,
-                    "apply_func": self._apply_nvme_power_save,
-                })
-        except Exception:
-            pass
-
-    def _apply_nvme_power_save(self) -> bool:
-        """Отключает NVMe power-saving."""
-        try:
-            ps_path = Path("/sys/module/nvme_core/parameters/default_ps_max_latency_us")
-            ps_path.write_text("0\n")
-            return True
-        except Exception:
-            return False
-
-    def _detect_nvme_apst(self):
-        """Проверяет NVMe APST (Autonomous Power State Transition)."""
-        if not self._nvme_devices:
+            return
+        if current == "performance":
             return
 
+        issue = {
+            "param": "CPU governor",
+            "current": current,
+            "target": "performance",
+            "disks": "все CPU",
+            "apply_func": self._apply_cpu_governor,
+        }
+        # Проверка температуры заранее (read-only): при перегреве не применяем.
+        temps = self.get_nvme_temps()
+        hot = [
+            (name, t)
+            for name, t in temps.items()
+            if t is not None and t > MAX_TEMP_BEFORE_TUNE_C
+        ]
+        if hot:
+            names = ", ".join(f"{n} ({t:.0f}°C)" for n, t in hot)
+            issue["skipped_reason"] = f"перегрев NVMe: {names}"
+        self.issues.append(issue)
+
+    def _apply_cpu_governor(self) -> bool:
+        applied_any = False
         try:
-            for disk in self._nvme_devices:
-                dev_path = disk["path"]
+            for governor_path in Path("/sys/devices/system/cpu").glob(
+                "cpu*/cpufreq/scaling_governor"
+            ):
+                try:
+                    governor_path.write_text("performance\n")
+                    applied_any = True
+                except Exception:
+                    pass
+        except Exception:
+            return applied_any
+        return applied_any
+
+    # ------------------------------------------------------------------
+    # Readahead (только целевые NVMe)
+    # ------------------------------------------------------------------
+
+    def _detect_readahead(self) -> None:
+        low = [
+            disk["name"]
+            for disk in self._target_nvme
+            if self._readahead_kb(disk["name"]) not in (None, READAHEAD_KB)
+        ]
+        if not low:
+            return
+        current = self._readahead_kb(low[0])
+        self.issues.append({
+            "param": "Readahead (NVMe)",
+            "current": f"{current} KB" if current is not None else "?",
+            "target": f"{READAHEAD_KB} KB",
+            "disks": ", ".join(low),
+            "apply_func": self._apply_readahead,
+        })
+
+    def _readahead_kb(self, disk_name: str) -> Optional[int]:
+        try:
+            ra_path = Path(f"/sys/block/{disk_name}/queue/read_ahead_kb")
+            if ra_path.exists():
+                return int(ra_path.read_text().strip())
+        except Exception:
+            pass
+        return None
+
+    def _apply_readahead(self) -> bool:
+        ok = False
+        for disk in self._target_nvme:
+            try:
+                ra_path = Path(f"/sys/block/{disk['name']}/queue/read_ahead_kb")
+                ra_path.write_text(f"{READAHEAD_KB}\n")
+                ok = True
+            except Exception:
+                pass
+        return ok
+
+    # ------------------------------------------------------------------
+    # NVMe APST (только целевые NVMe, per-device)
+    # ------------------------------------------------------------------
+
+    def _detect_nvme_apst(self) -> None:
+        if not self._target_nvme:
+            return
+        try:
+            result = subprocess.run(
+                ["nvme", "get-feature", self._target_nvme[0]["path"], "-f", "0x0c"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return
+        if result.returncode != 0:
+            return
+        if "APST" in result.stdout and "Enabled" in result.stdout:
+            disks = ", ".join(d["name"] for d in self._target_nvme)
+            self.issues.append({
+                "param": "NVMe APST",
+                "current": "enabled",
+                "target": "disabled",
+                "disks": disks,
+                "apply_func": self._apply_nvme_apst,
+            })
+
+    def _apply_nvme_apst(self) -> bool:
+        ok = False
+        for disk in self._target_nvme:
+            try:
                 result = subprocess.run(
-                    ["nvme", "get-feature", dev_path, "-f", "0x0c"],
+                    ["nvme", "set-feature", disk["path"], "-f", "0x0c", "-v", "0"],
                     capture_output=True,
                     text=True,
                     timeout=5,
                 )
                 if result.returncode == 0:
-                    if "APST" in result.stdout and "Enabled" in result.stdout:
-                        self.issues.append({
-                            "param": "NVMe APST",
-                            "current": "enabled",
-                            "target": "disabled",
-                            "reboot_required": False,
-                            "apply_func": self._apply_nvme_apst,
-                        })
-                        break
-        except Exception:
-            pass
-
-    def _apply_nvme_apst(self) -> bool:
-        """Отключает NVMe APST."""
-        try:
-            for disk in self._nvme_devices:
-                dev_path = disk["path"]
-                subprocess.run(
-                    ["nvme", "set-feature", dev_path, "-f", "0x0c", "-v", "0"],
-                    capture_output=True,
-                    timeout=5,
-                )
-            return True
-        except Exception:
-            return False
-
-    def _detect_readahead(self):
-        """Проверяет readahead для NVMe."""
-        try:
-            for disk in self._nvme_devices:
-                disk_name = disk["name"]
-                ra_path = Path(f"/sys/block/{disk_name}/queue/read_ahead_kb")
-                if not ra_path.exists():
-                    continue
-
-                current = int(ra_path.read_text().strip())
-                if current < 2048:
-                    self.issues.append({
-                        "param": f"Readahead ({disk_name})",
-                        "current": f"{current} KB",
-                        "target": "2048 KB",
-                        "reboot_required": False,
-                        "apply_func": lambda d=disk_name: self._apply_readahead(d),
-                    })
-        except Exception:
-            pass
-
-    def _apply_readahead(self, disk_name: str) -> bool:
-        """Устанавливает readahead в 2048 KB."""
-        try:
-            ra_path = Path(f"/sys/block/{disk_name}/queue/read_ahead_kb")
-            ra_path.write_text("2048\n")
-            return True
-        except Exception:
-            return False
-
-    def _detect_pcie_aspm(self):
-        """Проверяет PCIe ASPM на NVMe устройствах."""
-        try:
-            for disk in self._nvme_devices:
-                disk_name = disk["name"]
-                device_path = Path(f"/sys/class/nvme/{disk_name}/device")
-                if not device_path.exists():
-                    continue
-
-                aspm_path = device_path / "link" / "aspm"
-                if aspm_path.exists():
-                    current = aspm_path.read_text().strip()
-                    if current != "off":
-                        self.warnings.append({
-                            "message": f"PCIe ASPM: включён на {disk_name} (требуется reboot с pcie_aspm=off)",
-                        })
-                        break
-        except Exception:
-            pass
-
-    def _detect_kernel_cmdline(self):
-        """Проверяет kernel cmdline на наличие нужных параметров."""
-        try:
-            cmdline_path = Path("/proc/cmdline")
-            if not cmdline_path.exists():
-                return
-
-            cmdline = cmdline_path.read_text().strip()
-            if "nvme_core.default_ps_max_latency_us=0" not in cmdline:
-                self.warnings.append({
-                    "message": "Kernel cmdline: отсутствует nvme_core.default_ps_max_latency_us=0 (требуется reboot)",
-                })
-        except Exception:
-            pass
-
-    def _detect_vmd(self):
-        """Обнаруживает Intel VMD в цепочке."""
-        try:
-            result = subprocess.run(
-                ["lspci"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if "Volume Management Device" in result.stdout:
-                self.warnings.append({
-                    "message": "Intel VMD: обнаружен (оверхед ~5-10%, bypass через BIOS)",
-                })
-        except Exception:
-            pass
+                    ok = True
+            except Exception:
+                pass
+        return ok
