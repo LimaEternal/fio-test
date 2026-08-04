@@ -192,6 +192,23 @@ def get_nvme_pcie_info(disk_name: str) -> dict:
     return info
 
 
+def _get_numa_node(disk_name: str) -> Optional[int]:
+    """
+    Определяет NUMA-узел, на котором находится диск.
+
+    Возвращает номер NUMA-узла или None.
+    """
+    try:
+        numa_path = Path(f"/sys/class/block/{disk_name}/device/numa_node")
+        if numa_path.exists():
+            numa_node = int(numa_path.read_text().strip())
+            if numa_node >= 0:
+                return numa_node
+    except Exception:
+        pass
+    return None
+
+
 def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict]]:
     """
     Сканирует систему и возвращает два списка: (system_disks, target_disks).
@@ -266,6 +283,7 @@ def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict
             "slot": slot,
             "pcie_info": pcie_info,
             "root_partition": root_partition,
+            "numa_node": _get_numa_node(d["name"]),
         }
 
         if is_system:

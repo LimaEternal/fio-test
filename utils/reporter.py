@@ -67,6 +67,7 @@ def generate_report(
     test_names: Optional[dict] = None,
     output_path: Optional[Union[str, Path]] = None,
     diag_store: Optional[dict] = None,
+    tuner_report: Optional[List[dict]] = None,
 ) -> Path:
     """
     Генерирует MD-файл с таблицей результатов.
@@ -78,6 +79,7 @@ def generate_report(
         output_path — путь для выходного файла (по умолчанию fio_report_<timestamp>.md)
         diag_store  — диагностические данные {диск: {тест: {"samples", "summary"}}};
                       при наличии добавляет пер-секундные таблицы сэмплера
+        tuner_report — список применённых настроек тюнера (из SystemTuner.report())
 
     Возвращает:
         Path к созданному файлу
@@ -109,6 +111,18 @@ def generate_report(
                 for res in disk_results.values()
             )
         )
+
+        if tuner_report:
+            lines.append("## Системные настройки")
+            lines.append("")
+            lines.append("| Параметр | Было | Стало | Статус |")
+            lines.append("|----------|------|-------|--------|")
+            for item in tuner_report:
+                status = "✓" if item.get("success") else f"✗ {item.get('error', '')}"
+                lines.append(
+                    f"| {item['param']} | {item['before']} | {item['after']} | {status} |"
+                )
+            lines.append("")
 
         lines.append("## Обнаруженные диски")
         lines.append("")

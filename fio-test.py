@@ -33,6 +33,7 @@ from utils.fio_config import parse_fio_jobfile
 from utils.reporter import generate_report
 from utils.scanner import scan_disks
 from utils.table_renderer import build_results_table
+from utils.tuner import SystemTuner
 
 console = Console(color_system=None, highlight=False)
 
@@ -74,7 +75,7 @@ for _tests in INTERFACE_CONFIGS.values():
         TEST_NAMES[_tid] = FRIENDLY_TEST_NAMES.get(_tid, _tid)
 
 
-_SHORT_FLAGS = {"c", "s", "p", "t", "d"}
+_SHORT_FLAGS = {"c", "s", "p", "t", "d", "n"}
 
 
 def _expand_short_flags(argv: list[str]) -> list[str]:
@@ -122,6 +123,10 @@ def parse_args():
         "-d", "--diagnostic", action="store_true",
         help="Диагностический режим: сэмплинг линка/температуры/нагрузки "
              "в пер-секундные таблицы отчёта",
+    )
+    parser.add_argument(
+        "-n", "--no-tune", action="store_true",
+        help="Отключить автоматическую настройку системы для производительности",
     )
     parser.add_argument(
         "-t", "--test", action="store_true",
@@ -395,13 +400,16 @@ def _parse_fio_result(test_id, stdout):
     return res
 
 
-def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=None):
+def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=None, tuner=None):
     """Запускает fio-тест. Поддерживает отмену через cancel_event.
 
     В диагностическом режиме (diag_store) параллельно сэмплирует линк,
     температуру и реальную нагрузку на диск; сэмплы и сводка сохраняются
     в памяти и попадают в единый файл отчёта.
     """
+    if tuner:
+        tuner.drop_caches()
+
     disk_path = disk_info["path"]
     # Движок/direct/output-format приходят из .fio-конфига (секция [global]),
     # здесь добавляются только инфраструктурные параметры запуска.
@@ -410,6 +418,11 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         "--name", test_id,
         "--filename", disk_path,
     ] + list(base_args)
+
+    if tuner:
+        numa_cpus = tuner.get_numa_cpus(disk_info["name"])
+        if numa_cpus:
+            cmd.extend(["--cpus_allowed", numa_cpus])
 
     stop_event = threading.Event()
     sampler = None
@@ -563,14 +576,14 @@ def process_task_result(results, idx, disk, t, fio_args, res):
     results[idx][t] = res
 
 
-def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=None):
+def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=None, tuner=None):
     """Запускает все тесты одного диска строго последовательно.
 
     Параллелизация идёт по дискам, а не по отдельным тестам: несколько fio,
     конкурирующих за один накопитель, делят его шину и занижают результаты.
     """
     for t, fio_args in plan:
-        res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event, diag_store=diag_store)
+        res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event, diag_store=diag_store, tuner=tuner)
         process_task_result(results, disk_idx, disk, t, fio_args, res)
 
 
@@ -632,6 +645,13 @@ def main():
     if not disks:
         console.print("[bold yellow]Целевые диски не найдены.[/bold yellow]")
         sys.exit(0)
+
+    tuner = None
+    if not args.no_tune:
+        tuner = SystemTuner(disks)
+        tuner.detect()
+        tuner.apply()
+        tuner.print_summary()
 
     mode = "sequential" if args.sequential else "parallel"
     console.print(f"\n[bold]Режим: {mode}[/bold]")
@@ -710,7 +730,7 @@ def main():
     if args.sequential:
         try:
             for disk_idx, disk, plan in disk_plans:
-                run_disk_tests(disk_idx, disk, plan, results, cancel_event, diag_store)
+                run_disk_tests(disk_idx, disk, plan, results, cancel_event, diag_store, tuner)
         except KeyboardInterrupt:
             cancel_event.set()
             console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
@@ -722,7 +742,7 @@ def main():
             for disk_idx, disk, plan in disk_plans:
                 fut = pool.submit(
                     run_disk_tests, disk_idx, disk, plan, results,
-                    cancel_event=cancel_event, diag_store=diag_store,
+                    cancel_event=cancel_event, diag_store=diag_store, tuner=tuner,
                 )
                 future_map[fut] = disk_idx
 
@@ -741,7 +761,8 @@ def main():
     console.print(table)
 
     report_path = generate_report(
-        disks, results, TEST_NAMES, output_path=args.output, diag_store=diag_store
+        disks, results, TEST_NAMES, output_path=args.output, diag_store=diag_store,
+        tuner_report=tuner.report() if tuner else None,
     )
     console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
 
