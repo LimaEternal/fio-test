@@ -1,0 +1,43 @@
+# FIO-конфиг для NVMe накопителей.
+#
+# NVMe раскрывается на большой глубине очереди:
+#   - последовательный доступ: bs=128k, QD32 — насыщение шины PCIe;
+#   - случайный доступ: 8 потоков (QD32 x 8 = QD256) — максимум IOPS.
+#
+# Все тесты идут напрямую к диску (direct=1, минуя page cache)
+# через асинхронный движок libaio. Секция [global] применяется ко всем
+# тестам. Файл можно запускать напрямую:
+#   fio configs/nvme.fio --filename=/dev/nvme0n1
+
+[global]
+ioengine=libaio
+direct=1
+runtime=30
+time_based=1
+group_reporting=1
+norandommap=1
+output-format=json
+
+[seq_read]
+rw=read
+bs=128k
+iodepth=32
+numjobs=1
+
+[seq_write]
+rw=write
+bs=128k
+iodepth=32
+numjobs=1
+
+[rand_read]
+rw=randread
+bs=4k
+iodepth=32
+numjobs=8
+
+[rand_write]
+rw=randwrite
+bs=4k
+iodepth=32
+numjobs=8

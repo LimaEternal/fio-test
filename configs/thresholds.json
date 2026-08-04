@@ -1,0 +1,20 @@
+{
+  "nvme": {
+    "seq_read":  { "min_bw_mb": 5000 },
+    "seq_write": { "min_bw_mb": 3000 },
+    "rand_read": { "min_iops": 500000 },
+    "rand_write": { "min_iops": 200000 }
+  },
+  "sas": {
+    "seq_read":  { "min_bw_mb": 800 },
+    "seq_write": { "min_bw_mb": 600 },
+    "rand_read": { "min_iops": 30000 },
+    "rand_write": { "min_iops": 25000 }
+  },
+  "sata": {
+    "seq_read":  { "min_bw_mb": 400 },
+    "seq_write": { "min_bw_mb": 300 },
+    "rand_read": { "min_iops": 10000 },
+    "rand_write": { "min_iops": 8000 }
+  }
+}

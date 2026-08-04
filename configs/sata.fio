@@ -1,0 +1,43 @@
+# FIO-конфиг для SATA накопителей.
+#
+# SATA ограничен протоколом AHCI: максимум QD32, многопоточность вредит.
+#   - последовательный доступ: bs=64k, QD32;
+#   - случайный доступ: строго 1 поток (QD32).
+#
+# Все тесты идут напрямую к диску (direct=1, минуя page cache)
+# через асинхронный движок libaio. Секция [global] применяется ко всем
+# тестам. Файл можно запускать напрямую:
+#   fio configs/sata.fio --filename=/dev/sda
+
+[global]
+ioengine=libaio
+direct=1
+runtime=30
+time_based=1
+group_reporting=1
+norandommap=1
+output-format=json
+
+[seq_read]
+rw=read
+bs=64k
+iodepth=32
+numjobs=1
+
+[seq_write]
+rw=write
+bs=64k
+iodepth=32
+numjobs=1
+
+[rand_read]
+rw=randread
+bs=4k
+iodepth=32
+numjobs=1
+
+[rand_write]
+rw=randwrite
+bs=4k
+iodepth=32
+numjobs=1

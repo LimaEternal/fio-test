@@ -20,6 +20,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -27,36 +28,50 @@ import threading
 
 from rich.console import Console
 
-from configs import nvme, sas, sata
 from utils.diagnostics import DiagnosticSampler, collect_static_info
+from utils.fio_config import parse_fio_jobfile
 from utils.reporter import generate_report
 from utils.scanner import scan_disks
 from utils.table_renderer import build_results_table
 
 console = Console(color_system=None, highlight=False)
 
-INTERFACE_CONFIGS = {
-    "nvme": nvme.TESTS,
-    "sas": sas.TESTS,
-    "sata": sata.TESTS,
+CONFIG_DIR = Path(__file__).resolve().parent / "configs"
+
+INTERFACES = ["nvme", "sas", "sata"]
+
+# Отображаемые имена тестов для отчёта: id секции .fio -> заголовок
+FRIENDLY_TEST_NAMES = {
+    "seq_read": "Послед. чтение",
+    "seq_write": "Послед. запись",
+    "rand_read": "Случ. чтение 4k",
+    "rand_write": "Случ. запись 4k",
 }
+
+
+def _load_fio_configs():
+    """Читает configs/<interface>.fio -> {интерфейс: {id: [аргументы]}}."""
+    return {
+        iface: parse_fio_jobfile(CONFIG_DIR / f"{iface}.fio")
+        for iface in INTERFACES
+    }
+
+
+def _load_thresholds():
+    """Читает configs/thresholds.json -> {интерфейс: {id: {порог: значение}}}."""
+    path = CONFIG_DIR / "thresholds.json"
+    with path.open(encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+# Конфигурации интерфейсов и пороги (загружаются при старте, fail-fast)
+INTERFACE_CONFIGS = _load_fio_configs()
+INTERFACE_THRESHOLDS = _load_thresholds()
 
 TEST_NAMES = {}
-for _mod in [nvme, sas, sata]:
-    for _test in _mod.TESTS:
-        TEST_NAMES[_test["id"]] = _test["name"]
-
-INTERFACE_DESCRIPTIONS = {
-    "nvme": nvme.DESCRIPTION,
-    "sas": sas.DESCRIPTION,
-    "sata": sata.DESCRIPTION,
-}
-
-INTERFACE_THRESHOLDS = {
-    "nvme": nvme.THRESHOLDS,
-    "sas": sas.THRESHOLDS,
-    "sata": sata.THRESHOLDS,
-}
+for _tests in INTERFACE_CONFIGS.values():
+    for _tid in _tests:
+        TEST_NAMES[_tid] = FRIENDLY_TEST_NAMES.get(_tid, _tid)
 
 
 _SHORT_FLAGS = {"c", "s", "p", "t", "d"}
@@ -210,65 +225,79 @@ def build_fake_results(disks: list) -> list:
 
 
 def validate_configs():
-    """Валидирует конфигурации всех интерфейсов."""
-    required_test_keys = {"id", "name", "args"}
+    """Валидирует .fio-конфиги и пороги всех интерфейсов."""
     valid_bs = {"4k", "8k", "16k", "32k", "64k", "128k", "256k", "512k", "1m"}
     required_thresh_keys = {"seq_read", "seq_write", "rand_read", "rand_write"}
 
-    for name, mod in [("nvme", nvme), ("sas", sas), ("sata", sata)]:
-        desc = INTERFACE_DESCRIPTIONS.get(name, name)
+    for name, tests in INTERFACE_CONFIGS.items():
+        desc = name
 
-        # Проверка TESTS
-        tests = mod.TESTS
-        if not isinstance(tests, list) or len(tests) == 0:
-            console.print(f"[red]ОШИБКА:[/red] {desc}: TESTS — пустой список")
+        # Проверка секций .fio
+        if not tests:
+            console.print(
+                f"[red]ОШИБКА:[/red] {desc}: {name}.fio не содержит секций"
+            )
             sys.exit(1)
-        for t in tests:
-            missing = required_test_keys - set(t.keys())
-            if missing:
-                console.print(
-                    f"[red]ОШИБКА:[/red] {desc}: тест '{t.get('id', '?')}' "
-                    f"не содержит ключей {missing}"
-                )
-                sys.exit(1)
-            for a in t["args"]:
+        for tid, args in tests.items():
+            for a in args:
                 if a.startswith("--bs="):
                     bs_val = a.split("=", 1)[1].lower()
                     if bs_val not in valid_bs:
                         console.print(
                             f"[red]ОШИБКА:[/red] {desc}: недопустимый bs={bs_val} "
-                            f"в тесте {t['id']}"
+                            f"в тесте {tid}"
                         )
                         sys.exit(1)
+            if not any(a.startswith("--ioengine=") for a in args):
+                console.print(
+                    f"[red]ОШИБКА:[/red] {desc}: тест '{tid}' — "
+                    f"не указан ioengine (движок должен быть в конфиге)"
+                )
+                sys.exit(1)
+            if "--direct=1" not in args:
+                console.print(
+                    f"[red]ОШИБКА:[/red] {desc}: тест '{tid}' — "
+                    f"нет direct=1 (обход page cache обязателен)"
+                )
+                sys.exit(1)
+            if any(a.startswith("--fsync=") for a in args):
+                console.print(
+                    f"[red]ОШИБКА:[/red] {desc}: тест '{tid}' — "
+                    f"fsync искажает замер скорости, уберите его"
+                )
+                sys.exit(1)
+            if "--output-format=json" not in args:
+                console.print(
+                    f"[red]ОШИБКА:[/red] {desc}: тест '{tid}' — "
+                    f"нет output-format=json (скрипт парсит JSON)"
+                )
+                sys.exit(1)
 
-        # Проверка THRESHOLDS
-        thresh = mod.THRESHOLDS
+        # Проверка порогов
+        thresh = INTERFACE_THRESHOLDS.get(name)
         if not isinstance(thresh, dict):
-            console.print(f"[red]ОШИБКА:[/red] {desc}: THRESHOLDS не является словарём")
+            console.print(
+                f"[red]ОШИБКА:[/red] {desc}: пороги не являются словарём"
+            )
             sys.exit(1)
         missing_t = required_thresh_keys - set(thresh.keys())
         if missing_t:
             console.print(
-                f"[red]ОШИБКА:[/red] {desc}: THRESHOLDS не содержит ключей {missing_t}"
+                f"[red]ОШИБКА:[/red] {desc}: пороги не содержат ключей {missing_t}"
             )
             sys.exit(1)
         for tid, tv in thresh.items():
             if not isinstance(tv, dict):
                 console.print(
-                    f"[red]ОШИБКА:[/red] {desc}: THRESHOLDS['{tid}'] — не словарь"
+                    f"[red]ОШИБКА:[/red] {desc}: пороги['{tid}'] — не словарь"
                 )
                 sys.exit(1)
             if "min_bw_mb" not in tv and "min_iops" not in tv:
                 console.print(
-                    f"[red]ОШИБКА:[/red] {desc}: THRESHOLDS['{tid}'] — "
+                    f"[red]ОШИБКА:[/red] {desc}: пороги['{tid}'] — "
                     f"нет min_bw_mb или min_iops"
                 )
                 sys.exit(1)
-
-        # Проверка DESCRIPTION
-        if not mod.DESCRIPTION:
-            console.print(f"[red]ОШИБКА:[/red] {desc}: DESCRIPTION пуст")
-            sys.exit(1)
 
 
 def _kill_process_group(proc):
@@ -374,15 +403,12 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     в памяти и попадают в единый файл отчёта.
     """
     disk_path = disk_info["path"]
+    # Движок/direct/output-format приходят из .fio-конфига (секция [global]),
+    # здесь добавляются только инфраструктурные параметры запуска.
     cmd = [
         "fio",
         "--name", test_id,
         "--filename", disk_path,
-        "--direct=1",
-        "--ioengine=libaio",
-        "--group_reporting",
-        "--norandommap",
-        "--output-format=json",
     ] + list(base_args)
 
     stop_event = threading.Event()
@@ -554,9 +580,8 @@ def main():
 
     # Настройка пороговых значений с возможностью переопределения
     thresholds = {
-        "nvme": dict(nvme.THRESHOLDS),
-        "sas": dict(sas.THRESHOLDS),
-        "sata": dict(sata.THRESHOLDS),
+        iface: dict(thr_map)
+        for iface, thr_map in INTERFACE_THRESHOLDS.items()
     }
     if args.threshold_nvme:
         thresholds["nvme"].update(parse_custom_thresholds(args.threshold_nvme))
@@ -664,9 +689,8 @@ def main():
         results[disk_idx]["_thresholds"] = thresholds.get(tran_key, {})
 
         plan = []
-        for test in tests:
-            t = test["id"]
-            fio_args = list(test["args"])
+        for t, fio_args in tests.items():
+            fio_args = list(fio_args)
 
             # Переопределение длительности теста
             fio_args = [
