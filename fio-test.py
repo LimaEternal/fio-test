@@ -424,6 +424,9 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         if numa_cpus:
             cmd.extend(["--cpus_allowed", numa_cpus])
 
+    # Отладочный вывод команды (можно убрать позже)
+    console.print(f"[dim]Команда fio: {' '.join(cmd)}[/dim]")
+
     stop_event = threading.Event()
     sampler = None
     sampler_thread = None
@@ -446,13 +449,13 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
                 if cancel_event and cancel_event.is_set():
                     res = {"error": "Тест отменён пользователем"}
                 else:
-                    res = {"error": "Ошибка запуска fio"}
+                    res = {"error": "Ошибка запуска fio (проверьте права доступа к устройству)"}
             else:
                 proc, stdout, stderr = result
                 stdout = stdout.decode() if stdout else ""
                 stderr = stderr.decode() if stderr else ""
                 if proc.returncode != 0:
-                    hint = stderr.strip()[:200] if stderr else ""
+                    hint = stderr.strip()[:500] if stderr else "нет вывода stderr"
                     res = {"error": f"fio завершился с кодом {proc.returncode}: {hint}"}
                 else:
                     res = _parse_fio_result(test_id, stdout)
@@ -645,6 +648,18 @@ def main():
     if not disks:
         console.print("[bold yellow]Целевые диски не найдены.[/bold yellow]")
         sys.exit(0)
+
+    # Проверка наличия fio
+    try:
+        subprocess.run(["fio", "--version"], capture_output=True, check=True)
+    except FileNotFoundError:
+        console.print("[bold red]ОШИБКА:[/bold red] Утилита fio не найдена. Установите fio:")
+        console.print("  apt install fio  (Debian/Ubuntu)")
+        console.print("  yum install fio  (RHEL/CentOS)")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        console.print(f"[bold red]ОШИБКА:[/bold red] fio вернул ошибку: {e}")
+        sys.exit(1)
 
     tuner = None
     if not args.no_tune:

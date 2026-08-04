@@ -142,9 +142,12 @@ class SystemTuner:
                 try:
                     cpulist_path = Path(f"/sys/devices/system/node/node{numa_node}/cpulist")
                     if cpulist_path.exists():
-                        return cpulist_path.read_text().strip()
+                        cpulist = cpulist_path.read_text().strip()
+                        if cpulist:
+                            return cpulist
                 except Exception:
                     pass
+                break
         return None
 
     def _detect_cpu_governor(self):
