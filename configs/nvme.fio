@@ -11,7 +11,7 @@
 
 [global]
 ioengine=io_uring
-hipri=1
+hipri
 direct=1
 ramp_time=15
 runtime=60
