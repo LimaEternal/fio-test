@@ -115,6 +115,41 @@ class RenderSourceNotesTests(unittest.TestCase):
         lines = _render_source_notes(disk_results, TEST_NAMES)
         self.assertEqual(lines, [])
 
+    def test_notes_from_diag_notes_are_rendered(self):
+        disk_results = {
+            "_thresholds": {},
+            "seq_read": {
+                "iops": 1, "bw_mb": 1, "lat_avg": 0, "lat_p99": 0,
+                "cpu_user": 0, "cpu_sys": 0, "status": "ok",
+                "diag": {
+                    "notes": [
+                        "температура недоступна: установите nvme-cli (нужен nvme smart-log)",
+                        "нагрузка не отражается в /proc/diskstats на этом ядре; "
+                        "скорость/IOPS взяты из логов fio",
+                    ],
+                },
+            },
+        }
+        lines = _render_source_notes(disk_results, TEST_NAMES)
+        text = "\n".join(lines)
+        self.assertIn("> температура недоступна: установите nvme-cli", text)
+        self.assertIn("> нагрузка не отражается в /proc/diskstats", text)
+        self.assertIn("скорость/IOPS взяты из логов fio", text)
+
+    def test_notes_deduplicated_across_tests(self):
+        diag = {"notes": ["линк PCIe не удалось прочитать"]}
+        disk_results = {
+            "_thresholds": {},
+            "seq_read": {"iops": 1, "bw_mb": 1, "lat_avg": 0, "lat_p99": 0,
+                         "cpu_user": 0, "cpu_sys": 0, "status": "ok",
+                         "diag": dict(diag)},
+            "rand_read": {"iops": 1, "bw_mb": 1, "lat_avg": 0, "lat_p99": 0,
+                          "cpu_user": 0, "cpu_sys": 0, "status": "ok",
+                          "diag": dict(diag)},
+        }
+        lines = _render_source_notes(disk_results, TEST_NAMES)
+        self.assertEqual(lines.count("> линк PCIe не удалось прочитать"), 1)
+
 
 class GenerateReportDiagStoreTests(unittest.TestCase):
     def test_report_contains_sampler_tables_with_diag_store(self):

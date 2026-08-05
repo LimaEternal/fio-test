@@ -517,6 +517,22 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         if numa_cpus:
             cmd.extend(["--cpus_allowed", numa_cpus])
 
+    # В диагностическом режиме просим fio писать пер-секундные логи нагрузки:
+    # /proc/diskstats на некоторых ядрах не учитывает I/O под нагрузкой,
+    # поэтому скорость/IOPS берутся из логов (по таймстампу матчатся в сэмплы).
+    fio_log_prefix = None
+    if diag_store is not None:
+        log_dir = Path("reports")
+        log_dir.mkdir(exist_ok=True)
+        fio_log_prefix = str(log_dir / f"fio-{disk_info['name']}-{test_id}")
+        cmd.extend([
+            "--write_bw_log", fio_log_prefix,
+            "--write_iops_log", fio_log_prefix,
+            "--log_avg_msec", "1000",
+            "--log_unix_epoch", "1",
+            "--per_job_logs", "1",
+        ])
+
     stop_event = threading.Event()
     sampler = None
     sampler_thread = None
@@ -572,18 +588,34 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
 
     if res is not None:
         if sampler:
+            if fio_log_prefix:
+                merged = sampler.merge_fio_logs(fio_log_prefix)
+            else:
+                merged = False
             summary = sampler.summary()
             res["diag"] = summary
             sources = summary.get("sources") or {}
-            warnings = []
+            notes = []
+            if not sources.get("link"):
+                notes.append("линк PCIe не удалось прочитать")
             if not sources.get("temp"):
-                warnings.append("температура недоступна (нет hwmon)")
+                notes.append("температура недоступна: установите nvme-cli (нужен nvme smart-log)")
             if not sources.get("diskstats"):
-                warnings.append("/proc/diskstats не читается — нагрузка не сэмплирована")
-            if warnings:
+                notes.append("/proc/diskstats не читается — нагрузка не сэмплирована")
+            elif res.get("bw_mb") or res.get("iops"):
+                # fio намерил объём, а /proc/diskstats — нет: учёт на этом ядре
+                # не работает, нагрузка берётся из логов fio.
+                if not summary.get("diskstats_activity"):
+                    if summary.get("load_source") == "fio":
+                        notes.append("нагрузка не отражается в /proc/diskstats на этом ядре; "
+                                     "скорость/IOPS взяты из логов fio")
+                    else:
+                        notes.append("нагрузка не отражается в /proc/diskstats на этом ядре")
+            summary["notes"] = notes
+            if notes:
                 console.print(
                     f"[yellow]Мониторинг /dev/{disk_info['name']} ({test_id}): "
-                    f"{'; '.join(warnings)}[/yellow]"
+                    f"{'; '.join(notes)}[/yellow]"
                 )
             entry = {"samples": sampler.samples, "summary": summary}
             if state_lock is not None:

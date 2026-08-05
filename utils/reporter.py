@@ -28,21 +28,28 @@ TEST_NAMES = {
 def _render_source_notes(disk_results: dict, test_names: dict) -> List[str]:
     """Заметки о недоступных источниках сэмплера и первом снимке /proc/diskstats.
 
-    Берёт данные из res["diag"]["sources"] / ["diskstats_first"], чтобы причина
-    пустых пер-секундных таблиц была видна прямо в отчёте.
+    Основной источник заметок — res["diag"]["notes"] (собирает run_fio_test:
+    отсутствие nvme-cli, недостоверный /proc/diskstats и т.п.). Для старых
+    отчётов/тестовых данных есть фолбэк на res["diag"]["sources"].
     """
     seen = set()
     out: List[str] = []
     for test_id in test_names:
         res = disk_results.get(test_id) or {}
         diag = res.get("diag") or {}
+
+        for note in diag.get("notes") or []:
+            if note not in seen:
+                seen.add(note)
+                out.append(f"> {note}")
+
         sources = diag.get("sources")
-        if sources:
+        if sources and not diag.get("notes"):
             notes = []
             if not sources.get("link"):
                 notes.append("линк PCIe не удалось прочитать")
             if not sources.get("temp"):
-                notes.append("температура недоступна (hwmon не найден)")
+                notes.append("температура недоступна (нет hwmon)")
             if not sources.get("diskstats"):
                 notes.append("нагрузка недоступна: /proc/diskstats не читается")
             for note in notes:
