@@ -88,6 +88,14 @@ class ParseFioJobfileTests(unittest.TestCase):
         with self.assertRaises(FioConfigError):
             self._parse("rw=read\n")
 
+    def test_bare_boolean_option_treated_as_value_1(self):
+        result = self._parse(
+            "[seq_read]\n"
+            "rw=read\n"
+            "stonewall\n"
+        )
+        self.assertEqual(result["seq_read"], ["--rw=read", "--stonewall=1"])
+
     def test_bad_line_raises(self):
         with self.assertRaises(FioConfigError):
             self._parse("[seq_read]\nthis is not an option\n")

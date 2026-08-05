@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Union
 
-from utils.table_renderer import SHOW_LAT_P99, _fmt
+from utils.table_renderer import _fmt
 
 
 def _strip_rich(text: str) -> str:
@@ -68,18 +68,24 @@ def generate_report(
     output_path: Optional[Union[str, Path]] = None,
     diag_store: Optional[dict] = None,
     tuner_report: Optional[List[dict]] = None,
+    run_info: Optional[dict] = None,
+    fio_configs: Optional[dict] = None,
+    show_lat_p99: bool = False,
 ) -> Path:
     """
     Генерирует MD-файл с таблицей результатов.
 
     Параметры:
-        disks       — список словарей с данными дисков
-        results     — список словарей с результатами тестов (по одному на диск)
-        test_names  — порядок и отображаемые имена тестов (по умолчанию TEST_NAMES)
-        output_path — путь для выходного файла (по умолчанию fio_report_<timestamp>.md)
-        diag_store  — диагностические данные {диск: {тест: {"samples", "summary"}}};
-                      при наличии добавляет пер-секундные таблицы сэмплера
-        tuner_report — список применённых настроек тюнера (из SystemTuner.report())
+        disks         — список словарей с данными дисков
+        results       — список словарей с результатами тестов (по одному на диск)
+        test_names    — порядок и отображаемые имена тестов (по умолчанию TEST_NAMES)
+        output_path   — путь для выходного файла (по умолчанию fio_report_<timestamp>.md)
+        diag_store    — диагностические данные {диск: {тест: {"samples", "summary"}}};
+                        при наличии добавляет пер-секундные таблицы сэмплера
+        tuner_report  — список применённых настроек тюнера (из SystemTuner.report())
+        run_info      — метаданные запуска {"command": str, "flags": [(label, value), ...]}
+        fio_configs   — {интерфейс: сырое содержимое .fio-файла} для секции конфигов
+        show_lat_p99  — добавлять колонку Lat P99 в таблицу результатов
 
     Возвращает:
         Path к созданному файлу
@@ -102,6 +108,25 @@ def generate_report(
         lines.append("")
         lines.append(f"> Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("")
+
+        if run_info:
+            lines.append("## Параметры запуска")
+            lines.append("")
+            command = run_info.get("command")
+            if command:
+                lines.append("Команда:")
+                lines.append("")
+                lines.append("```bash")
+                lines.append(command)
+                lines.append("```")
+                lines.append("")
+            flags = run_info.get("flags") or []
+            if flags:
+                lines.append("| Параметр | Значение |")
+                lines.append("|----------|----------|")
+                for label, value in flags:
+                    lines.append(f"| {label} | {value} |")
+                lines.append("")
 
         has_diag = (
             any(d.get("diag_static") for d in disks)
@@ -161,13 +186,24 @@ def generate_report(
                 )
 
         lines.append("")
+        if fio_configs:
+            lines.append("## Конфигурация тестов (fio)")
+            lines.append("")
+            for name, content in fio_configs.items():
+                lines.append(f"Использован файл: `configs/{name}.fio`")
+                lines.append("")
+                lines.append("```ini")
+                lines.extend(content.splitlines())
+                lines.append("```")
+                lines.append("")
+
         lines.append("## Результаты тестирования")
         lines.append("")
 
         for idx, (disk, disk_results) in enumerate(zip(disks, results), 1):
             lines.append(f"### {idx}. /dev/{disk['name']} ({disk['model']})")
             lines.append("")
-            if SHOW_LAT_P99:
+            if show_lat_p99:
                 lines.append(
                     "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Lat P99 (мс) | Статус |"
                 )
@@ -187,7 +223,7 @@ def generate_report(
 
                 if "error" in res:
                     cells = [test_name, res.get("bs", "—"), "—", "—", "—"]
-                    if SHOW_LAT_P99:
+                    if show_lat_p99:
                         cells.append("—")
                     cells.append("undone")
                 else:
@@ -198,7 +234,7 @@ def generate_report(
                         _fmt(res.get("bw_mb", 0), ".1f"),
                         _fmt(res.get("lat_avg", 0), ".2f"),
                     ]
-                    if SHOW_LAT_P99:
+                    if show_lat_p99:
                         cells.append(_fmt(res.get("lat_p99", 0), ".2f"))
                     cells.append(res.get("status", "undone"))
                 lines.append("| " + " | ".join(cells) + " |")
@@ -206,7 +242,7 @@ def generate_report(
             lines.append("")
 
             if has_diag:
-                lines.append(f"**Диагностика — {disk['name']}**")
+                lines.append(f"**Мониторинг — {disk['name']}**")
                 lines.append("")
                 lines.append(
                     "| Тест | CPU user/sys (%) | Линк min | Tmax (°C) | avgqu-sz | "

@@ -3,6 +3,7 @@
 Поддерживает подмножество формата fio, которое генерирует этот проект:
 - секции [имя];
 - строки key=value;
+- голые булевы опции (например, stonewall) — эквивалент key=1;
 - полнострочные комментарии ; и # (пустые строки игнорируются);
 - секция [global] применяется ко всем остальным секциям: её опции идут
   первыми, а собственные опции секции могут их переопределить.
@@ -16,6 +17,7 @@ from pathlib import Path
 
 SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 OPTION_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=\s*(.*)$")
+BARE_OPTION_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*$")
 
 GLOBAL_SECTION = "global"
 
@@ -57,6 +59,11 @@ def parse_fio_jobfile(path):
         m = OPTION_RE.match(line)
         if m and current is not None:
             raw[current].append((m.group(1), m.group(2).strip()))
+            continue
+
+        m = BARE_OPTION_RE.match(line)
+        if m and current is not None:
+            raw[current].append((m.group(1), "1"))
             continue
 
         raise FioConfigError(f"{path}:{lineno}: не удалось разобрать строку: {line!r}")

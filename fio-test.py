@@ -11,9 +11,10 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -c           — тестирование с подтверждением
     python fio-test.py -c -s        — с подтверждением, последовательно
     python fio-test.py -c -p        — с подтверждением и прекондишнингом
-    python fio-test.py -r 60        — 60 сек на тест
-    python fio-test.py -o my.md     — свой путь отчёта
-    python fio-test.py -t           — тестовый режим (пробные данные без fio)
+    python fio-test.py -r 60            — 60 сек на тест
+    python fio-test.py -l               — подробное логирование (мониторинг в отчёте)
+    python fio-test.py -o my.md         — свой путь отчёта
+    python fio-test.py -t               — тестовый режим (пробные данные без fio)
 """
 
 import argparse
@@ -75,7 +76,7 @@ for _tests in INTERFACE_CONFIGS.values():
         TEST_NAMES[_tid] = FRIENDLY_TEST_NAMES.get(_tid, _tid)
 
 
-_SHORT_FLAGS = {"c", "s", "p", "t", "d", "n"}
+_SHORT_FLAGS = {"c", "s", "p", "t", "l", "n"}
 
 
 def _expand_short_flags(argv: list[str]) -> list[str]:
@@ -101,6 +102,7 @@ def parse_args():
             "  python fio-test.py -c -s                     — с подтверждением, последовательно\n"
             "  python fio-test.py -c -p                     — с подтверждением и прекондишнингом\n"
             "  python fio-test.py -r 60                     — 60 секунд на каждый тест\n"
+            "  python fio-test.py -l                        — подробное логирование (мониторинг в отчёте)\n"
             "  python fio-test.py -t                        — тестовый режим (пробные данные)\n"
             "  python fio-test.py -o reports/custom.md       — свой путь отчёта\n"
             "  python fio-test.py -c --threshold-nvme \"seq_read=15000:seq_write=12000\""
@@ -120,9 +122,9 @@ def parse_args():
         help="Прекондишнинг перед тестами",
     )
     parser.add_argument(
-        "-d", "--diagnostic", action="store_true",
-        help="Диагностический режим: сэмплинг линка/температуры/нагрузки "
-             "в пер-секундные таблицы отчёта",
+        "-l", "--logging", action="store_true",
+        help="Подробное логирование: пер-секундный мониторинг линка/температуры/"
+             "нагрузки в MD-отчёт (+ колонка Lat P99)",
     )
     parser.add_argument(
         "-n", "--no-tune", action="store_true",
@@ -184,6 +186,51 @@ def parse_custom_thresholds(raw):
             elif k.startswith("rand_"):
                 result.setdefault(k, {})["min_iops"] = v
     return result
+
+
+def _build_run_info(args) -> dict:
+    """Собирает мета-информацию о запуске для секции «Параметры запуска» отчёта."""
+    mode = "последовательный" if args.sequential else "параллельный"
+    flags = [
+        ("Режим", mode),
+        ("Прекондишнинг", "включён" if args.precond else "выключен"),
+        ("Подробные логи", "включены" if args.logging else "выключены"),
+        ("Автонастройка системы", "выключена" if args.no_tune else "включена"),
+        ("Длительность теста", f"{args.runtime} сек"),
+    ]
+    if args.threshold_nvme:
+        flags.append(("Пороги NVMe", args.threshold_nvme))
+    if args.threshold_sas:
+        flags.append(("Пороги SAS", args.threshold_sas))
+    if args.threshold_sata:
+        flags.append(("Пороги SATA", args.threshold_sata))
+    if args.output:
+        flags.append(("Выходной отчёт", args.output))
+    command = "python fio-test.py " + " ".join(sys.argv[1:])
+    return {"command": command.strip(), "flags": flags}
+
+
+def _collect_fio_configs(disks: list) -> dict:
+    """Возвращает {интерфейс: сырое содержимое .fio} для интерфейсов целевых дисков."""
+    used = set()
+    for disk in disks:
+        tran = disk.get("tran", "").lower()
+        if "nvme" in tran:
+            used.add("nvme")
+        elif "sas" in tran:
+            used.add("sas")
+        else:
+            used.add("sata")
+
+    configs = {}
+    for name in INTERFACES:
+        if name in used:
+            path = CONFIG_DIR / f"{name}.fio"
+            try:
+                configs[name] = path.read_text(encoding="utf-8")
+            except OSError:
+                configs[name] = f"# Файл {path.name} не найден"
+    return configs
 
 
 def build_fake_disks() -> list:
@@ -378,7 +425,7 @@ def _parse_fio_result(test_id, stdout):
 
     res = {"iops": iops, "bw_mb": bw_mb, "lat_avg": lat_avg, "lat_p99": lat_p99}
 
-    # Диагностика из fio-JSON (заполняется при --diagnostic и без него)
+    # Диагностика из fio-JSON (заполняется при --logging и без него)
     usage = job.get("usage") or {}
     res["cpu_user"] = round(usage.get("user", 0), 1)
     res["cpu_sys"] = round(usage.get("sys", 0), 1)
@@ -654,6 +701,9 @@ def main():
         report_path = generate_report(
             disks, results, TEST_NAMES, output_path=args.output,
             tuner_report=preview_rows or None,
+            run_info=_build_run_info(args),
+            fio_configs=_collect_fio_configs(disks),
+            show_lat_p99=args.logging,
         )
         console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
         return
@@ -666,7 +716,9 @@ def main():
         console.print(f"[bold red]Ошибка сканирования:[/bold red] {exc}")
         sys.exit(1)
 
-    if args.diagnostic:
+    fio_configs = _collect_fio_configs(disks)
+
+    if args.logging:
         for d in disks:
             d["diag_static"] = collect_static_info(d)
 
@@ -727,9 +779,9 @@ def main():
     cancel_event = threading.Event()
 
     # Сбор диагностических сэмплов в памяти: {диск: {тест: {"samples", "summary"}}}
-    diag_store = {}
-    if args.diagnostic:
-        console.print("\n[bold]Диагностика: пер-секундные сэмплы линка/"
+    diag_store = {} if args.logging else None
+    if args.logging:
+        console.print("\n[bold]Подробное логирование: пер-секундные сэмплы линка/"
                       "температуры/нагрузки — в единый файл отчёта[/bold]")
 
     # Прекондишнинг
@@ -819,6 +871,9 @@ def main():
     report_path = generate_report(
         disks, results, TEST_NAMES, output_path=args.output, diag_store=diag_store,
         tuner_report=tuner.report() if tuner else None,
+        run_info=_build_run_info(args),
+        fio_configs=fio_configs,
+        show_lat_p99=args.logging,
     )
     console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
 

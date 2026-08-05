@@ -30,7 +30,7 @@ class RunDiskTestsTests(unittest.TestCase):
         results = [{"_thresholds": {}}]
         call_log = []
 
-        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_store=None):
+        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_store=None, tuner=None):
             call_log.append(test_id)
             return {"iops": 1, "bw_mb": 1, "lat_avg": 0.1, "lat_p99": 0.2}
 
@@ -50,7 +50,7 @@ class RunDiskTestsTests(unittest.TestCase):
         results = [{"_thresholds": {}}]
         call_log = []
 
-        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_store=None):
+        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_store=None, tuner=None):
             call_log.append(test_id)
             if test_id == "seq_read":
                 return {"error": "fio не найден"}
@@ -110,17 +110,17 @@ class ParseFioResultTests(unittest.TestCase):
         self.assertIn("error", res)
 
 
-class ParseArgsDiagnosticTests(unittest.TestCase):
-    def test_diagnostic_flag_parses(self):
-        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-d"]):
+class ParseArgsLoggingTests(unittest.TestCase):
+    def test_logging_flag_parses(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-l"]):
             args = fio_test.parse_args()
-        self.assertTrue(args.diagnostic)
+        self.assertTrue(args.logging)
 
-    def test_combined_short_flags_with_d(self):
-        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-sd"]):
+    def test_combined_short_flags_with_l(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-sl"]):
             args = fio_test.parse_args()
         self.assertTrue(args.sequential)
-        self.assertTrue(args.diagnostic)
+        self.assertTrue(args.logging)
 
 
 class MainParallelModeTests(unittest.TestCase):
@@ -133,6 +133,9 @@ class MainParallelModeTests(unittest.TestCase):
         with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(fio_test, "SystemTuner"), \
              mock.patch.object(fio_test.sys, "argv", ["fio-test.py"]), \
              mock.patch.object(fio_test, "run_disk_tests") as fake_runner:
             fio_test.main()
@@ -144,12 +147,15 @@ class MainParallelModeTests(unittest.TestCase):
             self.assertEqual([t for t, _ in plan], NVME_TEST_IDS)
             self.assertEqual(kwargs.get("cancel_event") is not None, True)
 
-    def test_diagnostic_mode_passes_diag_store_to_runner_and_report(self):
+    def test_logging_mode_passes_diag_store_to_runner_and_report(self):
         disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
         with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
-             mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-d"]), \
+             mock.patch.object(fio_test.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(fio_test, "SystemTuner"), \
+             mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-l"]), \
              mock.patch.object(fio_test, "collect_static_info",
                                return_value={"numa_node": None, "cpu_affinity": None}), \
              mock.patch.object(fio_test, "run_disk_tests") as fake_runner:
@@ -160,20 +166,27 @@ class MainParallelModeTests(unittest.TestCase):
         self.assertIsNotNone(kwargs.get("diag_store"))
         _, report_kwargs = fake_report.call_args
         self.assertIsNotNone(report_kwargs.get("diag_store"))
+        self.assertTrue(report_kwargs.get("show_lat_p99"))
 
-    def test_non_diagnostic_mode_passes_empty_diag_store(self):
+    def test_non_logging_mode_passes_none_diag_store(self):
         disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
         with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(fio_test, "SystemTuner"), \
              mock.patch.object(fio_test.sys, "argv", ["fio-test.py"]), \
              mock.patch.object(fio_test, "run_disk_tests") as fake_runner:
             fio_test.main()
 
         _, kwargs = fake_runner.call_args
-        self.assertEqual(kwargs.get("diag_store"), {})
+        self.assertIsNone(kwargs.get("diag_store"))
         _, report_kwargs = fake_report.call_args
-        self.assertEqual(report_kwargs.get("diag_store"), {})
+        self.assertIsNone(report_kwargs.get("diag_store"))
+        self.assertFalse(report_kwargs.get("show_lat_p99"))
+        self.assertIsNotNone(report_kwargs.get("run_info"))
+        self.assertIsNotNone(report_kwargs.get("fio_configs"))
 
 
 class RunFioTestDiagStoreTests(unittest.TestCase):

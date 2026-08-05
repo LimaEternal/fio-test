@@ -11,7 +11,6 @@
 
 [global]
 ioengine=io_uring
---hipri
 direct=1
 ramp_time=15
 runtime=60
@@ -19,28 +18,31 @@ time_based=1
 group_reporting=1
 norandommap=1
 output-format=json
+thread=1
 
 [seq_read]
 rw=read
 bs=128k
-iodepth=32
-numjobs=16  
+iodepth=64
+numjobs=1
 
 [seq_write]
 rw=write
-bs=1m            
-iodepth=16
-numjobs=4        
+bs=1m
+iodepth=64
+numjobs=1
+stonewall
 
 [rand_read]
 rw=randread
-bs=4k            
-iodepth=32
-numjobs=8        
+bs=4k
+iodepth=8
+numjobs=4
+stonewall
 
 [rand_write]
 rw=randwrite
-bs=4k            
-iodepth=32
-numjobs=8
-
+bs=4k
+iodepth=4
+numjobs=4
+stonewall

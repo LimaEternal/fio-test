@@ -42,15 +42,18 @@ def make_diag_store(samples):
     }
 
 
-def make_results():
+def make_results(include_diag=True):
     res = {
         "iops": 47694, "bw_mb": 12400.5, "lat_avg": 1.33, "lat_p99": 1.83,
         "cpu_user": 2.0, "cpu_sys": 16.0, "status": "ok",
         "clat_p50_ms": 1.2, "clat_p90_ms": 1.5, "clat_p99_ms": 1.83,
         "clat_p99_9_ms": 2.1, "slat_avg_ms": 0.002, "iodepth": 16, "io_kb": 500000,
     }
+    seq_read = dict(res)
+    if include_diag:
+        seq_read["diag"] = {"temp_max_c": 41.0}
     return [
-        {"_thresholds": {}, "seq_read": {**res, "diag": {"temp_max_c": 41.0}}},
+        {"_thresholds": {}, "seq_read": seq_read},
     ]
 
 
@@ -89,9 +92,47 @@ class GenerateReportDiagStoreTests(unittest.TestCase):
 
         self.assertIn("Сэмплы линка/температуры/нагрузки", text)
         self.assertIn("32 GT/s x4", text)
-        self.assertIn("**Диагностика — nvme1n1**", text)
+        self.assertIn("**Мониторинг — nvme1n1**", text)
 
-    def test_report_without_diag_store_has_no_sampler_tables(self):
+    def test_report_without_diag_store_has_no_diag_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(include_diag=False), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("Сэмплы линка/температуры/нагрузки", text)
+        self.assertNotIn("**Мониторинг —", text)
+        self.assertNotIn("| NUMA |", text)
+        self.assertIn("## Результаты тестирования", text)
+
+
+class GenerateReportRunInfoTests(unittest.TestCase):
+    def test_report_contains_run_info_command_and_flags(self):
+        run_info = {
+            "command": "python fio-test.py -l -s",
+            "flags": [
+                ("Режим", "последовательный"),
+                ("Подробные логи", "включены"),
+                ("Длительность теста", "60 сек"),
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+                run_info=run_info,
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("## Параметры запуска", text)
+        self.assertIn("python fio-test.py -l -s", text)
+        self.assertIn("| Параметр | Значение |", text)
+        self.assertIn("| Режим | последовательный |", text)
+        self.assertIn("| Длительность теста | 60 сек |", text)
+
+    def test_report_without_run_info_has_no_params_section(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = generate_report(
                 [DISK], make_results(), TEST_NAMES,
@@ -99,7 +140,60 @@ class GenerateReportDiagStoreTests(unittest.TestCase):
             )
             text = path.read_text(encoding="utf-8")
 
-        self.assertNotIn("Сэмплы линка/температуры/нагрузки", text)
+        self.assertNotIn("## Параметры запуска", text)
+
+
+class GenerateReportFioConfigsTests(unittest.TestCase):
+    def test_report_contains_fio_config_content(self):
+        fio_configs = {
+            "nvme": "# FIO-конфиг для NVMe\n[global]\nioengine=io_uring\ndirect=1\n",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+                fio_configs=fio_configs,
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("## Конфигурация тестов (fio)", text)
+        self.assertIn("Использован файл: `configs/nvme.fio`", text)
+        self.assertIn("ioengine=io_uring", text)
+        self.assertIn("direct=1", text)
+
+    def test_report_without_fio_configs_has_no_config_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("## Конфигурация тестов (fio)", text)
+
+
+class GenerateReportLatP99Tests(unittest.TestCase):
+    def test_lat_p99_column_shown_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+                show_lat_p99=True,
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("Lat P99 (мс)", text)
+        self.assertIn("1.83", text)
+
+    def test_lat_p99_column_hidden_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("Lat P99 (мс)", text)
 
 
 if __name__ == "__main__":
