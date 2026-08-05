@@ -23,7 +23,7 @@ TEST_NAMES = {
 
 SAMPLE = {
     "gts": 32.0, "width": 4, "temp": 41.0,
-    "read_mbs": 12400.5, "write_mbs": 0.0, "iops": 47694, "avgqu_sz": 63.5,
+    "read_mbs": 12400.5, "write_mbs": 0.0, "iops": 47694,
 }
 
 
@@ -35,7 +35,7 @@ def make_diag_store(samples):
                 "summary": {
                     "link_gts_min": 32.0, "link_width_min": 4, "temp_max_c": 41.0,
                     "read_mbs_avg": 12400.5, "write_mbs_avg": 0.0, "iops_avg": 47694,
-                    "avgqu_sz_max": 63.5, "samples": len(samples),
+                    "samples": len(samples),
                 },
             }
         }
@@ -65,8 +65,8 @@ class RenderSamplerTablesTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("Сэмплы линка/температуры/нагрузки", text)
         self.assertIn("| Сек | Линк | t°C |", text)
-        self.assertIn("| 1 | 32 GT/s x4 | 41.0 | 12400.5 | 0.0 | 47,694 | 63.5 |", text)
-        self.assertIn("| 2 | 32 GT/s x4 | 42.0 | 12400.5 | 0.0 | 47,700 | 63.5 |", text)
+        self.assertIn("| 1 | 32 GT/s x4 | 41.0 | 12400.5 | 0.0 | 47,694 |", text)
+        self.assertIn("| 2 | 32 GT/s x4 | 42.0 | 12400.5 | 0.0 | 47,700 |", text)
 
     def test_unknown_disk_renders_nothing(self):
         lines = _render_sampler_tables(make_diag_store([SAMPLE]), "nvmeX", TEST_NAMES)
@@ -74,24 +74,21 @@ class RenderSamplerTablesTests(unittest.TestCase):
 
     def test_none_values_rendered_as_dash(self):
         sample = {"gts": None, "width": None, "temp": None,
-                  "read_mbs": None, "write_mbs": None, "iops": None, "avgqu_sz": None}
+                  "read_mbs": None, "write_mbs": None, "iops": None}
         lines = _render_sampler_tables(make_diag_store([sample]), "nvme1n1", TEST_NAMES)
         text = "\n".join(lines)
-        self.assertIn("| 1 | — | — | — | — | — | — |", text)
+        self.assertIn("| 1 | — | — | — | — | — |", text)
 
 
 class RenderSourceNotesTests(unittest.TestCase):
-    def test_notes_when_sources_missing_and_first_diskstats(self):
+    def test_notes_when_sources_missing(self):
         disk_results = {
             "_thresholds": {},
             "seq_read": {
                 "iops": 1, "bw_mb": 1, "lat_avg": 0, "lat_p99": 0,
                 "cpu_user": 0, "cpu_sys": 0, "status": "ok",
                 "diag": {
-                    "sources": {"link": False, "temp": False, "diskstats": True},
-                    "diskstats_first": {"reads": 10, "writes": 20,
-                                        "sectors_read": 1000, "sectors_written": 2000,
-                                        "weighted_io": 3000},
+                    "sources": {"link": False, "temp": False},
                 },
             },
         }
@@ -99,7 +96,6 @@ class RenderSourceNotesTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("температура недоступна", text)
         self.assertIn("линк PCIe", text)
-        self.assertIn("reads=10", text)
 
     def test_no_notes_when_all_sources_available(self):
         disk_results = {
@@ -108,7 +104,7 @@ class RenderSourceNotesTests(unittest.TestCase):
                 "iops": 1, "bw_mb": 1, "lat_avg": 0, "lat_p99": 0,
                 "cpu_user": 0, "cpu_sys": 0, "status": "ok",
                 "diag": {
-                    "sources": {"link": True, "temp": True, "diskstats": True},
+                    "sources": {"link": True, "temp": True},
                 },
             },
         }
@@ -124,8 +120,6 @@ class RenderSourceNotesTests(unittest.TestCase):
                 "diag": {
                     "notes": [
                         "температура недоступна: установите nvme-cli (нужен nvme smart-log)",
-                        "нагрузка не отражается в /proc/diskstats на этом ядре; "
-                        "скорость/IOPS взяты из логов fio",
                     ],
                 },
             },
@@ -133,8 +127,6 @@ class RenderSourceNotesTests(unittest.TestCase):
         lines = _render_source_notes(disk_results, TEST_NAMES)
         text = "\n".join(lines)
         self.assertIn("> температура недоступна: установите nvme-cli", text)
-        self.assertIn("> нагрузка не отражается в /proc/diskstats", text)
-        self.assertIn("скорость/IOPS взяты из логов fio", text)
 
     def test_notes_deduplicated_across_tests(self):
         diag = {"notes": ["линк PCIe не удалось прочитать"]}

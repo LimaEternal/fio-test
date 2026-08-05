@@ -6,8 +6,9 @@
       поколения или ширины под нагрузкой;
     * температуру контроллера NVMe через `nvme smart-log` (nvme-cli) —
       перегрев/троттлинг;
-    * реальную нагрузку на диск: /proc/diskstats и, как основной источник,
-      пер-секундные логи fio (write_bw_log/write_iops_log) — IOPS/МБ/с.
+    * реальную нагрузку на диск: пер-секундные логи fio
+      (write_bw_log/write_iops_log) — IOPS/МБ/с. Скорость из логов вливается
+      в сэмплы после завершения теста (merge_fio_logs).
 
 Также собирает статичную информацию: NUMA-нода диска и привязка CPU.
 """
@@ -151,9 +152,12 @@ def parse_fio_logs(prefix: str) -> Optional[dict]:
 
 
 class DiagnosticSampler:
-    """Сэмплирует линк, температуру и нагрузку на диск в отдельном потоке."""
+    """Сэмплирует линк и температуру в отдельном потоке.
 
-    SECTOR_SIZE = 512
+    Нагрузку (МБ/с, IOPS) сэмплер не считает: её отдаёт сам fio своими
+    пер-секундными логами (write_bw_log/write_iops_log), которые после
+    завершения теста вливаются в сэмплы через merge_fio_logs.
+    """
 
     def __init__(self, disk: dict, interval: float = 1.0):
         self.disk = disk
@@ -161,17 +165,12 @@ class DiagnosticSampler:
         self.name = disk.get("name", "")
         self.nvme_dev = _nvme_dev_name(self.name)
         self.link_dir = find_nvme_link_dir(self.name)
-        self._prev_diskstats = None
-        self._prev_ts = None
         self.samples = []
         # Какие источники реально отдали данные (для диагностики в отчёте).
-        self.source_status = {"link": False, "temp": False, "diskstats": False}
-        self._first_diskstats = None
-        # Кэш температуры (см. TEMP_CACHE_SEC) и признак реальной активности
-        # диска по /proc/diskstats (иначе нагрузку берём из логов fio).
+        self.source_status = {"link": False, "temp": False}
+        # Кэш температуры (см. TEMP_CACHE_SEC).
         self._temp_cache = None
         self._temp_cache_ts = 0.0
-        self.diskstats_activity = False
 
     # --- чтение источников ---
 
@@ -239,47 +238,12 @@ class DiagnosticSampler:
                 return float(m.group(1))
         return None
 
-    def _read_diskstats(self) -> Optional[dict]:
-        """Читает счётчики /proc/diskstats для диска.
-
-        Устройство ищем по имени (nvme1n1) либо по major:minor из
-        /sys/class/block/<имя>/dev — надёжнее на системах, где имена в
-        /proc/diskstats могут отличаться.
-        """
-        try:
-            text = Path("/proc/diskstats").read_text(encoding="utf-8")
-        except Exception:
-            return None
-        dev_id = None
-        if self.name:
-            try:
-                dev_id = Path(f"/sys/class/block/{self.name}/dev").read_text(
-                    encoding="utf-8").strip()
-            except Exception:
-                dev_id = None
-        for line in text.splitlines():
-            parts = line.split()
-            if len(parts) < 14:
-                continue
-            if parts[2] == self.name or (
-                dev_id and f"{parts[0]}:{parts[1]}" == dev_id
-            ):
-                return {
-                    "reads": int(parts[3]),
-                    "sectors_read": int(parts[5]),
-                    "writes": int(parts[7]),
-                    "sectors_written": int(parts[9]),
-                    "weighted_io": int(parts[13]),
-                }
-        return None
-
     def merge_fio_logs(self, prefix: str) -> bool:
         """Вливает пер-секундную нагрузку из логов fio в сэмплы.
 
-        Лог-файлы fio — основной источник нагрузки: /proc/diskstats на
-        некоторых ядрах не учитывает I/O под нагрузкой. Значения из логов
-        матчатся по таймстампу (сэмплы и лог пишутся раз в секунду).
-        avgqu_sz из логов взять нельзя — остаётся как был (None).
+        Лог-файлы fio — единственный источник нагрузки: скорость/IOPS fio
+        пишет сам (write_bw_log/write_iops_log). Значения из логов матчатся
+        по таймстампу (сэмплы и лог пишутся раз в секунду).
 
         Возвращает True, если хотя бы один сэмпл получил данные из логов.
         """
@@ -305,48 +269,20 @@ class DiagnosticSampler:
     def _sample_once(self):
         gts, width = self._read_link()
         temp = self._read_temp()
-        cur = self._read_diskstats()
 
         if gts is not None:
             self.source_status["link"] = True
         if temp is not None:
             self.source_status["temp"] = True
-        if cur is not None:
-            self.source_status["diskstats"] = True
-            if self._first_diskstats is None:
-                self._first_diskstats = cur
-
-        # None, а не 0.0: в отчёте это «—» (источник не отдал данные),
-        # а не «0.0» (реально нулевая нагрузка).
-        read_mbs = write_mbs = iops = avgqu_sz = None
-        now = time.time()
-        prev = self._prev_diskstats
-        prev_ts = self._prev_ts
-        self._prev_diskstats = cur
-        self._prev_ts = now
-
-        if cur and prev and prev_ts is not None and now > prev_ts:
-            dt = now - prev_ts
-            read_bytes = (cur["sectors_read"] - prev["sectors_read"]) * self.SECTOR_SIZE
-            write_bytes = (cur["sectors_written"] - prev["sectors_written"]) * self.SECTOR_SIZE
-            read_mbs = read_bytes / 1e6 / dt
-            write_mbs = write_bytes / 1e6 / dt
-            ops = (cur["reads"] - prev["reads"]) + (cur["writes"] - prev["writes"])
-            iops = ops / dt
-            weighted_delta = cur["weighted_io"] - prev["weighted_io"]
-            avgqu_sz = weighted_delta / 1000.0 / dt
-            if read_bytes > 0 or write_bytes > 0 or ops > 0:
-                self.diskstats_activity = True
 
         self.samples.append({
-            "ts": now,
+            "ts": time.time(),
             "gts": gts,
             "width": width,
             "temp": temp,
-            "read_mbs": read_mbs,
-            "write_mbs": write_mbs,
-            "iops": iops,
-            "avgqu_sz": avgqu_sz,
+            "read_mbs": None,
+            "write_mbs": None,
+            "iops": None,
         })
 
     def run(self, stop_event: threading.Event):
@@ -369,14 +305,8 @@ class DiagnosticSampler:
                   if s["write_mbs"] is not None and s["write_mbs"] > 0]
         iops_vals = [s["iops"] for s in self.samples
                      if s["iops"] is not None and s["iops"] > 0]
-        queues = [s["avgqu_sz"] for s in self.samples
-                  if s["avgqu_sz"] is not None and s["avgqu_sz"] > 0]
 
-        load_source = None
-        if any(s.get("load_source") == "fio" for s in self.samples):
-            load_source = "fio"
-        elif self.diskstats_activity:
-            load_source = "diskstats"
+        load_source = "fio" if any(s.get("load_source") == "fio" for s in self.samples) else None
 
         return {
             "link_gts_min": min(gts_vals) if gts_vals else None,
@@ -385,10 +315,7 @@ class DiagnosticSampler:
             "read_mbs_avg": round(sum(reads) / len(reads), 1) if reads else None,
             "write_mbs_avg": round(sum(writes) / len(writes), 1) if writes else None,
             "iops_avg": round(sum(iops_vals) / len(iops_vals)) if iops_vals else None,
-            "avgqu_sz_max": round(max(queues), 1) if queues else None,
             "samples": len(self.samples),
             "sources": dict(self.source_status),
-            "diskstats_first": self._first_diskstats,
             "load_source": load_source,
-            "diskstats_activity": self.diskstats_activity,
         }

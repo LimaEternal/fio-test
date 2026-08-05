@@ -256,7 +256,7 @@ class RunFioTestDiagStoreTests(unittest.TestCase):
         diag_store = {}
         samples = [{
             "gts": 32.0, "width": 4, "temp": 41.0,
-            "read_mbs": 1000.0, "write_mbs": 0.0, "iops": 100, "avgqu_sz": 10.0,
+            "read_mbs": 1000.0, "write_mbs": 0.0, "iops": 100,
         }]
         with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
              mock.patch.object(fio_test, "DiagnosticSampler") as fake_sampler_cls:
@@ -265,7 +265,7 @@ class RunFioTestDiagStoreTests(unittest.TestCase):
             fake_sampler.summary.return_value = {
                 "link_gts_min": 32.0, "link_width_min": 4, "temp_max_c": 41.0,
                 "read_mbs_avg": 1000.0, "write_mbs_avg": 0.0, "iops_avg": 100,
-                "avgqu_sz_max": 10.0, "samples": 1,
+                "samples": 1,
             }
             res = fio_test.run_fio_test(
                 DISK, "seq_read", ["--rw=read"], diag_store=diag_store
@@ -309,8 +309,8 @@ class RunFioTestLogFlagsTests(unittest.TestCase):
             fake_sampler = fake_sampler_cls.return_value
             fake_sampler.samples = []
             fake_sampler.summary.return_value = {
-                "samples": 0, "sources": {"link": True, "temp": True, "diskstats": True},
-                "load_source": None, "diskstats_activity": False,
+                "samples": 0, "sources": {"link": True, "temp": True},
+                "load_source": None,
             }
             fake_sampler.merge_fio_logs.return_value = False
             res = fio_test.run_fio_test(
@@ -338,27 +338,26 @@ class RunFioTestLogFlagsTests(unittest.TestCase):
         sampler.merge_fio_logs.assert_not_called()
         self.assertNotIn("diag", res)
 
-    def test_notes_for_missing_temp_and_unreliable_diskstats(self):
+    def test_notes_for_missing_temp(self):
         raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1, "iops": 1}}]})
         fake = (mock.Mock(returncode=0), raw.encode(), b"")
         with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
              mock.patch.object(fio_test, "DiagnosticSampler") as fake_sampler_cls:
             fake_sampler = fake_sampler_cls.return_value
             fake_sampler.samples = [{"ts": 1.0, "read_mbs": 1000.0,
-                                     "write_mbs": 0.0, "iops": 10, "avgqu_sz": None}]
+                                     "write_mbs": 0.0, "iops": 10}]
             fake_sampler.merge_fio_logs.return_value = True
             fake_sampler.summary.return_value = {
                 "samples": 1,
-                "sources": {"link": True, "temp": False, "diskstats": True},
-                "load_source": "fio", "diskstats_activity": False,
+                "sources": {"link": True, "temp": False},
+                "load_source": "fio",
             }
             res = fio_test.run_fio_test(DISK, "seq_read", ["--rw=read"], diag_store={})
 
         notes = res["diag"]["notes"]
         self.assertTrue(any("nvme-cli" in n for n in notes), notes)
-        self.assertTrue(any("логов fio" in n for n in notes), notes)
 
-    def test_no_unreliable_diskstats_note_when_diskstats_active(self):
+    def test_no_notes_when_all_sources_available(self):
         raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1, "iops": 1}}]})
         fake = (mock.Mock(returncode=0), raw.encode(), b"")
         with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
@@ -368,13 +367,12 @@ class RunFioTestLogFlagsTests(unittest.TestCase):
             fake_sampler.merge_fio_logs.return_value = True
             fake_sampler.summary.return_value = {
                 "samples": 1,
-                "sources": {"link": True, "temp": True, "diskstats": True},
-                "load_source": "fio", "diskstats_activity": True,
+                "sources": {"link": True, "temp": True},
+                "load_source": "fio",
             }
             res = fio_test.run_fio_test(DISK, "seq_read", ["--rw=read"], diag_store={})
 
-        notes = res["diag"]["notes"]
-        self.assertFalse(any("не отражается" in n for n in notes), notes)
+        self.assertEqual(res["diag"]["notes"], [])
 
 
 class MaxIodepthOverflowTests(unittest.TestCase):

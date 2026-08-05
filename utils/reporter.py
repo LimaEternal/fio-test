@@ -26,11 +26,11 @@ TEST_NAMES = {
 
 
 def _render_source_notes(disk_results: dict, test_names: dict) -> List[str]:
-    """Заметки о недоступных источниках сэмплера и первом снимке /proc/diskstats.
+    """Заметки о недоступных источниках сэмплера.
 
     Основной источник заметок — res["diag"]["notes"] (собирает run_fio_test:
-    отсутствие nvme-cli, недостоверный /proc/diskstats и т.п.). Для старых
-    отчётов/тестовых данных есть фолбэк на res["diag"]["sources"].
+    отсутствие nvme-cli, нечитаемый линк и т.п.). Для старых отчётов/тестовых
+    данных есть фолбэк на res["diag"]["sources"].
     """
     seen = set()
     out: List[str] = []
@@ -50,23 +50,10 @@ def _render_source_notes(disk_results: dict, test_names: dict) -> List[str]:
                 notes.append("линк PCIe не удалось прочитать")
             if not sources.get("temp"):
                 notes.append("температура недоступна (нет hwmon)")
-            if not sources.get("diskstats"):
-                notes.append("нагрузка недоступна: /proc/diskstats не читается")
             for note in notes:
                 if note not in seen:
                     seen.add(note)
                     out.append(f"> {note}")
-        first = diag.get("diskstats_first")
-        if first is not None:
-            raw = (
-                f"> Счётчики /proc/diskstats на старте теста: "
-                f"reads={first['reads']}, sectors_read={first['sectors_read']}, "
-                f"writes={first['writes']}, sectors_written={first['sectors_written']}, "
-                f"weighted_io={first['weighted_io']}"
-            )
-            if raw not in seen:
-                seen.add(raw)
-                out.append(raw)
     if out:
         out.append("")
     return out
@@ -89,8 +76,8 @@ def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_name
 
         lines.append(f"**Сэмплы линка/температуры/нагрузки — {test_name}**")
         lines.append("")
-        lines.append("| Сек | Линк | t°C | Чтение МБ/с | Запись МБ/с | IOPS | avgqu-sz |")
-        lines.append("|-----|------|-----|-------------|-------------|------|----------|")
+        lines.append("| Сек | Линк | t°C | Чтение МБ/с | Запись МБ/с | IOPS |")
+        lines.append("|-----|------|-----|-------------|-------------|------|")
         for i, s in enumerate(samples, 1):
             link = "—"
             if s.get("gts") is not None:
@@ -99,9 +86,8 @@ def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_name
             read_mbs = _fmt(s.get("read_mbs"), ".1f") if s.get("read_mbs") is not None else "—"
             write_mbs = _fmt(s.get("write_mbs"), ".1f") if s.get("write_mbs") is not None else "—"
             iops = _fmt(s.get("iops"), ",.0f") if s.get("iops") is not None else "—"
-            avgqu = _fmt(s.get("avgqu_sz"), ".1f") if s.get("avgqu_sz") is not None else "—"
             lines.append(
-                f"| {i} | {link} | {temp} | {read_mbs} | {write_mbs} | {iops} | {avgqu} |"
+                f"| {i} | {link} | {temp} | {read_mbs} | {write_mbs} | {iops} |"
             )
         lines.append("")
 
@@ -292,11 +278,11 @@ def generate_report(
                 lines.append(f"**Мониторинг — {disk['name']}**")
                 lines.append("")
                 lines.append(
-                    "| Тест | CPU user/sys (%) | Линк min | Tmax (°C) | avgqu-sz | "
+                    "| Тест | CPU user/sys (%) | Линк min | Tmax (°C) | "
                     "clat p99/p99.9 (мс) | slat (мс) | iodepth | Объём (ГБ) |"
                 )
                 lines.append(
-                    "|------|------------------|----------|-----------|----------|"
+                    "|------|------------------|----------|-----------|"
                     "--------------------|-----------|---------|-------------|"
                 )
                 for test_id, test_name in test_names.items():
@@ -313,7 +299,6 @@ def generate_report(
                         link = f"{diag['link_gts_min']:g} GT/s x{width}"
 
                     tmax = _fmt(diag["temp_max_c"], ".1f") if diag.get("temp_max_c") is not None else "—"
-                    qu = _fmt(diag["avgqu_sz_max"], ".1f") if diag.get("avgqu_sz_max") is not None else "—"
 
                     p99 = res.get("clat_p99_ms", "—")
                     p999 = res.get("clat_p99_9_ms", "—")
@@ -324,7 +309,7 @@ def generate_report(
                     gb = _fmt(io_kb / 1024 / 1024, ".1f") if io_kb else "—"
 
                     lines.append(
-                        f"| {test_name} | {cpu} | {link} | {tmax} | {qu} | "
+                        f"| {test_name} | {cpu} | {link} | {tmax} | "
                         f"{clat} | {res.get('slat_avg_ms', '—')} | {iod} | {gb} |"
                     )
                 lines.append("")

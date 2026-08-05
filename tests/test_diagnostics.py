@@ -1,6 +1,5 @@
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,14 +20,11 @@ DISK = {
 
 
 def _patch_paths(tmp):
-    """Перенаправляет /proc/diskstats, /sys/class/nvme и /sys/class/block
-    на временный каталог."""
+    """Перенаправляет /sys/class/nvme и /sys/class/block на временный каталог."""
     root = str(tmp)
 
     def _mapped(path):
         p = str(path)
-        if p.startswith("/proc/diskstats"):
-            return Path(root) / "proc" / "diskstats"
         if p.startswith("/sys/class/nvme") or p.startswith("/sys/class/block"):
             return Path(root) / "sys" / p[len("/sys"):].lstrip("/")
         return Path(p)
@@ -53,13 +49,6 @@ class DiagnosticSamplerTests(unittest.TestCase):
         (dev / "current_link_speed").write_text("32.0 GT/s PCIe", encoding="utf-8")
         (dev / "current_link_width").write_text("x4", encoding="utf-8")
         (dev / "numa_node").write_text("1", encoding="utf-8")
-        # Нагрузка на диск
-        proc = self.tmp / "proc"
-        proc.mkdir(parents=True, exist_ok=True)
-        self.diskstats_cur = (
-            "259 3 nvme1n1 100000 0 2000000 0 50000 0 4000000 0 0 0 1000000\n"
-        )
-        (proc / "diskstats").write_text(self.diskstats_cur, encoding="utf-8")
 
         self.link_dir = dev
 
@@ -112,64 +101,32 @@ class DiagnosticSamplerTests(unittest.TestCase):
             sampler = DiagnosticSampler(DISK)
             self.assertIsNone(sampler._read_temp())
 
-    def test_diskstats_deltas_and_summary(self):
+    def test_sample_once_reads_link_and_temp_only(self):
         with _patch_paths(self.tmp), \
              mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=self.link_dir), \
              _smart_log("temperature: 41 C"):
             sampler = DiagnosticSampler(DISK)
-            sampler._prev_diskstats = {
-                "reads": 0, "sectors_read": 0,
-                "writes": 0, "sectors_written": 0, "weighted_io": 0,
-            }
-            sampler._prev_ts = time.time() - 1.0
             sampler._sample_once()
+            sample = sampler.samples[0]
             summary = sampler.summary()
 
-        self.assertAlmostEqual(summary["read_mbs_avg"], 1024.0, delta=15)
-        self.assertAlmostEqual(summary["write_mbs_avg"], 2048.0, delta=15)
-        self.assertAlmostEqual(summary["iops_avg"], 150000, delta=3000)
-        self.assertAlmostEqual(summary["avgqu_sz_max"], 1000.0, delta=15)
+        self.assertEqual(sample["gts"], 32.0)
+        self.assertEqual(sample["width"], 4)
+        self.assertEqual(sample["temp"], 41.0)
+        # Нагрузка не сэмплируется: её даёт сам fio (логи вливаются после теста).
+        self.assertIsNone(sample["read_mbs"])
+        self.assertIsNone(sample["write_mbs"])
+        self.assertIsNone(sample["iops"])
         self.assertEqual(summary["link_gts_min"], 32.0)
         self.assertEqual(summary["link_width_min"], 4)
         self.assertEqual(summary["temp_max_c"], 41.0)
+        self.assertIsNone(summary["read_mbs_avg"])
         self.assertEqual(summary["sources"]["link"], True)
         self.assertEqual(summary["sources"]["temp"], True)
-        self.assertEqual(summary["sources"]["diskstats"], True)
-        self.assertIsNotNone(summary["diskstats_first"])
-        self.assertEqual(summary["load_source"], "diskstats")
-        self.assertTrue(summary["diskstats_activity"])
-
-    def test_diskstats_matched_by_major_minor(self):
-        tmp = Path(tempfile.mkdtemp())
-        blk = tmp / "sys" / "class" / "block" / "nvme1n1"
-        blk.mkdir(parents=True)
-        (blk / "dev").write_text("259:3", encoding="utf-8")
-        proc = tmp / "proc"
-        proc.mkdir(parents=True)
-        # Имя в /proc/diskstats не совпадает, но major:minor совпадает.
-        (proc / "diskstats").write_text(
-            "259 3 nvmeX 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-            encoding="utf-8",
-        )
-
-        with _patch_paths(tmp), \
-             mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=None):
-            sampler = DiagnosticSampler(DISK)
-            cur = sampler._read_diskstats()
-
-        self.assertIsNotNone(cur)
-        self.assertEqual(cur["reads"], 0)
+        self.assertIsNone(summary["load_source"])
 
     def test_source_status_and_none_values_when_sources_missing(self):
-        tmp = Path(tempfile.mkdtemp())
-        proc = tmp / "proc"
-        proc.mkdir(parents=True)
-        (proc / "diskstats").write_text(
-            "259 3 nvme1n1 10 0 1000 0 20 0 2000 0 0 0 3000\n",
-            encoding="utf-8",
-        )
-
-        with _patch_paths(tmp), \
+        with _patch_paths(self.tmp), \
              mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=None), \
              _smart_log("temperature: n/a C", returncode=1):
             sampler = DiagnosticSampler(DISK)
@@ -180,17 +137,13 @@ class DiagnosticSamplerTests(unittest.TestCase):
         self.assertEqual(sample["temp"], None)
         self.assertIsNone(sample["read_mbs"])
         self.assertIsNone(sample["write_mbs"])
-        self.assertEqual(sampler.source_status,
-                         {"link": False, "temp": False, "diskstats": True})
+        self.assertEqual(sampler.source_status, {"link": False, "temp": False})
 
         summary = sampler.summary()
-        self.assertEqual(summary["sources"]["diskstats"], True)
+        self.assertEqual(summary["sources"]["link"], False)
         self.assertEqual(summary["sources"]["temp"], False)
         self.assertIsNone(summary["read_mbs_avg"])
-        self.assertIsNotNone(summary["diskstats_first"])
-        self.assertEqual(summary["diskstats_first"]["reads"], 10)
         self.assertIsNone(summary["load_source"])
-        self.assertFalse(summary["diskstats_activity"])
 
 
 class ParseFioLogsTests(unittest.TestCase):
@@ -280,10 +233,8 @@ class ParseFioLogsTests(unittest.TestCase):
              mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=None):
             sampler = DiagnosticSampler(DISK)
         sampler.samples = [
-            {"ts": 1754400000.4, "read_mbs": None, "write_mbs": None,
-             "iops": None, "avgqu_sz": None},
-            {"ts": 1754400001.2, "read_mbs": None, "write_mbs": None,
-             "iops": None, "avgqu_sz": None},
+            {"ts": 1754400000.4, "read_mbs": None, "write_mbs": None, "iops": None},
+            {"ts": 1754400001.2, "read_mbs": None, "write_mbs": None, "iops": None},
         ]
         merged = sampler.merge_fio_logs(str(tmp / "fio-nvme1n1-seq_read"))
 

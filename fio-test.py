@@ -517,9 +517,9 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         if numa_cpus:
             cmd.extend(["--cpus_allowed", numa_cpus])
 
-    # В диагностическом режиме просим fio писать пер-секундные логи нагрузки:
-    # /proc/diskstats на некоторых ядрах не учитывает I/O под нагрузкой,
-    # поэтому скорость/IOPS берутся из логов (по таймстампу матчатся в сэмплы).
+    # В диагностическом режиме просим fio писать пер-секундные логи нагрузки
+    # (write_bw_log/write_iops_log): скорость/IOPS по секундам берутся из них,
+    # по таймстампу вливаются в сэмплы после завершения теста.
     fio_log_prefix = None
     if diag_store is not None:
         log_dir = Path("reports")
@@ -600,17 +600,6 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
                 notes.append("линк PCIe не удалось прочитать")
             if not sources.get("temp"):
                 notes.append("температура недоступна: установите nvme-cli (нужен nvme smart-log)")
-            if not sources.get("diskstats"):
-                notes.append("/proc/diskstats не читается — нагрузка не сэмплирована")
-            elif res.get("bw_mb") or res.get("iops"):
-                # fio намерил объём, а /proc/diskstats — нет: учёт на этом ядре
-                # не работает, нагрузка берётся из логов fio.
-                if not summary.get("diskstats_activity"):
-                    if summary.get("load_source") == "fio":
-                        notes.append("нагрузка не отражается в /proc/diskstats на этом ядре; "
-                                     "скорость/IOPS взяты из логов fio")
-                    else:
-                        notes.append("нагрузка не отражается в /proc/diskstats на этом ядре")
             summary["notes"] = notes
             if notes:
                 console.print(
