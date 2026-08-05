@@ -5,44 +5,43 @@
 #   - случайный доступ: 8 потоков (QD32 x 8 = QD256) — максимум IOPS.
 #
 # Все тесты идут напрямую к диску (direct=1, минуя page cache)
-# через асинхронный движок libaio. Секция [global] применяется ко всем
-# тестам. Файл можно запускать напрямую:
-#   fio configs/nvme.fio --filename=/dev/nvme0n1
+# через асинхронный движок io_uring. Секция [global] применяется ко всем
+# тестам.
 
 [global]
---ioengine=io_uring
---direct=1
---ramp_time=15
---runtime=60
---time_based=1
---group_reporting=1
---norandommap=1
---output-format=json
---thread=1
+ioengine=io_uring
+direct=1
+ramp_time=15
+runtime=60
+time_based=1
+group_reporting=1
+norandommap=1
+output_format=json
+thread=1
 
 [seq_read]
---rw=read
---bs=128k
---iodepth=64
---numjobs=1
+rw=read
+bs=128k
+iodepth=64
+numjobs=1
 
 [seq_write]
---rw=write
---bs=1m
---iodepth=64
---numjobs=1
---stonewall
+rw=write
+bs=1m
+iodepth=64
+numjobs=1
+stonewall
 
 [rand_read]
---rw=randread
---bs=4k
---iodepth=8
---numjobs=4
---stonewall
+rw=randread
+bs=4k
+iodepth=8
+numjobs=4
+stonewall
 
 [rand_write]
---rw=randwrite
---bs=4k
---iodepth=4
---numjobs=4
---stonewall
+rw=randwrite
+bs=4k
+iodepth=4
+numjobs=4
+stonewall
