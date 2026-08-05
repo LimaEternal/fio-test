@@ -12,7 +12,8 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -c -s        — с подтверждением, последовательно
     python fio-test.py -c -p        — с подтверждением и прекондишнингом
     python fio-test.py -r 60            — 60 сек на тест
-    python fio-test.py -l               — подробное логирование (мониторинг в отчёте)
+    python fio-test.py -l               — подробное логирование: отчёт обновляется
+                                          по мере завершения тестов (мониторинг в отчёте)
     python fio-test.py -o my.md         — свой путь отчёта
     python fio-test.py -t               — тестовый режим (пробные данные без fio)
 """
@@ -22,10 +23,12 @@ import concurrent.futures
 import json
 import os
 from pathlib import Path
+import queue
 import signal
 import subprocess
 import sys
 import threading
+from datetime import datetime
 
 from rich.console import Console
 
@@ -392,12 +395,18 @@ def _run_io_process(cmd, cancel_event):
 
 
 def _max_iodepth(iodepth_level: dict):
-    """Возвращает максимальную достигнутую глубину очереди из гистограммы fio."""
+    """Возвращает максимальную достигнутую глубину очереди из гистограммы fio.
+
+    fio помечает верхнюю (переполненную) корзину гистограммы строкой вида
+    ">=64" — такие ключи разбираются по цифрам.
+    """
     best = None
     for depth, count in iodepth_level.items():
         if count:
-            best = depth
-    return int(best) if best is not None else None
+            digits = "".join(ch for ch in str(depth) if ch.isdigit())
+            if digits:
+                best = int(digits)
+    return best
 
 
 def _parse_fio_result(test_id, stdout):
@@ -447,12 +456,16 @@ def _parse_fio_result(test_id, stdout):
     return res
 
 
-def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=None, tuner=None):
+def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=None, tuner=None,
+                 state_lock=None, live_store=None):
     """Запускает fio-тест. Поддерживает отмену через cancel_event.
 
     В диагностическом режиме (diag_store) параллельно сэмплирует линк,
     температуру и реальную нагрузку на диск; сэмплы и сводка сохраняются
     в памяти и попадают в единый файл отчёта.
+
+    state_lock защищает запись в общие diag_store/live_store от гонок
+    с фоновым writer-потоком инкрементального отчёта.
     """
     disk_path = disk_info["path"]
     # Движок/direct/output-format приходят из .fio-конфига (секция [global]),
@@ -478,6 +491,13 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
             target=sampler.run, args=(stop_event,), daemon=True
         )
         sampler_thread.start()
+        if live_store is not None:
+            live_entry = {"test_id": test_id, "samples": sampler.samples}
+            if state_lock is not None:
+                with state_lock:
+                    live_store[disk_info["name"]] = live_entry
+            else:
+                live_store[disk_info["name"]] = live_entry
 
     res = None
     try:
@@ -499,20 +519,31 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
                     hint = stderr.strip()[:500] if stderr else "нет вывода stderr"
                     res = {"error": f"fio завершился с кодом {proc.returncode}: {hint}"}
                 else:
-                    res = _parse_fio_result(test_id, stdout)
+                    try:
+                        res = _parse_fio_result(test_id, stdout)
+                    except Exception as exc:
+                        res = {"error": f"Ошибка разбора результата fio: {exc}"}
     finally:
         stop_event.set()
         if sampler_thread:
             sampler_thread.join(timeout=5)
+        if live_store is not None:
+            if state_lock is not None:
+                with state_lock:
+                    live_store.pop(disk_info["name"], None)
+            else:
+                live_store.pop(disk_info["name"], None)
 
     if res is not None:
         if sampler:
             summary = sampler.summary()
             res["diag"] = summary
-            diag_store.setdefault(disk_info["name"], {})[test_id] = {
-                "samples": sampler.samples,
-                "summary": summary,
-            }
+            entry = {"samples": sampler.samples, "summary": summary}
+            if state_lock is not None:
+                with state_lock:
+                    diag_store.setdefault(disk_info["name"], {})[test_id] = entry
+            else:
+                diag_store.setdefault(disk_info["name"], {})[test_id] = entry
 
     return res
 
@@ -597,17 +628,22 @@ def optimize_nvme_args(test_id, args_list, pcie_info):
     return new_args
 
 
-
-def process_task_result(results, idx, disk, t, fio_args, res):
+def process_task_result(results, idx, disk, t, fio_args, res, state_lock=None):
     """Обрабатывает результат задачи и записывает его в общий словарь результатов."""
     bs = "4k"
     for a in fio_args:
+
         if a.startswith("--bs="):
             bs = a.split("=", 1)[1]
             break
 
     if "error" in res:
-        results[idx][t] = {"error": res["error"], "status": "undone", "bs": bs}
+        error_entry = {"error": res["error"], "status": "undone", "bs": bs}
+        if state_lock is not None:
+            with state_lock:
+                results[idx][t] = error_entry
+        else:
+            results[idx][t] = error_entry
         console.print(
             f"  [bold red]ОШИБКА[/bold red] {disk['name']}/{t}: {res['error']}"
         )
@@ -617,18 +653,118 @@ def process_task_result(results, idx, disk, t, fio_args, res):
     status = check_threshold(t, res, thresholds)
     res["status"] = status
     res["bs"] = bs
-    results[idx][t] = res
+    if state_lock is not None:
+        with state_lock:
+            results[idx][t] = res
+    else:
+        results[idx][t] = res
 
 
-def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=None, tuner=None):
+def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=None, tuner=None,
+                   state_lock=None, report_queue=None, live_store=None):
     """Запускает все тесты одного диска строго последовательно.
 
     Параллелизация идёт по дискам, а не по отдельным тестам: несколько fio,
     конкурирующих за один накопитель, делят его шину и занижают результаты.
+
+    После каждого завершённого теста в report_queue кладётся маркер — фоновый
+    writer-поток перегенерирует MD-отчёт по мере поступления данных.
     """
     for t, fio_args in plan:
-        res = run_fio_test(disk, t, fio_args, cancel_event=cancel_event, diag_store=diag_store, tuner=tuner)
-        process_task_result(results, disk_idx, disk, t, fio_args, res)
+        res = run_fio_test(
+            disk, t, fio_args, cancel_event=cancel_event, diag_store=diag_store,
+            tuner=tuner, state_lock=state_lock, live_store=live_store,
+        )
+        process_task_result(results, disk_idx, disk, t, fio_args, res, state_lock=state_lock)
+        if report_queue is not None:
+            report_queue.put(disk_idx)
+
+
+REPORT_TICK = 2  # секунды между записями живых сэмплов в отчёт
+
+_STOP = object()  # маркер остановки фонового writer-потока
+
+
+def _default_report_path() -> Path:
+    """Формирует путь отчёта по умолчанию (reports/fio_report_<timestamp>.md)."""
+    reports_dir = Path("reports")
+    reports_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return reports_dir / f"fio_report_{timestamp}.md"
+
+
+def _snapshot_state(results, diag_store, live_store, state_lock):
+    """Копирует текущее состояние для рендера отчёта (безопасно к воркерам).
+
+    Живые сэмплы идущих тестов (live_store) вливаются в диагностическую копию,
+    чтобы пер-секундные таблицы текущего теста попадали в отчёт.
+    """
+    with state_lock:
+        results_snap = [dict(r) for r in results]
+        if diag_store is None:
+            diag_snap = None
+        else:
+            diag_snap = {}
+            for disk, tests in diag_store.items():
+                diag_snap[disk] = dict(tests)
+            for disk, entry in (live_store or {}).items():
+                diag_snap.setdefault(disk, {})[entry["test_id"]] = {
+                    "samples": entry["samples"],
+                    "summary": {},
+                }
+    return results_snap, diag_snap
+
+
+def _write_report(disks, results, diag_store, live_store, state_lock, output_path, tuner,
+                  test_names, run_info, fio_configs, show_lat_p99):
+    """Перегенерирует MD-отчёт по текущему (возможно, неполному) состоянию."""
+    results_snap, diag_snap = _snapshot_state(results, diag_store, live_store, state_lock)
+    return generate_report(
+        disks, results_snap, test_names, output_path=output_path,
+        diag_store=diag_snap,
+        tuner_report=tuner.report() if tuner else None,
+        run_info=run_info,
+        fio_configs=fio_configs,
+        show_lat_p99=show_lat_p99,
+    )
+
+
+class _ReportWriter(threading.Thread):
+    """Фоновый поток: перегенерирует отчёт по мере поступления данных.
+
+    Реагирует на маркер завершения теста из очереди и, по таймауту,
+    на живые пер-секундные сэмплы идущих тестов (live_store).
+    """
+
+    def __init__(self, report_queue, render, has_live, tick=REPORT_TICK):
+        super().__init__(daemon=True, name="report-writer")
+        self._q = report_queue
+        self._render = render
+        self._has_live = has_live
+        self._tick = tick
+
+    def run(self):
+        while True:
+            try:
+                item = self._q.get(timeout=self._tick)
+            except queue.Empty:
+                if self._has_live():
+                    self._safe_render()
+                continue
+            if item is _STOP:
+                break
+            while True:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
+            self._safe_render()
+
+    def _safe_render(self):
+        try:
+            self._render()
+        except Exception:
+            console.print("[dim]Не удалось обновить отчёт[/dim]")
 
 
 def main():
@@ -780,9 +916,46 @@ def main():
 
     # Сбор диагностических сэмплов в памяти: {диск: {тест: {"samples", "summary"}}}
     diag_store = {} if args.logging else None
+    # Живые сэмплы идущих тестов для инкрементального отчёта: {диск: {"test_id", "samples"}}
+    live_store = {} if args.logging else None
     if args.logging:
         console.print("\n[bold]Подробное логирование: пер-секундные сэмплы линка/"
                       "температуры/нагрузки — в единый файл отчёта[/bold]")
+        console.print("[dim]Отчёт обновляется по мере завершения тестов[/dim]")
+
+    # Путь отчёта фиксируется один раз: все обновления перезаписывают один файл.
+    output_path = Path(args.output) if args.output else _default_report_path()
+    state_lock = threading.Lock()
+    results = [{} for _ in disks]
+
+    # Начальная запись отчёта: файл существует с самого начала прогона,
+    # даже если тесты ещё не начались или прогон прервётся.
+    try:
+        _write_report(
+            disks, results, diag_store, live_store, state_lock, output_path,
+            tuner, TEST_NAMES, _build_run_info(args), fio_configs,
+            show_lat_p99=args.logging,
+        )
+    except Exception as exc:
+        console.print(f"[dim]Не удалось создать отчёт: {exc}[/dim]")
+
+    # Фоновый writer: перегенерирует отчёт после каждого теста и по тику
+    # показывает живые пер-секундные сэмплы идущих тестов.
+    report_queue = queue.Queue() if args.logging else None
+    writer = None
+    if args.logging:
+        def render_report():
+            _write_report(
+                disks, results, diag_store, live_store, state_lock, output_path,
+                tuner, TEST_NAMES, _build_run_info(args), fio_configs,
+                show_lat_p99=args.logging,
+            )
+        writer = _ReportWriter(
+            report_queue,
+            render=render_report,
+            has_live=lambda: bool(live_store),
+        )
+        writer.start()
 
     # Прекондишнинг
     if args.precond:
@@ -800,7 +973,6 @@ def main():
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")
 
     # Подготовка задач: по одному плану тестов на диск (тесты диска — подряд)
-    results = [{} for _ in disks]
     disk_plans = []
 
     for disk_idx, disk in enumerate(disks):
@@ -835,47 +1007,64 @@ def main():
         disk_plans.append((disk_idx, disk, plan))
 
     # Запуск тестов
-    if args.sequential:
+    try:
+        if args.sequential:
+            try:
+                for disk_idx, disk, plan in disk_plans:
+                    run_disk_tests(
+                        disk_idx, disk, plan, results,
+                        cancel_event=cancel_event, diag_store=diag_store,
+                        tuner=tuner, state_lock=state_lock,
+                        report_queue=report_queue, live_store=live_store,
+                    )
+            except KeyboardInterrupt:
+                cancel_event.set()
+                console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
+                sys.exit(130)
+        else:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+            try:
+                future_map = {}
+                for disk_idx, disk, plan in disk_plans:
+                    fut = pool.submit(
+                        run_disk_tests, disk_idx, disk, plan, results,
+                        cancel_event=cancel_event, diag_store=diag_store,
+                        tuner=tuner, state_lock=state_lock,
+                        report_queue=report_queue, live_store=live_store,
+                    )
+                    future_map[fut] = disk_idx
+
+                for fut in concurrent.futures.as_completed(future_map):
+                    fut.result()
+            except KeyboardInterrupt:
+                cancel_event.set()
+                console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
+                sys.exit(130)
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+        # Вывод результатов (только при успешном завершении всех тестов)
+        table = build_results_table(disks, results, TEST_NAMES)
+        console.print()
+        console.print(table)
+    finally:
+        # Остановить фоновый writer: живые сэмплы больше не нужны.
+        if writer is not None:
+            report_queue.put(_STOP)
+            writer.join(timeout=5)
+        # Финальная запись — либо итоговый отчёт, либо best-effort при сбое.
         try:
-            for disk_idx, disk, plan in disk_plans:
-                run_disk_tests(disk_idx, disk, plan, results, cancel_event, diag_store, tuner)
-        except KeyboardInterrupt:
-            cancel_event.set()
-            console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
-            sys.exit(130)
-    else:
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-        try:
-            future_map = {}
-            for disk_idx, disk, plan in disk_plans:
-                fut = pool.submit(
-                    run_disk_tests, disk_idx, disk, plan, results,
-                    cancel_event=cancel_event, diag_store=diag_store, tuner=tuner,
-                )
-                future_map[fut] = disk_idx
+            report_path = _write_report(
+                disks, results, diag_store, live_store, state_lock, output_path,
+                tuner, TEST_NAMES, _build_run_info(args), fio_configs,
+                show_lat_p99=args.logging,
+            )
+        except Exception as exc:
+            console.print(f"[bold red]Не удалось записать отчёт:[/bold red] {exc}")
+            report_path = None
 
-            for fut in concurrent.futures.as_completed(future_map):
-                fut.result()
-        except KeyboardInterrupt:
-            cancel_event.set()
-            console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
-            sys.exit(130)
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-
-    # Вывод результатов
-    table = build_results_table(disks, results, TEST_NAMES)
-    console.print()
-    console.print(table)
-
-    report_path = generate_report(
-        disks, results, TEST_NAMES, output_path=args.output, diag_store=diag_store,
-        tuner_report=tuner.report() if tuner else None,
-        run_info=_build_run_info(args),
-        fio_configs=fio_configs,
-        show_lat_p99=args.logging,
-    )
-    console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
+    if report_path is not None:
+        console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
 
 
 if __name__ == "__main__":
