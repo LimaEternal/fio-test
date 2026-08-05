@@ -409,6 +409,27 @@ def _max_iodepth(iodepth_level: dict):
     return best
 
 
+def _percentile_value(percentile: dict, target: float):
+    """Возвращает значение перцентиля из fio-JSON или None.
+
+    Ключи обычно форматируются как "99.000000", но у старых версий fio могут
+    отличаться — сначала ищем точный строковый ключ, затем числовое совпадение.
+    """
+    if not percentile:
+        return None
+    exact = percentile.get(f"{target:.6f}")
+    if exact is not None:
+        return exact
+    target_round = round(target, 2)
+    for key, value in percentile.items():
+        try:
+            if round(float(key), 2) == target_round:
+                return value
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _parse_fio_result(test_id, stdout):
     """Разбирает stdout fio (JSON) в результат + диагностические метрики."""
     try:
@@ -427,22 +448,37 @@ def _parse_fio_result(test_id, stdout):
 
     iops = mode.get("iops", 0)
     bw_bytes = mode.get("bw_bytes", 0)
-    lat = mode.get("lat_ns", {})
+    lat = mode.get("lat_ns") or {}
     lat_avg = lat.get("mean", 0) / 1e6
-    lat_p99 = lat.get("percentile", {}).get("99.000000", 0) / 1e6
     bw_mb = bw_bytes / (1024 * 1024)
+
+    # Перцентили по умолчанию fio пишет в clat_ns (clat_percentiles=1,
+    # lat_percentiles=0); при lat_percentiles=1 — в lat_ns. Пробуем оба.
+    perc = (mode.get("clat_ns") or {}).get("percentile")
+    if not perc:
+        perc = lat.get("percentile")
+    p99 = _percentile_value(perc or {}, 99.0) or 0
+    lat_p99 = p99 / 1e6
 
     res = {"iops": iops, "bw_mb": bw_mb, "lat_avg": lat_avg, "lat_p99": lat_p99}
 
-    # Диагностика из fio-JSON (заполняется при --logging и без него)
+    # Загрузка CPU: современный fio пишет usr_cpu/sys_cpu на уровне job,
+    # старые версии — usage.usr/usage.sys (в тестах встречается usage.user).
     usage = job.get("usage") or {}
-    res["cpu_user"] = round(usage.get("user", 0), 1)
-    res["cpu_sys"] = round(usage.get("sys", 0), 1)
+    cpu_user = job.get("usr_cpu")
+    if cpu_user is None:
+        cpu_user = usage.get("usr")
+    if cpu_user is None:
+        cpu_user = usage.get("user")
+    cpu_sys = job.get("sys_cpu")
+    if cpu_sys is None:
+        cpu_sys = usage.get("sys")
+    res["cpu_user"] = round(float(cpu_user or 0), 1)
+    res["cpu_sys"] = round(float(cpu_sys or 0), 1)
 
-    lat_perc = lat.get("percentile") or {}
-    for key, pkey in (("p50", "50.000000"), ("p90", "90.000000"),
-                      ("p99", "99.000000"), ("p99_9", "99.900000")):
-        val = lat_perc.get(pkey)
+    for key, target in (("p50", 50.0), ("p90", 90.0),
+                        ("p99", 99.0), ("p99_9", 99.9)):
+        val = _percentile_value(perc or {}, target)
         if val:
             res[f"clat_{key}_ms"] = round(val / 1e6, 3)
 
@@ -538,6 +574,17 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         if sampler:
             summary = sampler.summary()
             res["diag"] = summary
+            sources = summary.get("sources") or {}
+            warnings = []
+            if not sources.get("temp"):
+                warnings.append("температура недоступна (нет hwmon)")
+            if not sources.get("diskstats"):
+                warnings.append("/proc/diskstats не читается — нагрузка не сэмплирована")
+            if warnings:
+                console.print(
+                    f"[yellow]Мониторинг /dev/{disk_info['name']} ({test_id}): "
+                    f"{'; '.join(warnings)}[/yellow]"
+                )
             entry = {"samples": sampler.samples, "summary": summary}
             if state_lock is not None:
                 with state_lock:

@@ -77,12 +77,14 @@ class ParseFioResultTests(unittest.TestCase):
                     "bw_bytes": 1500000000,
                     "iops": 500000,
                     "io_kbytes": 2000000,
-                    "lat_ns": {"mean": 100000, "percentile": {
+                    "lat_ns": {"mean": 100000},
+                    "clat_ns": {"mean": 90000, "percentile": {
                         "50.000000": 50000, "90.000000": 90000,
                         "99.000000": 120000, "99.900000": 200000}},
                     "slat_ns": {"mean": 5000},
                 },
-                "usage": {"user": 10.5, "sys": 5.2},
+                "usr_cpu": 10.5,
+                "sys_cpu": 5.2,
                 "iodepth_level": {"1": 0, "2": 0, "4": 0, "8": 0, "16": 100},
             }]
         })
@@ -91,6 +93,7 @@ class ParseFioResultTests(unittest.TestCase):
         self.assertEqual(res["iops"], 500000)
         self.assertAlmostEqual(res["bw_mb"], 1500000000 / (1024 * 1024), places=1)
         self.assertAlmostEqual(res["lat_avg"], 0.1, places=3)
+        self.assertAlmostEqual(res["lat_p99"], 0.12, places=3)
         self.assertEqual(res["cpu_user"], 10.5)
         self.assertEqual(res["cpu_sys"], 5.2)
         self.assertEqual(res["clat_p50_ms"], 0.05)
@@ -99,6 +102,45 @@ class ParseFioResultTests(unittest.TestCase):
         self.assertEqual(res["slat_avg_ms"], 0.005)
         self.assertEqual(res["iodepth"], 16)
         self.assertEqual(res["io_kb"], 2000000)
+
+    def test_cpu_usage_legacy_usage_key_fallback(self):
+        raw = json.dumps({
+            "jobs": [{
+                "read": {"bw_bytes": 1000, "iops": 1},
+                "usage": {"usr": 1.5, "sys": 2.5},
+            }]
+        })
+        res = fio_test._parse_fio_result("seq_read", raw)
+        self.assertEqual(res["cpu_user"], 1.5)
+        self.assertEqual(res["cpu_sys"], 2.5)
+
+    def test_percentile_falls_back_to_lat_ns(self):
+        raw = json.dumps({
+            "jobs": [{
+                "read": {
+                    "bw_bytes": 1000, "iops": 1,
+                    "lat_ns": {"mean": 100000, "percentile": {
+                        "99.000000": 120000}},
+                },
+            }]
+        })
+        res = fio_test._parse_fio_result("seq_read", raw)
+        self.assertAlmostEqual(res["lat_p99"], 0.12, places=3)
+        self.assertEqual(res["clat_p99_ms"], 0.12)
+
+    def test_percentile_matched_by_numeric_key(self):
+        raw = json.dumps({
+            "jobs": [{
+                "read": {
+                    "bw_bytes": 1000, "iops": 1,
+                    "clat_ns": {"percentile": {"99": 240000, "99.9": 300000}},
+                },
+            }]
+        })
+        res = fio_test._parse_fio_result("seq_read", raw)
+        self.assertAlmostEqual(res["lat_p99"], 0.24, places=3)
+        self.assertEqual(res["clat_p99_ms"], 0.24)
+        self.assertEqual(res["clat_p99_9_ms"], 0.3)
 
     def test_write_mode_selected_by_test_id(self):
         raw = json.dumps({
@@ -207,7 +249,7 @@ class RunFioTestDiagStoreTests(unittest.TestCase):
         raw = json.dumps({
             "jobs": [{
                 "read": {"bw_bytes": 1000, "iops": 1},
-                "usage": {"user": 0.1, "sys": 0.2},
+                "usr_cpu": 0.1, "sys_cpu": 0.2,
             }]
         })
         fake = (mock.Mock(returncode=0), raw.encode(), b"")

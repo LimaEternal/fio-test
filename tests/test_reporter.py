@@ -6,7 +6,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.reporter import _render_sampler_tables, generate_report
+from utils.reporter import _render_sampler_tables, _render_source_notes, generate_report
 
 DISK = {
     "name": "nvme1n1", "path": "/dev/nvme1n1", "model": "KIOXIA KCMY1VUG3T20",
@@ -74,10 +74,46 @@ class RenderSamplerTablesTests(unittest.TestCase):
 
     def test_none_values_rendered_as_dash(self):
         sample = {"gts": None, "width": None, "temp": None,
-                  "read_mbs": 0.0, "write_mbs": 0.0, "iops": 0, "avgqu_sz": 0.0}
+                  "read_mbs": None, "write_mbs": None, "iops": None, "avgqu_sz": None}
         lines = _render_sampler_tables(make_diag_store([sample]), "nvme1n1", TEST_NAMES)
         text = "\n".join(lines)
-        self.assertIn("| 1 | — | — | 0.0 | 0.0 | 0 | 0.0 |", text)
+        self.assertIn("| 1 | — | — | — | — | — | — |", text)
+
+
+class RenderSourceNotesTests(unittest.TestCase):
+    def test_notes_when_sources_missing_and_first_diskstats(self):
+        disk_results = {
+            "_thresholds": {},
+            "seq_read": {
+                "iops": 1, "bw_mb": 1, "lat_avg": 0, "lat_p99": 0,
+                "cpu_user": 0, "cpu_sys": 0, "status": "ok",
+                "diag": {
+                    "sources": {"link": False, "temp": False, "diskstats": True},
+                    "diskstats_first": {"reads": 10, "writes": 20,
+                                        "sectors_read": 1000, "sectors_written": 2000,
+                                        "weighted_io": 3000},
+                },
+            },
+        }
+        lines = _render_source_notes(disk_results, TEST_NAMES)
+        text = "\n".join(lines)
+        self.assertIn("температура недоступна", text)
+        self.assertIn("линк PCIe", text)
+        self.assertIn("reads=10", text)
+
+    def test_no_notes_when_all_sources_available(self):
+        disk_results = {
+            "_thresholds": {},
+            "seq_read": {
+                "iops": 1, "bw_mb": 1, "lat_avg": 0, "lat_p99": 0,
+                "cpu_user": 0, "cpu_sys": 0, "status": "ok",
+                "diag": {
+                    "sources": {"link": True, "temp": True, "diskstats": True},
+                },
+            },
+        }
+        lines = _render_source_notes(disk_results, TEST_NAMES)
+        self.assertEqual(lines, [])
 
 
 class GenerateReportDiagStoreTests(unittest.TestCase):

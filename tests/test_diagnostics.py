@@ -17,14 +17,15 @@ DISK = {
 
 
 def _patch_paths(tmp):
-    """Перенаправляет /proc/diskstats и /sys/class/nvme на временный каталог."""
+    """Перенаправляет /proc/diskstats, /sys/class/nvme и /sys/class/block
+    на временный каталог."""
     root = str(tmp)
 
     def _mapped(path):
         p = str(path)
         if p.startswith("/proc/diskstats"):
             return Path(root) / "proc" / "diskstats"
-        if p.startswith("/sys/class/nvme"):
+        if p.startswith("/sys/class/nvme") or p.startswith("/sys/class/block"):
             return Path(root) / "sys" / p[len("/sys"):].lstrip("/")
         return Path(p)
 
@@ -79,6 +80,73 @@ class DiagnosticSamplerTests(unittest.TestCase):
         self.assertEqual(summary["link_gts_min"], 32.0)
         self.assertEqual(summary["link_width_min"], 4)
         self.assertEqual(summary["temp_max_c"], 41.0)
+        self.assertEqual(summary["sources"]["link"], True)
+        self.assertEqual(summary["sources"]["temp"], True)
+        self.assertEqual(summary["sources"]["diskstats"], True)
+        self.assertIsNotNone(summary["diskstats_first"])
+
+    def test_diskstats_matched_by_major_minor(self):
+        tmp = Path(tempfile.mkdtemp())
+        blk = tmp / "sys" / "class" / "block" / "nvme1n1"
+        blk.mkdir(parents=True)
+        (blk / "dev").write_text("259:3", encoding="utf-8")
+        proc = tmp / "proc"
+        proc.mkdir(parents=True)
+        # Имя в /proc/diskstats не совпадает, но major:minor совпадает.
+        (proc / "diskstats").write_text(
+            "259 3 nvmeX 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            encoding="utf-8",
+        )
+
+        with _patch_paths(tmp), \
+             mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=None):
+            sampler = DiagnosticSampler(DISK)
+            cur = sampler._read_diskstats()
+
+        self.assertIsNotNone(cur)
+        self.assertEqual(cur["reads"], 0)
+
+    def test_temp_read_from_block_hwmon_fallback(self):
+        tmp = Path(tempfile.mkdtemp())
+        hwmon = tmp / "sys" / "class" / "block" / "nvme1n1" / "device" / "hwmon" / "hwmon0"
+        hwmon.mkdir(parents=True)
+        (hwmon / "temp1_input").write_text("38000", encoding="utf-8")
+
+        with _patch_paths(tmp), \
+             mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=None):
+            sampler = DiagnosticSampler(DISK)
+            temp = sampler._read_temp()
+
+        self.assertEqual(temp, 38.0)
+
+    def test_source_status_and_none_values_when_sources_missing(self):
+        tmp = Path(tempfile.mkdtemp())
+        proc = tmp / "proc"
+        proc.mkdir(parents=True)
+        (proc / "diskstats").write_text(
+            "259 3 nvme1n1 10 0 1000 0 20 0 2000 0 0 0 3000\n",
+            encoding="utf-8",
+        )
+
+        with _patch_paths(tmp), \
+             mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=None):
+            sampler = DiagnosticSampler(DISK)
+            sampler._sample_once()
+            sample = sampler.samples[0]
+
+        self.assertEqual(sample["gts"], None)
+        self.assertEqual(sample["temp"], None)
+        self.assertIsNone(sample["read_mbs"])
+        self.assertIsNone(sample["write_mbs"])
+        self.assertEqual(sampler.source_status,
+                         {"link": False, "temp": False, "diskstats": True})
+
+        summary = sampler.summary()
+        self.assertEqual(summary["sources"]["diskstats"], True)
+        self.assertEqual(summary["sources"]["temp"], False)
+        self.assertIsNone(summary["read_mbs_avg"])
+        self.assertIsNotNone(summary["diskstats_first"])
+        self.assertEqual(summary["diskstats_first"]["reads"], 10)
 
 
 class CollectStaticInfoTests(unittest.TestCase):

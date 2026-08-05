@@ -65,6 +65,9 @@ class DiagnosticSampler:
         self._prev_diskstats = None
         self._prev_ts = None
         self.samples = []
+        # Какие источники реально отдали данные (для диагностики в отчёте).
+        self.source_status = {"link": False, "temp": False, "diskstats": False}
+        self._first_diskstats = None
 
     # --- чтение источников ---
 
@@ -88,24 +91,45 @@ class DiagnosticSampler:
         """Возвращает температуру контроллера NVMe в °C или None."""
         if not self.nvme_dev:
             return None
-        try:
-            hwmon = Path(f"/sys/class/nvme/{self.nvme_dev}/hwmon")
-            for temp_file in sorted(hwmon.glob("hwmon*/temp1_input")):
-                value = int(temp_file.read_text(encoding="utf-8").strip())
-                return value / 1000.0
-        except Exception:
-            pass
+        roots = [Path(f"/sys/class/nvme/{self.nvme_dev}/hwmon")]
+        if self.name:
+            roots.append(Path(f"/sys/class/block/{self.name}/device/hwmon"))
+        if self.link_dir:
+            roots.append(self.link_dir / "hwmon")
+        for hwmon in roots:
+            try:
+                for temp_file in sorted(hwmon.glob("hwmon*/temp1_input")):
+                    value = int(temp_file.read_text(encoding="utf-8").strip())
+                    return value / 1000.0
+            except Exception:
+                continue
         return None
 
     def _read_diskstats(self) -> Optional[dict]:
-        """Читает счётчики /proc/diskstats для диска."""
+        """Читает счётчики /proc/diskstats для диска.
+
+        Устройство ищем по имени (nvme1n1) либо по major:minor из
+        /sys/class/block/<имя>/dev — надёжнее на системах, где имена в
+        /proc/diskstats могут отличаться.
+        """
         try:
             text = Path("/proc/diskstats").read_text(encoding="utf-8")
         except Exception:
             return None
+        dev_id = None
+        if self.name:
+            try:
+                dev_id = Path(f"/sys/class/block/{self.name}/dev").read_text(
+                    encoding="utf-8").strip()
+            except Exception:
+                dev_id = None
         for line in text.splitlines():
             parts = line.split()
-            if len(parts) >= 14 and parts[2] == self.name:
+            if len(parts) < 14:
+                continue
+            if parts[2] == self.name or (
+                dev_id and f"{parts[0]}:{parts[1]}" == dev_id
+            ):
                 return {
                     "reads": int(parts[3]),
                     "sectors_read": int(parts[5]),
@@ -122,7 +146,18 @@ class DiagnosticSampler:
         temp = self._read_temp()
         cur = self._read_diskstats()
 
-        read_mbs = write_mbs = iops = avgqu_sz = 0.0
+        if gts is not None:
+            self.source_status["link"] = True
+        if temp is not None:
+            self.source_status["temp"] = True
+        if cur is not None:
+            self.source_status["diskstats"] = True
+            if self._first_diskstats is None:
+                self._first_diskstats = cur
+
+        # None, а не 0.0: в отчёте это «—» (источник не отдал данные),
+        # а не «0.0» (реально нулевая нагрузка).
+        read_mbs = write_mbs = iops = avgqu_sz = None
         now = time.time()
         prev = self._prev_diskstats
         prev_ts = self._prev_ts
@@ -164,10 +199,14 @@ class DiagnosticSampler:
         gts_vals = [s["gts"] for s in self.samples if s["gts"] is not None]
         width_vals = [s["width"] for s in self.samples if s["width"] is not None]
         temps = [s["temp"] for s in self.samples if s["temp"] is not None]
-        reads = [s["read_mbs"] for s in self.samples if s["read_mbs"] > 0]
-        writes = [s["write_mbs"] for s in self.samples if s["write_mbs"] > 0]
-        iops_vals = [s["iops"] for s in self.samples if s["iops"] > 0]
-        queues = [s["avgqu_sz"] for s in self.samples if s["avgqu_sz"] > 0]
+        reads = [s["read_mbs"] for s in self.samples
+                 if s["read_mbs"] is not None and s["read_mbs"] > 0]
+        writes = [s["write_mbs"] for s in self.samples
+                  if s["write_mbs"] is not None and s["write_mbs"] > 0]
+        iops_vals = [s["iops"] for s in self.samples
+                     if s["iops"] is not None and s["iops"] > 0]
+        queues = [s["avgqu_sz"] for s in self.samples
+                  if s["avgqu_sz"] is not None and s["avgqu_sz"] > 0]
 
         return {
             "link_gts_min": min(gts_vals) if gts_vals else None,
@@ -178,4 +217,6 @@ class DiagnosticSampler:
             "iops_avg": round(sum(iops_vals) / len(iops_vals)) if iops_vals else None,
             "avgqu_sz_max": round(max(queues), 1) if queues else None,
             "samples": len(self.samples),
+            "sources": dict(self.source_status),
+            "diskstats_first": self._first_diskstats,
         }

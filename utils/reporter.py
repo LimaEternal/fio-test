@@ -25,6 +25,46 @@ TEST_NAMES = {
 }
 
 
+def _render_source_notes(disk_results: dict, test_names: dict) -> List[str]:
+    """Заметки о недоступных источниках сэмплера и первом снимке /proc/diskstats.
+
+    Берёт данные из res["diag"]["sources"] / ["diskstats_first"], чтобы причина
+    пустых пер-секундных таблиц была видна прямо в отчёте.
+    """
+    seen = set()
+    out: List[str] = []
+    for test_id in test_names:
+        res = disk_results.get(test_id) or {}
+        diag = res.get("diag") or {}
+        sources = diag.get("sources")
+        if sources:
+            notes = []
+            if not sources.get("link"):
+                notes.append("линк PCIe не удалось прочитать")
+            if not sources.get("temp"):
+                notes.append("температура недоступна (hwmon не найден)")
+            if not sources.get("diskstats"):
+                notes.append("нагрузка недоступна: /proc/diskstats не читается")
+            for note in notes:
+                if note not in seen:
+                    seen.add(note)
+                    out.append(f"> {note}")
+        first = diag.get("diskstats_first")
+        if first is not None:
+            raw = (
+                f"> Счётчики /proc/diskstats на старте теста: "
+                f"reads={first['reads']}, sectors_read={first['sectors_read']}, "
+                f"writes={first['writes']}, sectors_written={first['sectors_written']}, "
+                f"weighted_io={first['weighted_io']}"
+            )
+            if raw not in seen:
+                seen.add(raw)
+                out.append(raw)
+    if out:
+        out.append("")
+    return out
+
+
 def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_names: dict) -> List[str]:
     """Строит пер-секундные таблицы сэмплера для диска (из diag_store)."""
     lines: List[str] = []
@@ -281,6 +321,7 @@ def generate_report(
                         f"{clat} | {res.get('slat_avg_ms', '—')} | {iod} | {gb} |"
                     )
                 lines.append("")
+                lines.extend(_render_source_notes(disk_results, test_names))
                 lines.extend(_render_sampler_tables(diag_store, disk["name"], test_names))
 
         lines.append("---")
