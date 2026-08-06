@@ -37,18 +37,11 @@ import time
 from datetime import datetime
 
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    ProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.text import Text
 
 from utils.diagnostics import DiagnosticSampler, collect_static_info
+from utils.format import format_duration
 from utils.fio_config import parse_fio_jobfile
+from utils.prefill import prefill_disks
 from utils.reporter import generate_report
 from utils.scanner import scan_disks
 from utils.table_renderer import build_results_table
@@ -324,9 +317,9 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None) -> dict:
         ),
     ]
     if prefill_duration is not None:
-        flags.append(("Время предзаполнения", _fmt_duration(prefill_duration)))
+        flags.append(("Время предзаполнения", format_duration(prefill_duration)))
     if tests_duration is not None:
-        flags.append(("Время тестов", _fmt_duration(tests_duration)))
+        flags.append(("Время тестов", format_duration(tests_duration)))
     if args.add is not None:
         flags.append(("Выбор дисков (--add)", ", ".join(str(n) for n in args.add)))
     if args.delete is not None:
@@ -747,277 +740,6 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     return res
 
 
-def _prefill_state_path() -> Path:
-    """Путь к файлу маркеров предварительного заполнения."""
-    return Path("reports") / "prefill_state.json"
-
-
-def _load_prefill_state() -> dict:
-    """Читает маркеры предзаполнения {serial: {model, size, name, filled_at}}."""
-    try:
-        with _prefill_state_path().open(encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except (OSError, ValueError):
-        pass
-    return {}
-
-
-def _save_prefill_state(state: dict) -> None:
-    """Атомарно сохраняет маркеры предзаполнения (temp + rename)."""
-    path = _prefill_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-
-def _needs_prefill(disk: dict, state: dict) -> bool:
-    """True, если диск ещё не заполнен или изменился его объём."""
-    entry = state.get(disk.get("serial", ""))
-    if entry is None:
-        return True
-    return entry.get("size") != disk.get("size")
-
-
-def _written_sectors(stat_path: Path):
-    """Счётчик записанных секторов из /sys/block/<name>/stat (поле 7)."""
-    try:
-        parts = stat_path.read_text(encoding="utf-8").split()
-        if len(parts) > 6:
-            return int(parts[6])
-    except Exception:
-        pass
-    return None
-
-
-def _fmt_bytes(n: float) -> str:
-    """Форматирует байты в человекочитаемый вид (Б/КБ/МБ/ГБ/ТБ)."""
-    value = float(n)
-    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
-        if value < 1024:
-            return f"{value:.1f}{unit}"
-        value /= 1024
-    return f"{value:.1f}ПБ"
-
-
-def _fmt_duration(sec: float) -> str:
-    """Форматирует длительность в человекочитаемый вид (часы/минуты/секунды)."""
-    sec = int(round(sec))
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h} ч {m:02d} мин"
-    if m:
-        return f"{m} мин {s:02d} с"
-    return f"{s} с"
-
-
-class _BytesColumn(ProgressColumn):
-    """Колонка прогрессбара: записано из общего объёма диска."""
-
-    def render(self, task):
-        return Text(f"({_fmt_bytes(task.completed)} из {_fmt_bytes(task.total)})")
-
-
-def _disk_total_bytes(name: str):
-    """Полный объём диска в байтах из /sys/block/<name>/size."""
-    try:
-        sectors = int(
-            Path(f"/sys/block/{name}/size").read_text(encoding="utf-8").strip()
-        )
-        return sectors * 512
-    except Exception:
-        return None
-
-
-def _disk_iostats(name: str):
-    """Текущее значение /sys/block/<name>/queue/iostats ('0'/'1') или None."""
-    try:
-        return Path(f"/sys/block/{name}/queue/iostats").read_text(encoding="utf-8").strip()
-    except Exception:
-        return None
-
-
-def _set_disk_iostats(name: str, value: str) -> bool:
-    """Задаёт учёт статистики блочного слоя (queue/iostats) для диска."""
-    try:
-        Path(f"/sys/block/{name}/queue/iostats").write_text(
-            f"{value}\n", encoding="utf-8"
-        )
-        return True
-    except Exception:
-        return False
-
-
-def run_prefill(disk_info, cancel_event=None, tuner=None):
-    """Запускает предварительное заполнение (полную запись объёма) диска.
-
-    Запись идёт одним потоком с глубиной очереди 32 (iodepth=32) — близко
-    к насыщению последовательной записи NVMe. Если известен NUMA-узел диска,
-    fio пинится к его CPU (--cpus_allowed). Возвращает True при успехе.
-    """
-    disk_path = disk_info["path"]
-    cmd = [
-        "fio",
-        "--name=prefill",
-        "--filename", disk_path,
-        "--direct=1",
-        "--ioengine=libaio",
-        "--rw=write",
-        "--bs=128k",
-        "--iodepth=32",
-        "--size=100%",
-        "--numjobs=1",
-        "--group_reporting",
-        "--output-format=json",
-    ]
-
-    if tuner:
-        numa_cpus = tuner.get_numa_cpus(disk_info["name"])
-        if numa_cpus:
-            cmd.extend(["--cpus_allowed", numa_cpus])
-
-    try:
-        result = _run_io_process(cmd, cancel_event)
-    except FileNotFoundError:
-        return False
-    if result is None:
-        return False
-    proc, _, _ = result
-    return proc.returncode == 0
-
-
-def prefill_disks(disks, tuner=None, cancel_event=None):
-    """Предварительно заполняет диски параллельно, с маркером пропуска.
-
-    Уже заполненные диски (маркер в reports/prefill_state.json) пропускаются;
-    перезапись происходит только при смене диска или изменении объёма.
-    Прогресс показывается Rich-прогрессбаром (проценты, объём, секундомер, ETA)
-    по каждому диску; на время заполнения включается учёт статистики блочного
-    слоя (iostats), чтобы счётчик записанного в /sys/block/<name>/stat рос.
-    Возвращает длительность этапа в секундах (0, если заполнять было нечего).
-    """
-    state = _load_prefill_state()
-    to_fill = []
-    for d in disks:
-        if _needs_prefill(d, state):
-            to_fill.append(d)
-        else:
-            console.print(f"  [dim]пропуск (уже заполнен)[/dim] /dev/{d['name']}")
-
-    phase_start = time.monotonic()
-    if not to_fill:
-        return 0.0
-
-    iostats_prev = {}
-    for d in to_fill:
-        name = d["name"]
-        prev = _disk_iostats(name)
-        if prev is not None:
-            iostats_prev[name] = prev
-        if prev == "0" and not _set_disk_iostats(name, "1"):
-            console.print(
-                f"  [yellow]не удалось включить iostats для /dev/{name} — "
-                f"прогресс заполнения будет недоступен[/yellow]"
-            )
-
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-    future_map = {}
-    starts = {}
-    finished = []
-    try:
-        with Progress(
-            TextColumn("[bold]{task.description}[/bold]"),
-            BarColumn(),
-            TextColumn("{task.percentage:>3.0f}%"),
-            _BytesColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            task_ids = {}
-            baselines = {}
-            for d in to_fill:
-                name = d["name"]
-                total = _disk_total_bytes(name) or 1
-                baselines[name] = (
-                    _written_sectors(Path(f"/sys/block/{name}/stat")) or 0
-                )
-                task_ids[name] = progress.add_task(
-                    f"Заполнение /dev/{name}", total=total, completed=0
-                )
-                starts[name] = time.monotonic()
-                future_map[
-                    pool.submit(
-                        run_prefill, d, cancel_event=cancel_event, tuner=tuner
-                    )
-                ] = d
-
-            pending = set(future_map)
-            while pending:
-                for fut in list(pending):
-                    if fut.done():
-                        pending.discard(fut)
-                        d = future_map[fut]
-                        name = d["name"]
-                        dur = time.monotonic() - starts[name]
-                        try:
-                            ok = fut.result()
-                        except Exception as exc:
-                            finished.append((d, False, dur, str(exc)))
-                        else:
-                            finished.append((d, ok, dur))
-                        if ok:
-                            state[d["serial"]] = {
-                                "model": d.get("model", ""),
-                                "size": d.get("size"),
-                                "name": d["name"],
-                                "filled_at": datetime.now().isoformat(
-                                    timespec="seconds"
-                                ),
-                            }
-                if not pending:
-                    break
-                for d in to_fill:
-                    name = d["name"]
-                    total = _disk_total_bytes(name) or 1
-                    written = _written_sectors(Path(f"/sys/block/{name}/stat"))
-                    if written is None:
-                        done = 0
-                    else:
-                        done = min(total, max(0, (written - baselines[name]) * 512))
-                    progress.update(task_ids[name], completed=done)
-                time.sleep(1)
-    except KeyboardInterrupt:
-        if cancel_event:
-            cancel_event.set()
-        console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
-        sys.exit(130)
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-        for name, prev in iostats_prev.items():
-            _set_disk_iostats(name, prev)
-        _save_prefill_state(state)
-
-    phase_dur = time.monotonic() - phase_start
-    for d, ok, dur, *err in finished:
-        if ok:
-            console.print(
-                f"  [green]Готово[/green] /dev/{d['name']} (за {_fmt_duration(dur)})"
-            )
-        else:
-            msg = f"  [red]Ошибка[/red] /dev/{d['name']}"
-            if err and err[0]:
-                msg += f": {err[0]}"
-            console.print(msg)
-    console.print(f"[bold]Предзаполнение заняло {_fmt_duration(phase_dur)}[/bold]")
-    return phase_dur
-
-
 def optimize_nvme_args(test_id, args_list, pcie_info):
     """Оптимизирует аргументы fio для NVMe в зависимости от поколения PCIe."""
     if not pcie_info:
@@ -1127,7 +849,7 @@ def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=
     duration = time.monotonic() - start
     results[disk_idx]["_wall_s"] = duration
     console.print(
-        f"  Диск /dev/{disk['name']}: тесты заняли {_fmt_duration(duration)}"
+        f"  Диск /dev/{disk['name']}: тесты заняли {format_duration(duration)}"
     )
 
 
@@ -1519,7 +1241,7 @@ def main():
             report_queue.put(_STOP)
             writer.join(timeout=5)
         tests_duration = time.monotonic() - tests_start
-        console.print(f"\n[bold]Тесты заняли {_fmt_duration(tests_duration)}[/bold]")
+        console.print(f"\n[bold]Тесты заняли {format_duration(tests_duration)}[/bold]")
         # Финальная запись — либо итоговый отчёт, либо best-effort при сбое.
         try:
             report_path = _write_report(

@@ -9,24 +9,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Union
 
+from utils.format import format_duration
 from utils.table_renderer import _fmt
 
 
 def _strip_rich(text: str) -> str:
     """Удаляет rich-разметку [tag]...[/tag] из строки."""
     return re.sub(r"\[.*?\]", "", text)
-
-
-def _fmt_duration(sec) -> str:
-    """Форматирует длительность в человекочитаемый вид (часы/минуты/секунды)."""
-    sec = int(round(float(sec)))
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h} ч {m:02d} мин"
-    if m:
-        return f"{m} мин {s:02d} с"
-    return f"{s} с"
 
 
 TEST_NAMES = {
@@ -249,7 +238,7 @@ def generate_report(
             header = f"### {idx}. /dev/{disk['name']} ({disk['model']})"
             wall = disk_results.get("_wall_s") if disk_results else None
             if wall:
-                header += f" — тесты: {_fmt_duration(wall)}"
+                header += f" — тесты: {format_duration(wall)}"
             lines.append(header)
             lines.append("")
             if show_lat_p99:
