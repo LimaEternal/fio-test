@@ -34,23 +34,23 @@ RESULTS = [
     {
         "seq_read": {
             "bs": "64k", "iops": 73390, "bw_mb": 4586.9,
-            "lat_avg": 0.44, "status": "done",
+            "lat_avg": 0.44, "status": "PASS",
         },
         "seq_write": {
             "bs": "64k", "iops": 8169, "bw_mb": 510.6,
-            "lat_avg": 3.8, "status": "done",
+            "lat_avg": 3.8, "status": "PASS",
         },
         "rand_read": {
             "bs": "4k", "iops": 170566, "bw_mb": 666.3,
-            "lat_avg": 0.19, "status": "done",
+            "lat_avg": 0.19, "status": "PASS",
         },
         "rand_write": {
             "bs": "4k", "iops": 20322, "bw_mb": 79.4,
-            "lat_avg": 1.53, "status": "undone",
+            "lat_avg": 1.53, "status": "FAIL",
         },
         "mixed": {
             "bs": "8k", "iops": 12345, "bw_mb": 96.5,
-            "lat_avg": 0.81, "status": "done",
+            "lat_avg": 0.81, "status": "PASS",
         },
     },
     {},
@@ -175,8 +175,8 @@ class TableRendererTests(unittest.TestCase):
     def test_statuses_appear_once_per_test_per_disk(self):
         output = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
 
-        self.assertEqual(len(re.findall(r"\bdone\b", output)), 4)
-        self.assertEqual(len(re.findall(r"\bundone\b", output)), 6)
+        self.assertEqual(len(re.findall(r"\bPASS\b", output)), 4)
+        self.assertEqual(len(re.findall(r"\bFAIL\b", output)), 6)
 
     def test_entrypoint_exposes_flat_renderer(self):
         entrypoint = load_entrypoint()
@@ -189,13 +189,13 @@ class TableRendererTests(unittest.TestCase):
         self.assertEqual(output.count("Профиль теста"), 2)
 
     def test_only_status_values_receive_color_styles(self):
-        done = format_status("done")
-        undone = format_status("undone")
+        passed = format_status("PASS")
+        failed = format_status("FAIL")
 
-        self.assertEqual(done.plain, "done")
-        self.assertEqual(str(done.style), "bold green")
-        self.assertEqual(undone.plain, "undone")
-        self.assertEqual(str(undone.style), "bold red")
+        self.assertEqual(passed.plain, "PASS")
+        self.assertEqual(str(passed.style), "bold green")
+        self.assertEqual(failed.plain, "FAIL")
+        self.assertEqual(str(failed.style), "bold red")
 
     def test_fake_test_mode_data_renders_without_errors(self):
         entrypoint = load_entrypoint()

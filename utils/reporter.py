@@ -30,7 +30,7 @@ def _render_source_notes(disk_results: dict, test_names: dict) -> List[str]:
 
     Основной источник заметок — res["diag"]["notes"] (собирает run_fio_test:
     отсутствие nvme-cli, нечитаемый линк и т.п.). Для старых отчётов/тестовых
-    данных есть фолбэк на res["diag"]["sources"].
+    данных есть откат на res["diag"]["sources"].
     """
     seen = set()
     out: List[str] = []
@@ -60,7 +60,7 @@ def _render_source_notes(disk_results: dict, test_names: dict) -> List[str]:
 
 
 def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_names: dict) -> List[str]:
-    """Строит пер-секундные таблицы сэмплера для диска (из diag_store)."""
+    """Строит посекундные таблицы сэмплера для диска (из diag_store)."""
     lines: List[str] = []
     store = (diag_store or {}).get(disk_name)
     if not store:
@@ -114,7 +114,7 @@ def generate_report(
         test_names    — порядок и отображаемые имена тестов (по умолчанию TEST_NAMES)
         output_path   — путь для выходного файла (по умолчанию fio_report_<timestamp>.md)
         diag_store    — диагностические данные {диск: {тест: {"samples", "summary"}}};
-                        при наличии добавляет пер-секундные таблицы сэмплера
+                        при наличии добавляет посекундные таблицы сэмплера
         tuner_report  — список применённых настроек тюнера (из SystemTuner.report())
         run_info      — метаданные запуска {"command": str, "flags": [(label, value), ...]}
         fio_configs   — {интерфейс: сырое содержимое .fio-файла} для секции конфигов
@@ -258,7 +258,7 @@ def generate_report(
                     cells = [test_name, res.get("bs", "—"), "—", "—", "—"]
                     if show_lat_p99:
                         cells.append("—")
-                    cells.append("undone")
+                    cells.append("FAIL")
                 else:
                     cells = [
                         test_name,
@@ -269,7 +269,7 @@ def generate_report(
                     ]
                     if show_lat_p99:
                         cells.append(_fmt(res.get("lat_p99", 0), ".2f"))
-                    cells.append(res.get("status", "undone"))
+                    cells.append(res.get("status", "FAIL"))
                 lines.append("| " + " | ".join(cells) + " |")
 
             lines.append("")

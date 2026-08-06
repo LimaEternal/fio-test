@@ -10,7 +10,7 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -s           — тестирование (последовательно)
     python fio-test.py -c           — тестирование с подтверждением
     python fio-test.py -c -s        — с подтверждением, последовательно
-    python fio-test.py -c -p        — с подтверждением и прекондишнингом
+    python fio-test.py -c -p        — с подтверждением и предварительным заполнением
     python fio-test.py -r 60            — 60 сек на тест
     python fio-test.py -l               — подробное логирование: отчёт обновляется
                                           по мере завершения тестов (мониторинг в отчёте)
@@ -108,7 +108,7 @@ def parse_args():
             "  python fio-test.py -s                        — тестирование (последовательно)\n"
             "  python fio-test.py -c                        — с подтверждением перед стартом\n"
             "  python fio-test.py -c -s                     — с подтверждением, последовательно\n"
-            "  python fio-test.py -c -p                     — с подтверждением и прекондишнингом\n"
+            "  python fio-test.py -c -p                     — с подтверждением и предварительным заполнением\n"
             "  python fio-test.py -r 60                     — 60 секунд на каждый тест\n"
             "  python fio-test.py -l                        — подробное логирование (мониторинг в отчёте)\n"
             "  python fio-test.py -t                        — тестовый режим (пробные данные)\n"
@@ -128,12 +128,12 @@ def parse_args():
         help="Последовательный режим (для виртуальных машин)",
     )
     parser.add_argument(
-        "-p", "--precond", action="store_true",
-        help="Прекондишнинг перед тестами",
+        "-p", "--prefill", action="store_true",
+        help="Предварительное заполнение перед тестами",
     )
     parser.add_argument(
         "-l", "--logging", action="store_true",
-        help="Подробное логирование: пер-секундный мониторинг линка/температуры/"
+        help="Подробное логирование: посекундный мониторинг линка/температуры/"
              "нагрузки в MD-отчёт (+ колонка Lat P99)",
     )
     parser.add_argument(
@@ -194,17 +194,17 @@ def parse_args():
 
 
 def check_threshold(test_id, res, thresholds):
-    """Проверяет результат теста по пороговым значениям. Возвращает 'done' или 'undone'."""
+    """Проверяет результат теста по пороговым значениям. Возвращает 'PASS' или 'FAIL'."""
     thr = thresholds.get(test_id)
     if thr is None or "error" in res:
-        return "undone"
+        return "FAIL"
     if "min_bw_mb" in thr:
         if res.get("bw_mb", 0) >= thr["min_bw_mb"]:
-            return "done"
+            return "PASS"
     elif "min_iops" in thr:
         if res.get("iops", 0) >= thr["min_iops"]:
-            return "done"
-    return "undone"
+            return "PASS"
+    return "FAIL"
 
 
 def parse_custom_thresholds(raw):
@@ -305,7 +305,7 @@ def _build_run_info(args) -> dict:
     mode = "последовательный" if args.sequential else "параллельный"
     flags = [
         ("Режим", mode),
-        ("Прекондишнинг", "включён" if args.precond else "выключен"),
+        ("Предварительное заполнение", "включено" if args.prefill else "выключено"),
         ("Подробные логи", "включены" if args.logging else "выключены"),
         ("Автонастройка системы", "выключена" if args.no_tune else "включена"),
         (
@@ -633,7 +633,7 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         if numa_cpus:
             cmd.extend(["--cpus_allowed", numa_cpus])
 
-    # В диагностическом режиме просим fio писать пер-секундные логи нагрузки
+    # В диагностическом режиме просим fio писать посекундные логи нагрузки
     # (write_bw_log/write_iops_log): скорость/IOPS по секундам берутся из них,
     # по таймстампу вливаются в сэмплы после завершения теста.
     fio_log_prefix = None
@@ -732,12 +732,12 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     return res
 
 
-def run_precondition(disk_info, cancel_event=None):
-    """Запускает прекондишнинг (полная запись) диска. Возвращает True при успехе."""
+def run_prefill(disk_info, cancel_event=None):
+    """Запускает предварительное заполнение (полную запись объёма) диска. Возвращает True при успехе."""
     disk_path = disk_info["path"]
     cmd = [
         "fio",
-        "--name=precond",
+        "--name=prefill",
         "--filename", disk_path,
         "--direct=1",
         "--ioengine=libaio",
@@ -822,7 +822,7 @@ def process_task_result(results, idx, disk, t, fio_args, res, state_lock=None):
             break
 
     if "error" in res:
-        error_entry = {"error": res["error"], "status": "undone", "bs": bs}
+        error_entry = {"error": res["error"], "status": "FAIL", "bs": bs}
         if state_lock is not None:
             with state_lock:
                 results[idx][t] = error_entry
@@ -881,7 +881,7 @@ def _snapshot_state(results, diag_store, live_store, state_lock):
     """Копирует текущее состояние для рендера отчёта (безопасно к воркерам).
 
     Живые сэмплы идущих тестов (live_store) вливаются в диагностическую копию,
-    чтобы пер-секундные таблицы текущего теста попадали в отчёт.
+    чтобы посекундные таблицы текущего теста попадали в отчёт.
     """
     with state_lock:
         results_snap = [dict(r) for r in results]
@@ -917,7 +917,7 @@ class _ReportWriter(threading.Thread):
     """Фоновый поток: перегенерирует отчёт по мере поступления данных.
 
     Реагирует на маркер завершения теста из очереди и, по таймауту,
-    на живые пер-секундные сэмплы идущих тестов (live_store).
+    на живые посекундные сэмплы идущих тестов (live_store).
     """
 
     def __init__(self, report_queue, render, has_live, tick=REPORT_TICK):
@@ -1121,7 +1121,7 @@ def main():
     # Живые сэмплы идущих тестов для инкрементального отчёта: {диск: {"test_id", "samples"}}
     live_store = {} if args.logging else None
     if args.logging:
-        console.print("\n[bold]Подробное логирование: пер-секундные сэмплы линка/"
+        console.print("\n[bold]Подробное логирование: посекундные сэмплы линка/"
                       "температуры/нагрузки — в единый файл отчёта[/bold]")
         console.print("[dim]Отчёт обновляется по мере завершения тестов[/dim]")
 
@@ -1142,7 +1142,7 @@ def main():
         console.print(f"[dim]Не удалось создать отчёт: {exc}[/dim]")
 
     # Фоновый writer: перегенерирует отчёт после каждого теста и по тику
-    # показывает живые пер-секундные сэмплы идущих тестов.
+    # показывает живые посекундные сэмплы идущих тестов.
     report_queue = queue.Queue() if args.logging else None
     writer = None
     if args.logging:
@@ -1159,13 +1159,13 @@ def main():
         )
         writer.start()
 
-    # Прекондишнинг
-    if args.precond:
-        console.print("\n[bold]Прекондишнинг...[/bold]")
+    # Предварительное заполнение
+    if args.prefill:
+        console.print("\n[bold]Предварительное заполнение...[/bold]")
         for d in disks:
             name = d["name"]
-            console.print(f"  Прекондишнинг /dev/{name}...")
-            ok = run_precondition(d, cancel_event=cancel_event)
+            console.print(f"  Предварительное заполнение /dev/{name}...")
+            ok = run_prefill(d, cancel_event=cancel_event)
             if ok:
                 console.print(f"  [green]Готово[/green] /dev/{name}")
             else:

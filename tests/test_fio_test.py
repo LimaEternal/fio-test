@@ -293,7 +293,7 @@ class RunFioTestDiagStoreTests(unittest.TestCase):
 
 
 class RunFioTestLogFlagsTests(unittest.TestCase):
-    """В диагностическом режиме fio пишет пер-секундные логи нагрузки."""
+    """В диагностическом режиме fio пишет посекундные логи нагрузки."""
 
     def _run(self, diag_store):
         raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})

@@ -28,10 +28,10 @@ RESULT_HEADERS = tuple(
 
 def format_status(status):
     """Возвращает статус с цветовой разметкой; неизвестные значения — как есть."""
-    if status == "done":
-        return Text("done", style="bold green")
-    if status == "undone":
-        return Text("undone", style="bold red")
+    if status == "PASS":
+        return Text("PASS", style="bold green")
+    if status == "FAIL":
+        return Text("FAIL", style="bold red")
     return Text(str(status))
 
 
@@ -68,7 +68,7 @@ def _test_rows(disk_results, test_names):
             row = [test_name + "\n", "—", "—", "—", "—"]
             if SHOW_LAT_P99:
                 row.append("—")
-            row.append("undone")
+            row.append("FAIL")
         else:
             row = [
                 test_name + "\n",
@@ -79,7 +79,7 @@ def _test_rows(disk_results, test_names):
             ]
             if SHOW_LAT_P99:
                 row.append(_fmt(result.get("lat_p99", 0), ".2f"))
-            row.append(result.get("status", "undone"))
+            row.append(result.get("status", "FAIL"))
         rows.append(tuple(row))
     return rows
 

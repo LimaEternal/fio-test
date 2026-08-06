@@ -6,7 +6,7 @@
       поколения или ширины под нагрузкой;
     * температуру контроллера NVMe через `nvme smart-log` (nvme-cli) —
       перегрев/троттлинг;
-    * реальную нагрузку на диск: пер-секундные логи fio
+    * реальную нагрузку на диск: посекундные логи fio
       (write_bw_log/write_iops_log) — IOPS/МБ/с. Скорость из логов вливается
       в сэмплы после завершения теста (merge_fio_logs).
 
@@ -57,7 +57,7 @@ def collect_static_info(disk: dict) -> dict:
     return info
 
 
-# --- пер-секундные логи fio (write_bw_log / write_iops_log) ---
+# --- посекундные логи fio (write_bw_log / write_iops_log) ---
 
 
 def _log_files(prefix: str, kind: str):
@@ -101,7 +101,7 @@ def _parse_log_file(path: Path) -> dict:
 
 
 def parse_fio_logs(prefix: str) -> Optional[dict]:
-    """Парсит bw/iops-логи fio по префиксу в пер-секундную нагрузку.
+    """Парсит bw/iops-логи fio по префиксу в посекундную нагрузку.
 
     Возвращает {ts_sec: {"read_mbs", "write_mbs", "iops"}} либо None, если
     файлы не найдены или не распарсились. Значения суммируются по всем
@@ -155,7 +155,7 @@ class DiagnosticSampler:
     """Сэмплирует линк и температуру в отдельном потоке.
 
     Нагрузку (МБ/с, IOPS) сэмплер не считает: её отдаёт сам fio своими
-    пер-секундными логами (write_bw_log/write_iops_log), которые после
+    посекундными логами (write_bw_log/write_iops_log), которые после
     завершения теста вливаются в сэмплы через merge_fio_logs.
     """
 
@@ -240,7 +240,7 @@ class DiagnosticSampler:
         return None
 
     def merge_fio_logs(self, prefix: str) -> bool:
-        """Вливает пер-секундную нагрузку из логов fio в сэмплы.
+        """Вливает посекундную нагрузку из логов fio в сэмплы.
 
         Лог-файлы fio — единственный источник нагрузки: скорость/IOPS fio
         пишет сам (write_bw_log/write_iops_log). Значения из логов матчатся
