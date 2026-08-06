@@ -149,8 +149,8 @@ def parse_args():
         help="Путь для выходного MD-отчёта",
     )
     parser.add_argument(
-        "-r", "--runtime", type=int, default=30,
-        help="Длительность каждого теста в секундах (по умолчанию: 30)",
+        "-r", "--runtime", type=int, default=None,
+        help="Длительность каждого теста в секундах (по умолчанию — из конфига .fio)",
     )
     def disk_token_type(token: str):
         try:
@@ -308,7 +308,10 @@ def _build_run_info(args) -> dict:
         ("Прекондишнинг", "включён" if args.precond else "выключен"),
         ("Подробные логи", "включены" if args.logging else "выключены"),
         ("Автонастройка системы", "выключена" if args.no_tune else "включена"),
-        ("Длительность теста", f"{args.runtime} сек"),
+        (
+            "Длительность теста",
+            f"{args.runtime} сек" if args.runtime is not None else "по конфигу (.fio)",
+        ),
     ]
     if args.add is not None:
         flags.append(("Выбор дисков (--add)", ", ".join(str(n) for n in args.add)))
@@ -1168,7 +1171,7 @@ def main():
             else:
                 console.print(f"  [red]Ошибка[/red] /dev/{name}")
 
-    if args.runtime != 30:
+    if args.runtime is not None:
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")
 
     # Подготовка задач: по одному плану тестов на диск (тесты диска — подряд)
@@ -1191,11 +1194,13 @@ def main():
         for t, fio_args in tests.items():
             fio_args = list(fio_args)
 
-            # Переопределение длительности теста
-            fio_args = [
-                f"--runtime={args.runtime}" if a.startswith("--runtime=") else a
-                for a in fio_args
-            ]
+            # Длительность теста: только если задан явно через -r; иначе
+            # остаётся значение runtime= из .fio-конфига.
+            if args.runtime is not None:
+                fio_args = [
+                    f"--runtime={args.runtime}" if a.startswith("--runtime=") else a
+                    for a in fio_args
+                ]
 
             # Оптимизация для NVMe
             if "nvme" in tran and pcie_info:
