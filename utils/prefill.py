@@ -132,64 +132,122 @@ def _kill_tree(proc) -> None:
             pass
 
 
+def _extract_fio_statuses(text):
+    """Извлекает из потока текста полные JSON-объекты fio.
+
+    fio-3.28 печатает JSON-статусы многострочными (pretty), поэтому построчный
+    парсинг невозможен: ищем первый '{' и балансируем фигурные скобки с учётом
+    строк ("..." и экранирования \\"). Возвращает (список_объектов, остаток).
+    Незавершённый объект на конце остаётся в остатке и ждёт следующих данных.
+    """
+    statuses = []
+    while True:
+        start = text.find("{")
+        if start == -1:
+            break
+        depth = 0
+        in_str = False
+        escaped = False
+        end = -1
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif c == "\\":
+                    escaped = True
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end == -1:
+            break
+        chunk = text[start:end + 1]
+        text = text[end + 1:]
+        try:
+            statuses.append(json.loads(chunk))
+        except ValueError:
+            continue
+    return statuses, text
+
+
 def _run_fio_stream(cmd, cancel_event=None, on_progress=None):
     """Запускает fio с живым чтением JSON-статусов (--status-interval=1).
 
-    Статусы парсятся по мере поступления (одна строка = один JSON) и передаются
-    в on_progress(io_bytes, bw_bytes). Если за STALL_SECONDS секунд не записано
-    ни байта — процесс убивается и возвращается "stall" (движок не пишет).
+    Статусы fio многострочные (pretty) — парсятся по балансу скобок через
+    _extract_fio_statuses по мере поступления и передаются в
+    on_progress(io_bytes, bw_bytes). Читаются оба потока (stdout+stderr):
+    JSON может прийти в любой, а заодно stderr-пайп не переполняется.
+
+    Стагн (движок не пишет) определяется двумя путями:
+      * 0 записанных байт при живых статусах в течение STALL_SECONDS сек;
+      * полное отсутствие вывода в течение STALL_SECONDS сек.
+    В обоих случаях процесс убивается и возвращается "stall".
     Возвращает: True при успехе, "stall" при стагне, None при отмене/ошибке,
     False если fio не запустился.
     """
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
+        kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+        if hasattr(os, "setsid"):
+            kwargs["preexec_fn"] = os.setsid
+        proc = subprocess.Popen(cmd, **kwargs)
     except (OSError, FileNotFoundError):
         return False
 
-    buf = b""
+    buf = ""
+    stdout_eof = False
     stall_deadline = None
     max_io_bytes = 0
+    last_output = time.monotonic()
     exit_code = None
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 _kill_tree(proc)
                 return None
-            if stall_deadline is not None and time.monotonic() >= stall_deadline:
+            now = time.monotonic()
+            if stall_deadline is not None and now >= stall_deadline:
                 _kill_tree(proc)
                 return "stall"
-            ready, _, _ = select.select([proc.stdout], [], [], 0.5)
-            if ready:
+            if max_io_bytes == 0 and now - last_output >= STALL_SECONDS:
+                _kill_tree(proc)
+                return "stall"
+
+            ready, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.5)
+            for stream in ready:
                 try:
-                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    chunk = os.read(stream.fileno(), 65536)
                 except OSError:
                     chunk = b""
                 if not chunk:
+                    if stream is proc.stdout:
+                        stdout_eof = True
+                    continue
+                last_output = time.monotonic()
+                buf += chunk.decode("utf-8", "replace")
+
+            statuses, buf = _extract_fio_statuses(buf)
+            for status in statuses:
+                io_bytes, bw_bytes = _extract_prefill_stats(status)
+                if io_bytes > max_io_bytes:
+                    max_io_bytes = io_bytes
+                    stall_deadline = None
+                elif io_bytes == 0 and stall_deadline is None:
+                    stall_deadline = time.monotonic() + STALL_SECONDS
+                if on_progress is not None:
+                    on_progress(io_bytes, bw_bytes)
+
+            if stdout_eof:
+                if not buf.strip() and proc.poll() is not None:
                     exit_code = proc.wait()
                     break
-                buf += chunk
-                while b"\n" in buf:
-                    raw, buf = buf.split(b"\n", 1)
-                    line = raw.decode("utf-8", "replace").strip()
-                    if not line.startswith("{"):
-                        continue
-                    try:
-                        status = json.loads(line)
-                    except ValueError:
-                        continue
-                    io_bytes, bw_bytes = _extract_prefill_stats(status)
-                    if io_bytes > max_io_bytes:
-                        max_io_bytes = io_bytes
-                        stall_deadline = None
-                    elif io_bytes == 0 and stall_deadline is None:
-                        stall_deadline = time.monotonic() + STALL_SECONDS
-                    if on_progress is not None:
-                        on_progress(io_bytes, bw_bytes)
             elif proc.poll() is not None:
                 exit_code = proc.wait()
                 break

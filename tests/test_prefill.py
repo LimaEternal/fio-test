@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -285,6 +286,166 @@ class PrefillDisksTests(unittest.TestCase):
             dur = prefill.prefill_disks([d1])
 
         self.assertEqual(dur, 0.0)
+
+
+PRETTY_STATUS = (
+    '{\n'
+    '  "fio version" : "fio-3.28",\n'
+    '  "jobs" : [\n'
+    '    {\n'
+    '      "jobname" : "v",\n'
+    '      "write" : {\n'
+    '        "io_kbytes" : 2048,\n'
+    '        "bw_bytes" : 1048576\n'
+    '      }\n'
+    '    }\n'
+    '  ]\n'
+    '}\n'
+)
+
+
+class ExtractStatusTests(unittest.TestCase):
+    def test_pretty_multiline_status(self):
+        statuses, rest = prefill._extract_fio_statuses(PRETTY_STATUS)
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(statuses[0]["jobs"][0]["write"]["io_kbytes"], 2048)
+        self.assertFalse(rest.strip())
+
+    def test_two_objects_concatenated(self):
+        statuses, rest = prefill._extract_fio_statuses(PRETTY_STATUS * 2)
+        self.assertEqual(len(statuses), 2)
+        self.assertFalse(rest.strip())
+
+    def test_partial_status_kept_for_next_chunk(self):
+        half = len(PRETTY_STATUS) // 2
+        statuses, rest = prefill._extract_fio_statuses(PRETTY_STATUS[:half])
+        self.assertEqual(statuses, [])
+        self.assertNotEqual(rest, "")
+        statuses, rest = prefill._extract_fio_statuses(rest + PRETTY_STATUS[half:])
+        self.assertEqual(len(statuses), 1)
+        self.assertFalse(rest.strip())
+
+    def test_mixed_text_around_status(self):
+        text = "fio: looks like your fs does not support direct=1\n" + PRETTY_STATUS + "Jobs: 1 (f=1)\n"
+        statuses, rest = prefill._extract_fio_statuses(text)
+        self.assertEqual(len(statuses), 1)
+
+    def test_braces_inside_strings_ignored(self):
+        text = '{\n  "a" : "}}",\n  "b" : { "c" : "{" },\n  "io_kbytes" : 7\n}\n'
+        statuses, rest = prefill._extract_fio_statuses(text)
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(statuses[0]["b"]["c"], "{")
+        self.assertEqual(statuses[0]["io_kbytes"], 7)
+
+    def test_no_braces_returns_empty(self):
+        statuses, rest = prefill._extract_fio_statuses("no json here\n")
+        self.assertEqual(statuses, [])
+        self.assertEqual(rest, "no json here\n")
+
+
+class FioStreamTests(unittest.TestCase):
+    def _make_proc(self):
+        stdout = mock.Mock()
+        stdout.fileno.return_value = 11
+        stderr = mock.Mock()
+        stderr.fileno.return_value = 22
+        proc = mock.Mock()
+        proc.stdout = stdout
+        proc.stderr = stderr
+        proc.pid = 12345
+        return proc
+
+    def test_feeds_progress_from_pretty_json_and_succeeds(self):
+        proc = self._make_proc()
+        read_plan = {11: [PRETTY_STATUS.encode(), b""], 22: [b""]}
+        selects = [
+            ([proc.stdout, proc.stderr], [], []),
+            ([proc.stdout], [], []),
+            ([], [], []),
+        ]
+
+        def fake_read(fd, n):
+            q = read_plan[fd]
+            return q.pop(0) if q else b""
+
+        def fake_select(readable, writable, exc, timeout):
+            return selects.pop(0)
+
+        proc.poll.side_effect = [None, None, 0]
+        proc.wait.return_value = 0
+        seen = []
+        with mock.patch.object(prefill.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(prefill.select, "select", side_effect=fake_select), \
+             mock.patch.object(prefill.os, "read", side_effect=fake_read), \
+             mock.patch.object(prefill, "_kill_tree") as kill:
+            result = prefill._run_fio_stream(
+                ["fio", "--x"], on_progress=lambda i, b: seen.append((i, b))
+            )
+        self.assertIs(result, True)
+        self.assertEqual(seen[-1][0], 2048 * 1024)
+        self.assertEqual(seen[-1][1], 1048576)
+
+    def test_stall_when_statuses_show_zero_bytes(self):
+        proc = self._make_proc()
+        zero_status = PRETTY_STATUS.replace("2048", "0").encode()
+
+        def fake_read(fd, n):
+            return zero_status
+
+        def fake_select(readable, writable, exc, timeout):
+            return [proc.stdout], [], []
+
+        clock = [100.0]
+
+        def fake_mono():
+            clock[0] += 1
+            return clock[0]
+
+        proc.poll.return_value = None
+        with mock.patch.object(prefill.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(prefill.select, "select", side_effect=fake_select), \
+             mock.patch.object(prefill.os, "read", side_effect=fake_read), \
+             mock.patch.object(prefill, "_kill_tree") as kill, \
+             mock.patch.object(prefill.time, "monotonic", side_effect=fake_mono):
+            result = prefill._run_fio_stream(["fio", "--x"])
+        self.assertEqual(result, "stall")
+        kill.assert_called_once_with(proc)
+
+    def test_stall_when_no_output_at_all(self):
+        proc = self._make_proc()
+
+        def fake_select(readable, writable, exc, timeout):
+            return [], [], []
+
+        clock = [100.0]
+
+        def fake_mono():
+            clock[0] += 1
+            return clock[0]
+
+        proc.poll.return_value = None
+        with mock.patch.object(prefill.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(prefill.select, "select", side_effect=fake_select), \
+             mock.patch.object(prefill, "_kill_tree") as kill, \
+             mock.patch.object(prefill.time, "monotonic", side_effect=fake_mono):
+            result = prefill._run_fio_stream(["fio", "--x"])
+        self.assertEqual(result, "stall")
+        kill.assert_called_once_with(proc)
+
+    def test_cancel_returns_none(self):
+        proc = self._make_proc()
+        cancel = threading.Event()
+        cancel.set()
+
+        def fake_select(readable, writable, exc, timeout):
+            return [], [], []
+
+        with mock.patch.object(prefill.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(prefill.select, "select", side_effect=fake_select), \
+             mock.patch.object(prefill, "_kill_tree") as kill:
+            result = prefill._run_fio_stream(["fio", "--x"], cancel_event=cancel)
+        self.assertIsNone(result)
+        kill.assert_called_once_with(proc)
 
 
 if __name__ == "__main__":
