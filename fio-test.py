@@ -732,8 +732,95 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     return res
 
 
-def run_prefill(disk_info, cancel_event=None):
-    """Запускает предварительное заполнение (полную запись объёма) диска. Возвращает True при успехе."""
+def _prefill_state_path() -> Path:
+    """Путь к файлу маркеров предварительного заполнения."""
+    return Path("reports") / "prefill_state.json"
+
+
+def _load_prefill_state() -> dict:
+    """Читает маркеры предзаполнения {serial: {model, size, name, filled_at}}."""
+    try:
+        with _prefill_state_path().open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_prefill_state(state: dict) -> None:
+    """Атомарно сохраняет маркеры предзаполнения (temp + rename)."""
+    path = _prefill_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _needs_prefill(disk: dict, state: dict) -> bool:
+    """True, если диск ещё не заполнен или изменился его объём."""
+    entry = state.get(disk.get("serial", ""))
+    if entry is None:
+        return True
+    return entry.get("size") != disk.get("size")
+
+
+def _written_sectors(stat_path: Path):
+    """Счётчик записанных секторов из /sys/block/<name>/stat (поле 7)."""
+    try:
+        parts = stat_path.read_text(encoding="utf-8").split()
+        if len(parts) > 6:
+            return int(parts[6])
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_bytes(n: float) -> str:
+    """Форматирует байты в человекочитаемый вид (Б/КБ/МБ/ГБ/ТБ)."""
+    value = float(n)
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if value < 1024:
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}ПБ"
+
+
+def _monitor_prefill(disk_info: dict, stop_event: threading.Event) -> None:
+    """Периодически печатает прогресс заполнения диска (через sysfs-статистику)."""
+    name = disk_info["name"]
+    stat_path = Path(f"/sys/block/{name}/stat")
+    size_path = Path(f"/sys/block/{name}/size")
+    try:
+        total_sectors = int(size_path.read_text(encoding="utf-8").strip())
+        baseline = _written_sectors(stat_path)
+    except Exception:
+        return
+    if total_sectors <= 0 or baseline is None:
+        return
+    total_bytes = total_sectors * 512
+    while not stop_event.wait(5):
+        current = _written_sectors(stat_path)
+        if current is None:
+            continue
+        written = (current - baseline) * 512
+        pct = min(100.0, written / total_bytes * 100)
+        console.print(
+            f"  [dim]Заполнение /dev/{name}: {pct:.0f}% "
+            f"({_fmt_bytes(written)} из {_fmt_bytes(total_bytes)})[/dim]"
+        )
+
+
+def run_prefill(disk_info, cancel_event=None, tuner=None):
+    """Запускает предварительное заполнение (полную запись объёма) диска.
+
+    Запись идёт одним потоком с глубиной очереди 32 (iodepth=32) — близко
+    к насыщению последовательной записи NVMe. Если известен NUMA-узел диска,
+    fio пинится к его CPU (--cpus_allowed). Параллельно с записью выводится
+    прогресс заполнения (проценты от объёма). Возвращает True при успехе.
+    """
     disk_path = disk_info["path"]
     cmd = [
         "fio",
@@ -743,19 +830,87 @@ def run_prefill(disk_info, cancel_event=None):
         "--ioengine=libaio",
         "--rw=write",
         "--bs=128k",
+        "--iodepth=32",
         "--size=100%",
         "--numjobs=1",
         "--group_reporting",
         "--output-format=json",
     ]
+
+    if tuner:
+        numa_cpus = tuner.get_numa_cpus(disk_info["name"])
+        if numa_cpus:
+            cmd.extend(["--cpus_allowed", numa_cpus])
+
+    stop_progress = threading.Event()
+    monitor = threading.Thread(
+        target=_monitor_prefill, args=(disk_info, stop_progress), daemon=True
+    )
+    monitor.start()
     try:
-        result = _run_io_process(cmd, cancel_event)
-    except FileNotFoundError:
-        return False
-    if result is None:
-        return False
-    proc, _, _ = result
-    return proc.returncode == 0
+        try:
+            result = _run_io_process(cmd, cancel_event)
+        except FileNotFoundError:
+            return False
+        if result is None:
+            return False
+        proc, _, _ = result
+        return proc.returncode == 0
+    finally:
+        stop_progress.set()
+        monitor.join(timeout=1)
+
+
+def prefill_disks(disks, tuner=None, cancel_event=None):
+    """Предварительно заполняет диски параллельно, с маркером пропуска.
+
+    Уже заполненные диски (маркер в reports/prefill_state.json) пропускаются;
+    перезапись происходит только при смене диска или изменении объёма.
+    """
+    state = _load_prefill_state()
+    to_fill = []
+    for d in disks:
+        if _needs_prefill(d, state):
+            to_fill.append(d)
+        else:
+            console.print(f"  [dim]пропуск (уже заполнен)[/dim] /dev/{d['name']}")
+
+    if not to_fill:
+        return
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    future_map = {}
+    try:
+        for d in to_fill:
+            console.print(f"  Заполнение /dev/{d['name']}...")
+            fut = pool.submit(run_prefill, d, cancel_event=cancel_event, tuner=tuner)
+            future_map[fut] = d
+
+        for fut in concurrent.futures.as_completed(future_map):
+            d = future_map[fut]
+            try:
+                ok = fut.result()
+            except Exception as exc:
+                console.print(f"  [red]Ошибка[/red] /dev/{d['name']}: {exc}")
+                continue
+            if ok:
+                state[d["serial"]] = {
+                    "model": d.get("model", ""),
+                    "size": d.get("size"),
+                    "name": d["name"],
+                    "filled_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                console.print(f"  [green]Готово[/green] /dev/{d['name']}")
+            else:
+                console.print(f"  [red]Ошибка[/red] /dev/{d['name']}")
+    except KeyboardInterrupt:
+        if cancel_event:
+            cancel_event.set()
+        console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
+        sys.exit(130)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        _save_prefill_state(state)
 
 
 def optimize_nvme_args(test_id, args_list, pcie_info):
@@ -1162,14 +1317,7 @@ def main():
     # Предварительное заполнение
     if args.prefill:
         console.print("\n[bold]Предварительное заполнение...[/bold]")
-        for d in disks:
-            name = d["name"]
-            console.print(f"  Предварительное заполнение /dev/{name}...")
-            ok = run_prefill(d, cancel_event=cancel_event)
-            if ok:
-                console.print(f"  [green]Готово[/green] /dev/{name}")
-            else:
-                console.print(f"  [red]Ошибка[/red] /dev/{name}")
+        prefill_disks(disks, tuner=tuner, cancel_event=cancel_event)
 
     if args.runtime is not None:
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")

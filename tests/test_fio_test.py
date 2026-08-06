@@ -833,5 +833,112 @@ class TestModeDiskSelectionTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
 
 
+class PrefillTests(unittest.TestCase):
+    """Предварительное заполнение: команда fio, параллельный запуск, маркер пропуска."""
+
+    def _fake_result(self, ok=True):
+        return (mock.Mock(returncode=0 if ok else 1), b"{}", b"")
+
+    def test_run_prefill_adds_iodepth_and_numa_pinning(self):
+        cmd_seen = {}
+        fake_tuner = mock.Mock()
+        fake_tuner.get_numa_cpus.return_value = "0-11,24-35"
+
+        def fake_run(cmd, cancel_event):
+            cmd_seen["cmd"] = cmd
+            return self._fake_result()
+
+        with mock.patch.object(fio_test, "_run_io_process", side_effect=fake_run):
+            ok = fio_test.run_prefill(DISK, tuner=fake_tuner)
+
+        self.assertTrue(ok)
+        cmd = cmd_seen["cmd"]
+        self.assertIn("--iodepth=32", cmd)
+        self.assertIn("--cpus_allowed", cmd)
+        self.assertIn("0-11,24-35", cmd)
+
+    def test_run_prefill_without_numa_omits_cpus_allowed(self):
+        cmd_seen = {}
+
+        def fake_run(cmd, cancel_event):
+            cmd_seen["cmd"] = cmd
+            return self._fake_result()
+
+        with mock.patch.object(fio_test, "_run_io_process", side_effect=fake_run):
+            ok = fio_test.run_prefill(DISK, tuner=None)
+
+        self.assertTrue(ok)
+        self.assertNotIn("--cpus_allowed", cmd_seen["cmd"])
+
+    def test_prefill_disks_runs_all_and_saves_state(self):
+        d1 = dict(DISK, name="nvme0n1", serial="S1")
+        d2 = dict(DISK, name="nvme1n1", serial="S2")
+        calls = []
+        saved = {}
+
+        def fake_prefill(disk, cancel_event=None, tuner=None):
+            calls.append(disk["name"])
+            return True
+
+        with mock.patch.object(fio_test, "_load_prefill_state", return_value={}), \
+             mock.patch.object(fio_test, "_save_prefill_state",
+                               side_effect=lambda s: saved.update(s)), \
+             mock.patch.object(fio_test, "run_prefill", side_effect=fake_prefill):
+            fio_test.prefill_disks([d1, d2])
+
+        self.assertEqual(sorted(calls), ["nvme0n1", "nvme1n1"])
+        self.assertEqual(set(saved), {"S1", "S2"})
+        self.assertEqual(saved["S1"]["size"], "3.2T")
+
+    def test_prefill_disks_skips_already_filled(self):
+        d1 = dict(DISK, name="nvme0n1", serial="S1")
+        d2 = dict(DISK, name="nvme1n1", serial="S2")
+        state = {"S1": {"model": "M", "size": "3.2T", "name": "nvme0n1"}}
+        calls = []
+
+        def fake_prefill(disk, cancel_event=None, tuner=None):
+            calls.append(disk["name"])
+            return True
+
+        with mock.patch.object(fio_test, "_load_prefill_state", return_value=state), \
+             mock.patch.object(fio_test, "_save_prefill_state"), \
+             mock.patch.object(fio_test, "run_prefill", side_effect=fake_prefill):
+            fio_test.prefill_disks([d1, d2])
+
+        self.assertEqual(calls, ["nvme1n1"])
+
+    def test_prefill_disks_refills_when_size_changed(self):
+        d1 = dict(DISK, name="nvme0n1", serial="S1")
+        state = {"S1": {"model": "M", "size": "1.0T", "name": "nvme0n1"}}
+        calls = []
+
+        def fake_prefill(disk, cancel_event=None, tuner=None):
+            calls.append(disk["name"])
+            return True
+
+        with mock.patch.object(fio_test, "_load_prefill_state", return_value=state), \
+             mock.patch.object(fio_test, "_save_prefill_state"), \
+             mock.patch.object(fio_test, "run_prefill", side_effect=fake_prefill):
+            fio_test.prefill_disks([d1])
+
+        self.assertEqual(calls, ["nvme0n1"])
+
+    def test_prefill_disks_failure_not_saved(self):
+        d1 = dict(DISK, name="nvme0n1", serial="S1")
+        d2 = dict(DISK, name="nvme1n1", serial="S2")
+        saved = {}
+
+        def fake_prefill(disk, cancel_event=None, tuner=None):
+            return disk["name"] == "nvme0n1"
+
+        with mock.patch.object(fio_test, "_load_prefill_state", return_value={}), \
+             mock.patch.object(fio_test, "_save_prefill_state",
+                               side_effect=lambda s: saved.update(s)), \
+             mock.patch.object(fio_test, "run_prefill", side_effect=fake_prefill):
+            fio_test.prefill_disks([d1, d2])
+
+        self.assertEqual(set(saved), {"S1"})
+
+
 if __name__ == "__main__":
     unittest.main()
