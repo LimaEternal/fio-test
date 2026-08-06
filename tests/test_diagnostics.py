@@ -78,6 +78,15 @@ class DiagnosticSamplerTests(unittest.TestCase):
         self.assertEqual(temp, 38.0)
         self.assertEqual(calls, ["/dev/nvme1", "/dev/nvme1n1"])
 
+    def test_temp_parses_degree_sign_format(self):
+        """nvme-cli 2.3 пишет `28°C` без пробела — градус должен распознаваться."""
+        with _patch_paths(self.tmp), \
+             mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=None), \
+             _smart_log("temperature                             : 28°C (301 Kelvin)\n"
+                        "Temperature Sensor 1           : 28°C (301 Kelvin)"):
+            sampler = DiagnosticSampler(DISK)
+            self.assertEqual(sampler._read_temp(), 28.0)
+
     def test_temp_cached_after_first_read(self):
         with _patch_paths(self.tmp), \
              mock.patch("utils.diagnostics.find_nvme_link_dir", return_value=None), \

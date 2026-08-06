@@ -217,8 +217,9 @@ class DiagnosticSampler:
     def _nvme_smart_temp(self, dev: str) -> Optional[float]:
         """Запускает `nvme smart-log <dev>` и вытаскивает temperature.
 
-        Формат строки: `temperature: 31 C (304 Kelvin)` — первое число
-        перед `C` и есть температура в °C.
+        Разные версии nvme-cli форматируют по-разному:
+        `temperature: 31 C (304 Kelvin)` или `temperature: 28°C (301 Kelvin)`
+        (градус может идти без пробела). Первое число перед `C` — температура.
         """
         try:
             proc = subprocess.run(
@@ -233,7 +234,7 @@ class DiagnosticSampler:
         for line in text.splitlines():
             if not line.strip().lower().startswith("temperature"):
                 continue
-            m = re.search(r"(\d+(?:\.\d+)?)\s*C\b", line)
+            m = re.search(r"(\d+(?:\.\d+)?)\s*°?\s*C\b", line)
             if m:
                 return float(m.group(1))
         return None
