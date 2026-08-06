@@ -14,6 +14,11 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -r 60            — 60 сек на тест
     python fio-test.py -l               — подробное логирование: отчёт обновляется
                                           по мере завершения тестов (мониторинг в отчёте)
+    python fio-test.py -t               — тестовый режим (пробные данные без fio)
+    python fio-test.py -a 1 3-5         — протестировать только диски 1 и 3..5
+                                          (номера и диапазоны из нумерованного списка)
+    python fio-test.py -d 4 6-8         — протестировать все несистемные диски,
+                                          кроме 4 и 6..8
     python fio-test.py -o my.md         — свой путь отчёта
     python fio-test.py -t               — тестовый режим (пробные данные без fio)
 """
@@ -107,6 +112,8 @@ def parse_args():
             "  python fio-test.py -r 60                     — 60 секунд на каждый тест\n"
             "  python fio-test.py -l                        — подробное логирование (мониторинг в отчёте)\n"
             "  python fio-test.py -t                        — тестовый режим (пробные данные)\n"
+            "  python fio-test.py -a 1 3-5                  — только диски 1 и 3..5 (номера/диапазоны)\n"
+            "  python fio-test.py -d 4 6-8                  — все диски, кроме 4 и 6..8\n"
             "  python fio-test.py -o reports/custom.md       — свой путь отчёта\n"
             "  python fio-test.py -c --threshold-nvme \"seq_read=15000:seq_write=12000\""
         ),
@@ -145,6 +152,27 @@ def parse_args():
         "-r", "--runtime", type=int, default=30,
         help="Длительность каждого теста в секундах (по умолчанию: 30)",
     )
+    def disk_token_type(token: str):
+        try:
+            return _expand_token(token)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"неверный формат номера/диапазона: '{token}'"
+            )
+
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "-a", "--add", nargs="*", type=disk_token_type, default=None, metavar="N",
+        help="Протестировать только указанные диски (номера или диапазоны из "
+             "пронумерованного списка, через пробел: 1 3-5). Без номеров — "
+             "запросит список интерактивно",
+    )
+    selection.add_argument(
+        "-d", "--delete", nargs="*", type=disk_token_type, default=None, metavar="N",
+        help="Протестировать все несистемные диски, кроме указанных (номера или "
+             "диапазоны, через пробел: 1 3-5). Без номеров — запросит список "
+             "интерактивно",
+    )
     parser.add_argument(
         "--threshold-nvme", type=str, default=None,
         help="Пороговые значения NVMe (формат: seq_read=5000:rand_read=500000)",
@@ -157,7 +185,12 @@ def parse_args():
         "--threshold-sata", type=str, default=None,
         help="Пороговые значения SATA (формат: seq_read=400:rand_read=10000)",
     )
-    return parser.parse_args(_expand_short_flags(sys.argv[1:]))
+    args = parser.parse_args(_expand_short_flags(sys.argv[1:]))
+    if args.add is not None:
+        args.add = [n for tok in args.add for n in tok]
+    if args.delete is not None:
+        args.delete = [n for tok in args.delete for n in tok]
+    return args
 
 
 def check_threshold(test_id, res, thresholds):
@@ -191,6 +224,82 @@ def parse_custom_thresholds(raw):
     return result
 
 
+def _expand_token(token: str) -> list:
+    """Разворачивает один токен номера/диапазона в список целых.
+
+    '5'   → [5]
+    '1-3' → [1, 2, 3]
+    '3-1' → [3, 2, 1]
+    Неверный формат → ValueError.
+    """
+    token = token.strip()
+    if "-" in token:
+        start_s, end_s = token.split("-", 1)
+        start = int(start_s)
+        end = int(end_s)
+        if start <= end:
+            return list(range(start, end + 1))
+        return list(range(start, end - 1, -1))
+    return [int(token)]
+
+
+def parse_disk_numbers(raw: str) -> list:
+    """Разбирает строку номеров и диапазонов '1-3 5' в список целых (пустая строка → [])."""
+    result = []
+    for token in raw.strip().split():
+        result.extend(_expand_token(token))
+    return result
+
+
+def _input_disk_numbers(prompt: str) -> list:
+    """Спрашивает у пользователя номера дисков (через пробел или диапазоном) и возвращает их список.
+
+    При неверном формате запрашивает ввод повторно; EOF/Ctrl-C → «Отменено».
+    """
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[bold yellow]Отменено.[/bold yellow]")
+            sys.exit(0)
+        try:
+            return parse_disk_numbers(raw)
+        except ValueError:
+            console.print(
+                "[bold red]ОШИБКА:[/bold red] неверный формат. Пример: '1 3-5'"
+            )
+
+
+def apply_disk_selection(disks: list, args) -> list:
+    """Применяет выбор дисков --add/--delete к пронумерованному списку (1..N).
+
+    --add 1 2 3    — оставить только диски 1, 2, 3; --add без номеров → [].
+    --delete 4 5 6 — исключить диски 4, 5, 6 из полного набора;
+                     --delete без номеров → все диски.
+    Флаг не задан (None) → список без изменений.
+    Неверные номера (вне диапазона) считаются ошибкой и останавливают запуск.
+    """
+    if args.add is None and args.delete is None:
+        return disks
+
+    numbers = args.add if args.add is not None else args.delete
+
+    valid = set(range(1, len(disks) + 1))
+    invalid = sorted(set(numbers) - valid)
+    if invalid:
+        console.print(
+            f"[bold red]ОШИБКА:[/bold red] неверные номера дисков: "
+            f"{', '.join(str(n) for n in invalid)} "
+            f"(доступны номера 1..{len(disks)})"
+        )
+        sys.exit(1)
+
+    selected = set(numbers)
+    if args.add is not None:
+        return [d for i, d in enumerate(disks, 1) if i in selected]
+    return [d for i, d in enumerate(disks, 1) if i not in selected]
+
+
 def _build_run_info(args) -> dict:
     """Собирает мета-информацию о запуске для секции «Параметры запуска» отчёта."""
     mode = "последовательный" if args.sequential else "параллельный"
@@ -201,6 +310,10 @@ def _build_run_info(args) -> dict:
         ("Автонастройка системы", "выключена" if args.no_tune else "включена"),
         ("Длительность теста", f"{args.runtime} сек"),
     ]
+    if args.add is not None:
+        flags.append(("Выбор дисков (--add)", ", ".join(str(n) for n in args.add)))
+    if args.delete is not None:
+        flags.append(("Выбор дисков (--delete)", ", ".join(str(n) for n in args.delete)))
     if args.threshold_nvme:
         flags.append(("Пороги NVMe", args.threshold_nvme))
     if args.threshold_sas:
@@ -897,6 +1010,11 @@ def main():
 
         # 2. Фейковая таблица для проверки вёрстки (fio не запускается).
         disks = build_fake_disks()
+        if args.add is not None or args.delete is not None:
+            disks = apply_disk_selection(disks, args)
+            if not disks:
+                console.print("[bold yellow]После фильтрации целевые диски не найдены.[/bold yellow]")
+                sys.exit(0)
         results = build_fake_results(disks)
         console.print("[bold]Тестовый режим: пробные данные, fio не запускается[/bold]")
         console.print()
@@ -920,12 +1038,6 @@ def main():
         console.print(f"[bold red]Ошибка сканирования:[/bold red] {exc}")
         sys.exit(1)
 
-    fio_configs = _collect_fio_configs(disks)
-
-    if args.logging:
-        for d in disks:
-            d["diag_static"] = collect_static_info(d)
-
     if system_disks:
         console.print("\n[bold]Системные диски:[/bold]")
         for sd in system_disks:
@@ -945,6 +1057,25 @@ def main():
     if not disks:
         console.print("[bold yellow]Целевые диски не найдены.[/bold yellow]")
         sys.exit(0)
+
+    # Ручной выбор дисков: -a/--add или -d/--delete.
+    # Если флаг передан без номеров, список уже показан выше — запрашиваем номера.
+    if args.add is not None and not args.add:
+        args.add = _input_disk_numbers("Номера дисков для теста (через пробел): ")
+    elif args.delete is not None and not args.delete:
+        args.delete = _input_disk_numbers("Номера дисков для исключения (через пробел): ")
+
+    disks = apply_disk_selection(disks, args)
+
+    if not disks:
+        console.print("[bold yellow]После фильтрации целевые диски не найдены.[/bold yellow]")
+        sys.exit(0)
+
+    fio_configs = _collect_fio_configs(disks)
+
+    if args.logging:
+        for d in disks:
+            d["diag_static"] = collect_static_info(d)
 
     # Проверка наличия fio
     try:

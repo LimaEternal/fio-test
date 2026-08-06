@@ -531,5 +531,307 @@ class MainIncrementalReportTests(unittest.TestCase):
         self.assertGreaterEqual(order.count("report"), 2)
 
 
+class ParseDiskSelectionArgsTests(unittest.TestCase):
+    """-a/--add и -d/--delete: парсинг, интерактив и взаимное исключение."""
+
+    def test_add_parses_numbers(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a", "1", "2", "3"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.add, [1, 2, 3])
+        self.assertIsNone(args.delete)
+
+    def test_add_long_form(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "--add", "1", "3"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.add, [1, 3])
+
+    def test_delete_parses_numbers(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-d", "4", "5"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.delete, [4, 5])
+        self.assertIsNone(args.add)
+
+    def test_add_range_expands(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a", "1-3"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.add, [1, 2, 3])
+
+    def test_add_mixed_numbers_and_ranges(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a", "1-3", "5"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.add, [1, 2, 3, 5])
+
+    def test_delete_range_expands(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-d", "2-4", "6"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.delete, [2, 3, 4, 6])
+
+    def test_add_descending_range(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a", "3-1"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.add, [3, 2, 1])
+
+    def test_invalid_token_exits(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a", "1-x"]):
+            with self.assertRaises(SystemExit):
+                fio_test.parse_args()
+
+    def test_bare_add_yields_empty_list(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.add, [])
+
+    def test_defaults_are_none(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py"]):
+            args = fio_test.parse_args()
+        self.assertIsNone(args.add)
+        self.assertIsNone(args.delete)
+
+    def test_add_and_delete_are_mutually_exclusive(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a", "1", "-d", "2"]):
+            with self.assertRaises(SystemExit):
+                fio_test.parse_args()
+
+
+class ExpandTokenTests(unittest.TestCase):
+    def test_single_number(self):
+        self.assertEqual(fio_test._expand_token("5"), [5])
+
+    def test_ascending_range(self):
+        self.assertEqual(fio_test._expand_token("1-3"), [1, 2, 3])
+
+    def test_descending_range(self):
+        self.assertEqual(fio_test._expand_token("3-1"), [3, 2, 1])
+
+    def test_single_element_range(self):
+        self.assertEqual(fio_test._expand_token("2-2"), [2])
+
+    def test_invalid_token_raises(self):
+        with self.assertRaises(ValueError):
+            fio_test._expand_token("1-x")
+
+    def test_empty_token_raises(self):
+        with self.assertRaises(ValueError):
+            fio_test._expand_token("")
+
+
+class ParseDiskNumbersTests(unittest.TestCase):
+    def test_numbers_split_on_spaces(self):
+        self.assertEqual(fio_test.parse_disk_numbers(" 1  2  3 "), [1, 2, 3])
+
+    def test_single_number(self):
+        self.assertEqual(fio_test.parse_disk_numbers("5"), [5])
+
+    def test_empty_string(self):
+        self.assertEqual(fio_test.parse_disk_numbers(""), [])
+
+    def test_whitespace_only(self):
+        self.assertEqual(fio_test.parse_disk_numbers("   "), [])
+
+    def test_range_expands(self):
+        self.assertEqual(fio_test.parse_disk_numbers("1-3"), [1, 2, 3])
+
+    def test_numbers_and_ranges_mix(self):
+        self.assertEqual(fio_test.parse_disk_numbers("1-3 5"), [1, 2, 3, 5])
+
+    def test_descending_range(self):
+        self.assertEqual(fio_test.parse_disk_numbers("3-1"), [3, 2, 1])
+
+    def test_invalid_token_raises(self):
+        with self.assertRaises(ValueError):
+            fio_test.parse_disk_numbers("1-x 3")
+
+
+class InputDiskNumbersTests(unittest.TestCase):
+    def test_reads_numbers_from_stdin(self):
+        with mock.patch("builtins.input", return_value=" 1  2 "):
+            self.assertEqual(fio_test._input_disk_numbers("prompt: "), [1, 2])
+
+    def test_reads_ranges_from_stdin(self):
+        with mock.patch("builtins.input", return_value="1-3 5"):
+            self.assertEqual(fio_test._input_disk_numbers("prompt: "), [1, 2, 3, 5])
+
+    def test_empty_input_returns_empty_list(self):
+        with mock.patch("builtins.input", return_value=""):
+            self.assertEqual(fio_test._input_disk_numbers("prompt: "), [])
+
+    def test_invalid_input_reprompts(self):
+        answers = iter(["1-x", "3-1 5"])
+        with mock.patch("builtins.input", side_effect=lambda *a: next(answers)), \
+             mock.patch.object(fio_test, "console"):
+            self.assertEqual(fio_test._input_disk_numbers("prompt: "), [3, 2, 1, 5])
+
+    def test_eof_aborts(self):
+        with mock.patch("builtins.input", side_effect=EOFError), \
+             mock.patch.object(fio_test, "console"):
+            with self.assertRaises(SystemExit):
+                fio_test._input_disk_numbers("prompt: ")
+
+
+class ApplyDiskSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.disks = fio_test.build_fake_disks()
+        self.names = [d["name"] for d in self.disks]
+
+    def _args(self, add=None, delete=None):
+        args = mock.Mock()
+        args.add = add
+        args.delete = delete
+        return args
+
+    def test_add_keeps_only_selected(self):
+        result = fio_test.apply_disk_selection(self.disks, self._args(add=[1, 3]))
+        self.assertEqual([d["name"] for d in result], ["nvme0n1", "sda"])
+
+    def test_delete_removes_selected(self):
+        result = fio_test.apply_disk_selection(self.disks, self._args(delete=[2, 4]))
+        self.assertEqual([d["name"] for d in result], ["nvme0n1", "sda", "sdc"])
+
+    def test_add_with_all_numbers_keeps_all(self):
+        result = fio_test.apply_disk_selection(self.disks, self._args(add=[1, 2, 3, 4, 5]))
+        self.assertEqual([d["name"] for d in result], self.names)
+
+    def test_delete_with_all_numbers_keeps_none(self):
+        result = fio_test.apply_disk_selection(self.disks, self._args(delete=[1, 2, 3, 4, 5]))
+        self.assertEqual(result, [])
+
+    def test_no_flags_returns_unchanged(self):
+        result = fio_test.apply_disk_selection(self.disks, self._args())
+        self.assertEqual([d["name"] for d in result], self.names)
+
+    def test_empty_add_yields_no_disks(self):
+        result = fio_test.apply_disk_selection(self.disks, self._args(add=[]))
+        self.assertEqual(result, [])
+
+    def test_empty_delete_keeps_all_disks(self):
+        result = fio_test.apply_disk_selection(self.disks, self._args(delete=[]))
+        self.assertEqual([d["name"] for d in result], self.names)
+
+    def test_out_of_range_number_exits(self):
+        with mock.patch.object(fio_test, "console"):
+            with self.assertRaises(SystemExit):
+                fio_test.apply_disk_selection(self.disks, self._args(add=[1, 99]))
+
+
+class MainDiskSelectionTests(unittest.TestCase):
+    """Выбор дисков через -a/-d должен доходить до run_disk_tests."""
+
+    def _run_main(self, argv, disks):
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
+             mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(fio_test, "SystemTuner"), \
+             mock.patch.object(fio_test.sys, "argv", argv), \
+             mock.patch.object(fio_test, "_default_report_path",
+                               return_value=Path("reports") / "t.md"), \
+             mock.patch.object(fio_test, "run_disk_tests") as fake_runner:
+            fio_test.main()
+        return fake_runner
+
+    def _three_disks(self):
+        return [dict(DISK, name=f"nvme{i}n1", slot=f"nvme{i}") for i in range(3)]
+
+    def test_add_selects_subset_of_disks(self):
+        disks = self._three_disks()
+        runner = self._run_main(["fio-test.py", "-a", "1", "3"], disks)
+
+        self.assertEqual(runner.call_count, 2)
+        tested = sorted(disk["name"] for call in runner.call_args_list
+                        for _, disk, _, _ in [call.args])
+        self.assertEqual(tested, ["nvme0n1", "nvme2n1"])
+
+    def test_delete_excludes_disk(self):
+        disks = self._three_disks()
+        runner = self._run_main(["fio-test.py", "-d", "2"], disks)
+
+        self.assertEqual(runner.call_count, 2)
+        tested = sorted(disk["name"] for call in runner.call_args_list
+                        for _, disk, _, _ in [call.args])
+        self.assertEqual(tested, ["nvme0n1", "nvme2n1"])
+
+    def test_add_range_selects_disks(self):
+        disks = self._three_disks()
+        runner = self._run_main(["fio-test.py", "-a", "1-3"], disks)
+
+        self.assertEqual(runner.call_count, 3)
+        tested = sorted(disk["name"] for call in runner.call_args_list
+                        for _, disk, _, _ in [call.args])
+        self.assertEqual(tested, ["nvme0n1", "nvme1n1", "nvme2n1"])
+
+    def test_add_prompt_fills_numbers(self):
+        disks = self._three_disks()
+        with mock.patch("builtins.input", return_value="2"):
+            runner = self._run_main(["fio-test.py", "-a"], disks)
+
+        self.assertEqual(runner.call_count, 1)
+        _, disk, _, _ = runner.call_args.args
+        self.assertEqual(disk["name"], "nvme1n1")
+
+    def test_add_empty_prompt_exits_without_running(self):
+        disks = self._three_disks()
+        runner = mock.MagicMock()
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+             mock.patch.object(fio_test, "console"), \
+             mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a"]), \
+             mock.patch("builtins.input", return_value=""), \
+             mock.patch.object(fio_test, "run_disk_tests", runner):
+            with self.assertRaises(SystemExit) as cm:
+                fio_test.main()
+        self.assertEqual(cm.exception.code, 0)
+        runner.assert_not_called()
+
+    def test_delete_all_disks_exits_without_running(self):
+        disks = self._three_disks()
+        runner = mock.MagicMock()
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+             mock.patch.object(fio_test, "console"), \
+             mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-d", "1", "2", "3"]), \
+             mock.patch.object(fio_test, "run_disk_tests", runner):
+            with self.assertRaises(SystemExit) as cm:
+                fio_test.main()
+        self.assertEqual(cm.exception.code, 0)
+        runner.assert_not_called()
+
+
+class TestModeDiskSelectionTests(unittest.TestCase):
+    """В тестовом режиме -a/-d фильтруют фейковые диски."""
+
+    def _run(self, argv):
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [])), \
+             mock.patch.object(fio_test, "build_results_table", return_value=None) as fake_table, \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
+             mock.patch.object(fio_test.sys, "argv", argv):
+            fio_test.main()
+        disks, _, _ = fake_table.call_args.args
+        return [d["name"] for d in disks]
+
+    def test_add_filters_fake_disks(self):
+        self.assertEqual(
+            self._run(["fio-test.py", "-t", "-a", "1", "3"]),
+            ["nvme0n1", "sda"],
+        )
+
+    def test_delete_filters_fake_disks(self):
+        self.assertEqual(
+            self._run(["fio-test.py", "-t", "-d", "2", "4"]),
+            ["nvme0n1", "sda", "sdc"],
+        )
+
+    def test_no_selection_keeps_all_fake_disks(self):
+        names = [d["name"] for d in fio_test.build_fake_disks()]
+        self.assertEqual(self._run(["fio-test.py", "-t"]), names)
+
+    def test_delete_all_fake_disks_exits(self):
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [])), \
+             mock.patch.object(fio_test, "console"), \
+             mock.patch.object(fio_test.sys, "argv",
+                               ["fio-test.py", "-t", "-d", "1", "2", "3", "4", "5"]):
+            with self.assertRaises(SystemExit) as cm:
+                fio_test.main()
+        self.assertEqual(cm.exception.code, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
