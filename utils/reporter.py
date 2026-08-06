@@ -306,7 +306,7 @@ def generate_report(
 
                     iod = res.get("iodepth", "—")
                     io_kb = res.get("io_kb")
-                    gb = _fmt(io_kb / 1024 / 1024, ".1f") if io_kb else "—"
+                    gb = _fmt(io_kb / 1e6, ".1f") if io_kb else "—"
 
                     lines.append(
                         f"| {test_name} | {cpu} | {link} | {tmax} | "

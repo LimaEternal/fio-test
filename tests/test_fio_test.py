@@ -91,7 +91,7 @@ class ParseFioResultTests(unittest.TestCase):
         res = fio_test._parse_fio_result("seq_read", raw)
 
         self.assertEqual(res["iops"], 500000)
-        self.assertAlmostEqual(res["bw_mb"], 1500000000 / (1024 * 1024), places=1)
+        self.assertAlmostEqual(res["bw_mb"], 1500000000 / 1e6, places=1)
         self.assertAlmostEqual(res["lat_avg"], 0.1, places=3)
         self.assertAlmostEqual(res["lat_p99"], 0.12, places=3)
         self.assertEqual(res["cpu_user"], 10.5)

@@ -566,7 +566,7 @@ def _parse_fio_result(test_id, stdout):
     bw_bytes = mode.get("bw_bytes", 0)
     lat = mode.get("lat_ns") or {}
     lat_avg = lat.get("mean", 0) / 1e6
-    bw_mb = bw_bytes / (1024 * 1024)
+    bw_mb = bw_bytes / 1_000_000
 
     # Перцентили по умолчанию fio пишет в clat_ns (clat_percentiles=1,
     # lat_percentiles=0); при lat_percentiles=1 — в lat_ns. Пробуем оба.
