@@ -17,6 +17,18 @@ def _strip_rich(text: str) -> str:
     return re.sub(r"\[.*?\]", "", text)
 
 
+def _fmt_duration(sec) -> str:
+    """Форматирует длительность в человекочитаемый вид (часы/минуты/секунды)."""
+    sec = int(round(float(sec)))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} ч {m:02d} мин"
+    if m:
+        return f"{m} мин {s:02d} с"
+    return f"{s} с"
+
+
 TEST_NAMES = {
     "seq_read": "1. Послед. Чтение",
     "seq_write": "2. Послед. Запись",
@@ -234,7 +246,11 @@ def generate_report(
         lines.append("")
 
         for idx, (disk, disk_results) in enumerate(zip(disks, results), 1):
-            lines.append(f"### {idx}. /dev/{disk['name']} ({disk['model']})")
+            header = f"### {idx}. /dev/{disk['name']} ({disk['model']})"
+            wall = disk_results.get("_wall_s") if disk_results else None
+            if wall:
+                header += f" — тесты: {_fmt_duration(wall)}"
+            lines.append(header)
             lines.append("")
             if show_lat_p99:
                 lines.append(

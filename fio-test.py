@@ -33,9 +33,19 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    ProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.text import Text
 
 from utils.diagnostics import DiagnosticSampler, collect_static_info
 from utils.fio_config import parse_fio_jobfile
@@ -300,7 +310,7 @@ def apply_disk_selection(disks: list, args) -> list:
     return [d for i, d in enumerate(disks, 1) if i not in selected]
 
 
-def _build_run_info(args) -> dict:
+def _build_run_info(args, prefill_duration=None, tests_duration=None) -> dict:
     """Собирает мета-информацию о запуске для секции «Параметры запуска» отчёта."""
     mode = "последовательный" if args.sequential else "параллельный"
     flags = [
@@ -313,6 +323,10 @@ def _build_run_info(args) -> dict:
             f"{args.runtime} сек" if args.runtime is not None else "по конфигу (.fio)",
         ),
     ]
+    if prefill_duration is not None:
+        flags.append(("Время предзаполнения", _fmt_duration(prefill_duration)))
+    if tests_duration is not None:
+        flags.append(("Время тестов", _fmt_duration(tests_duration)))
     if args.add is not None:
         flags.append(("Выбор дисков (--add)", ", ".join(str(n) for n in args.add)))
     if args.delete is not None:
@@ -604,6 +618,7 @@ def _parse_fio_result(test_id, stdout):
 
     res["io_kb"] = int(mode.get("io_kbytes", 0))
     res["iodepth"] = _max_iodepth(job.get("iodepth_level") or {})
+    res["elapsed_s"] = round(float(job.get("elapsed") or 0), 1)
 
     return res
 
@@ -788,29 +803,53 @@ def _fmt_bytes(n: float) -> str:
     return f"{value:.1f}ПБ"
 
 
-def _monitor_prefill(disk_info: dict, stop_event: threading.Event) -> None:
-    """Периодически печатает прогресс заполнения диска (через sysfs-статистику)."""
-    name = disk_info["name"]
-    stat_path = Path(f"/sys/block/{name}/stat")
-    size_path = Path(f"/sys/block/{name}/size")
+def _fmt_duration(sec: float) -> str:
+    """Форматирует длительность в человекочитаемый вид (часы/минуты/секунды)."""
+    sec = int(round(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} ч {m:02d} мин"
+    if m:
+        return f"{m} мин {s:02d} с"
+    return f"{s} с"
+
+
+class _BytesColumn(ProgressColumn):
+    """Колонка прогрессбара: записано из общего объёма диска."""
+
+    def render(self, task):
+        return Text(f"({_fmt_bytes(task.completed)} из {_fmt_bytes(task.total)})")
+
+
+def _disk_total_bytes(name: str):
+    """Полный объём диска в байтах из /sys/block/<name>/size."""
     try:
-        total_sectors = int(size_path.read_text(encoding="utf-8").strip())
-        baseline = _written_sectors(stat_path)
-    except Exception:
-        return
-    if total_sectors <= 0 or baseline is None:
-        return
-    total_bytes = total_sectors * 512
-    while not stop_event.wait(5):
-        current = _written_sectors(stat_path)
-        if current is None:
-            continue
-        written = (current - baseline) * 512
-        pct = min(100.0, written / total_bytes * 100)
-        console.print(
-            f"  [dim]Заполнение /dev/{name}: {pct:.0f}% "
-            f"({_fmt_bytes(written)} из {_fmt_bytes(total_bytes)})[/dim]"
+        sectors = int(
+            Path(f"/sys/block/{name}/size").read_text(encoding="utf-8").strip()
         )
+        return sectors * 512
+    except Exception:
+        return None
+
+
+def _disk_iostats(name: str):
+    """Текущее значение /sys/block/<name>/queue/iostats ('0'/'1') или None."""
+    try:
+        return Path(f"/sys/block/{name}/queue/iostats").read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+
+def _set_disk_iostats(name: str, value: str) -> bool:
+    """Задаёт учёт статистики блочного слоя (queue/iostats) для диска."""
+    try:
+        Path(f"/sys/block/{name}/queue/iostats").write_text(
+            f"{value}\n", encoding="utf-8"
+        )
+        return True
+    except Exception:
+        return False
 
 
 def run_prefill(disk_info, cancel_event=None, tuner=None):
@@ -818,8 +857,7 @@ def run_prefill(disk_info, cancel_event=None, tuner=None):
 
     Запись идёт одним потоком с глубиной очереди 32 (iodepth=32) — близко
     к насыщению последовательной записи NVMe. Если известен NUMA-узел диска,
-    fio пинится к его CPU (--cpus_allowed). Параллельно с записью выводится
-    прогресс заполнения (проценты от объёма). Возвращает True при успехе.
+    fio пинится к его CPU (--cpus_allowed). Возвращает True при успехе.
     """
     disk_path = disk_info["path"]
     cmd = [
@@ -842,23 +880,14 @@ def run_prefill(disk_info, cancel_event=None, tuner=None):
         if numa_cpus:
             cmd.extend(["--cpus_allowed", numa_cpus])
 
-    stop_progress = threading.Event()
-    monitor = threading.Thread(
-        target=_monitor_prefill, args=(disk_info, stop_progress), daemon=True
-    )
-    monitor.start()
     try:
-        try:
-            result = _run_io_process(cmd, cancel_event)
-        except FileNotFoundError:
-            return False
-        if result is None:
-            return False
-        proc, _, _ = result
-        return proc.returncode == 0
-    finally:
-        stop_progress.set()
-        monitor.join(timeout=1)
+        result = _run_io_process(cmd, cancel_event)
+    except FileNotFoundError:
+        return False
+    if result is None:
+        return False
+    proc, _, _ = result
+    return proc.returncode == 0
 
 
 def prefill_disks(disks, tuner=None, cancel_event=None):
@@ -866,6 +895,10 @@ def prefill_disks(disks, tuner=None, cancel_event=None):
 
     Уже заполненные диски (маркер в reports/prefill_state.json) пропускаются;
     перезапись происходит только при смене диска или изменении объёма.
+    Прогресс показывается Rich-прогрессбаром (проценты, объём, секундомер, ETA)
+    по каждому диску; на время заполнения включается учёт статистики блочного
+    слоя (iostats), чтобы счётчик записанного в /sys/block/<name>/stat рос.
+    Возвращает длительность этапа в секундах (0, если заполнять было нечего).
     """
     state = _load_prefill_state()
     to_fill = []
@@ -875,34 +908,90 @@ def prefill_disks(disks, tuner=None, cancel_event=None):
         else:
             console.print(f"  [dim]пропуск (уже заполнен)[/dim] /dev/{d['name']}")
 
+    phase_start = time.monotonic()
     if not to_fill:
-        return
+        return 0.0
+
+    iostats_prev = {}
+    for d in to_fill:
+        name = d["name"]
+        prev = _disk_iostats(name)
+        if prev is not None:
+            iostats_prev[name] = prev
+        if prev == "0" and not _set_disk_iostats(name, "1"):
+            console.print(
+                f"  [yellow]не удалось включить iostats для /dev/{name} — "
+                f"прогресс заполнения будет недоступен[/yellow]"
+            )
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     future_map = {}
+    starts = {}
+    finished = []
     try:
-        for d in to_fill:
-            console.print(f"  Заполнение /dev/{d['name']}...")
-            fut = pool.submit(run_prefill, d, cancel_event=cancel_event, tuner=tuner)
-            future_map[fut] = d
+        with Progress(
+            TextColumn("[bold]{task.description}[/bold]"),
+            BarColumn(),
+            TextColumn("{task.percentage:>3.0f}%"),
+            _BytesColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task_ids = {}
+            baselines = {}
+            for d in to_fill:
+                name = d["name"]
+                total = _disk_total_bytes(name) or 1
+                baselines[name] = (
+                    _written_sectors(Path(f"/sys/block/{name}/stat")) or 0
+                )
+                task_ids[name] = progress.add_task(
+                    f"Заполнение /dev/{name}", total=total, completed=0
+                )
+                starts[name] = time.monotonic()
+                future_map[
+                    pool.submit(
+                        run_prefill, d, cancel_event=cancel_event, tuner=tuner
+                    )
+                ] = d
 
-        for fut in concurrent.futures.as_completed(future_map):
-            d = future_map[fut]
-            try:
-                ok = fut.result()
-            except Exception as exc:
-                console.print(f"  [red]Ошибка[/red] /dev/{d['name']}: {exc}")
-                continue
-            if ok:
-                state[d["serial"]] = {
-                    "model": d.get("model", ""),
-                    "size": d.get("size"),
-                    "name": d["name"],
-                    "filled_at": datetime.now().isoformat(timespec="seconds"),
-                }
-                console.print(f"  [green]Готово[/green] /dev/{d['name']}")
-            else:
-                console.print(f"  [red]Ошибка[/red] /dev/{d['name']}")
+            pending = set(future_map)
+            while pending:
+                for fut in list(pending):
+                    if fut.done():
+                        pending.discard(fut)
+                        d = future_map[fut]
+                        name = d["name"]
+                        dur = time.monotonic() - starts[name]
+                        try:
+                            ok = fut.result()
+                        except Exception as exc:
+                            finished.append((d, False, dur, str(exc)))
+                        else:
+                            finished.append((d, ok, dur))
+                        if ok:
+                            state[d["serial"]] = {
+                                "model": d.get("model", ""),
+                                "size": d.get("size"),
+                                "name": d["name"],
+                                "filled_at": datetime.now().isoformat(
+                                    timespec="seconds"
+                                ),
+                            }
+                if not pending:
+                    break
+                for d in to_fill:
+                    name = d["name"]
+                    total = _disk_total_bytes(name) or 1
+                    written = _written_sectors(Path(f"/sys/block/{name}/stat"))
+                    if written is None:
+                        done = 0
+                    else:
+                        done = min(total, max(0, (written - baselines[name]) * 512))
+                    progress.update(task_ids[name], completed=done)
+                time.sleep(1)
     except KeyboardInterrupt:
         if cancel_event:
             cancel_event.set()
@@ -910,7 +999,23 @@ def prefill_disks(disks, tuner=None, cancel_event=None):
         sys.exit(130)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+        for name, prev in iostats_prev.items():
+            _set_disk_iostats(name, prev)
         _save_prefill_state(state)
+
+    phase_dur = time.monotonic() - phase_start
+    for d, ok, dur, *err in finished:
+        if ok:
+            console.print(
+                f"  [green]Готово[/green] /dev/{d['name']} (за {_fmt_duration(dur)})"
+            )
+        else:
+            msg = f"  [red]Ошибка[/red] /dev/{d['name']}"
+            if err and err[0]:
+                msg += f": {err[0]}"
+            console.print(msg)
+    console.print(f"[bold]Предзаполнение заняло {_fmt_duration(phase_dur)}[/bold]")
+    return phase_dur
 
 
 def optimize_nvme_args(test_id, args_list, pcie_info):
@@ -1008,7 +1113,9 @@ def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=
 
     После каждого завершённого теста в report_queue кладётся маркер — фоновый
     writer-поток перегенерирует MD-отчёт по мере поступления данных.
+    В results[disk_idx] сохраняется длительность всех тестов диска (_wall_s).
     """
+    start = time.monotonic()
     for t, fio_args in plan:
         res = run_fio_test(
             disk, t, fio_args, cancel_event=cancel_event, diag_store=diag_store,
@@ -1017,6 +1124,11 @@ def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=
         process_task_result(results, disk_idx, disk, t, fio_args, res, state_lock=state_lock)
         if report_queue is not None:
             report_queue.put(disk_idx)
+    duration = time.monotonic() - start
+    results[disk_idx]["_wall_s"] = duration
+    console.print(
+        f"  Диск /dev/{disk['name']}: тесты заняли {_fmt_duration(duration)}"
+    )
 
 
 REPORT_TICK = 2  # секунды между записями живых сэмплов в отчёт
@@ -1315,9 +1427,10 @@ def main():
         writer.start()
 
     # Предварительное заполнение
+    prefill_duration = None
     if args.prefill:
         console.print("\n[bold]Предварительное заполнение...[/bold]")
-        prefill_disks(disks, tuner=tuner, cancel_event=cancel_event)
+        prefill_duration = prefill_disks(disks, tuner=tuner, cancel_event=cancel_event)
 
     if args.runtime is not None:
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")
@@ -1359,6 +1472,7 @@ def main():
         disk_plans.append((disk_idx, disk, plan))
 
     # Запуск тестов
+    tests_start = time.monotonic()
     try:
         if args.sequential:
             try:
@@ -1404,11 +1518,19 @@ def main():
         if writer is not None:
             report_queue.put(_STOP)
             writer.join(timeout=5)
+        tests_duration = time.monotonic() - tests_start
+        console.print(f"\n[bold]Тесты заняли {_fmt_duration(tests_duration)}[/bold]")
         # Финальная запись — либо итоговый отчёт, либо best-effort при сбое.
         try:
             report_path = _write_report(
                 disks, results, diag_store, live_store, state_lock, output_path,
-                tuner, TEST_NAMES, _build_run_info(args), fio_configs,
+                tuner, TEST_NAMES,
+                _build_run_info(
+                    args,
+                    prefill_duration=prefill_duration,
+                    tests_duration=tests_duration,
+                ),
+                fio_configs,
                 show_lat_p99=args.logging,
             )
         except Exception as exc:

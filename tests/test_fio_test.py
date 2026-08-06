@@ -43,7 +43,7 @@ class RunDiskTestsTests(unittest.TestCase):
 
         self.assertEqual(call_log, NVME_TEST_IDS)
         self.assertEqual(
-            set(results[0]) - {"_thresholds"}, set(NVME_TEST_IDS)
+            set(results[0]) - {"_thresholds", "_wall_s"}, set(NVME_TEST_IDS)
         )
 
     def test_error_result_does_not_break_following_tests(self):
@@ -938,6 +938,123 @@ class PrefillTests(unittest.TestCase):
             fio_test.prefill_disks([d1, d2])
 
         self.assertEqual(set(saved), {"S1"})
+
+    def test_prefill_disks_returns_phase_duration(self):
+        d1 = dict(DISK, name="nvme0n1", serial="S1")
+
+        def fake_prefill(disk, cancel_event=None, tuner=None):
+            return True
+
+        with mock.patch.object(fio_test, "_load_prefill_state", return_value={}), \
+             mock.patch.object(fio_test, "_save_prefill_state"), \
+             mock.patch.object(fio_test, "run_prefill", side_effect=fake_prefill):
+            dur = fio_test.prefill_disks([d1])
+
+        self.assertIsInstance(dur, float)
+        self.assertGreaterEqual(dur, 0)
+
+    def test_prefill_disks_returns_zero_when_nothing_to_fill(self):
+        d1 = dict(DISK, name="nvme0n1", serial="S1")
+        state = {"S1": {"model": "M", "size": "3.2T", "name": "nvme0n1"}}
+
+        with mock.patch.object(fio_test, "_load_prefill_state", return_value=state), \
+             mock.patch.object(fio_test, "_save_prefill_state"):
+            dur = fio_test.prefill_disks([d1])
+
+        self.assertEqual(dur, 0.0)
+
+    def test_prefill_disks_enables_and_restores_iostats(self):
+        d1 = dict(DISK, name="nvme0n1", serial="S1")
+        writes = []
+
+        def fake_iostats(name):
+            return "0"
+
+        def fake_set(name, value):
+            writes.append((name, value))
+            return True
+
+        def fake_prefill(disk, cancel_event=None, tuner=None):
+            return True
+
+        with mock.patch.object(fio_test, "_load_prefill_state", return_value={}), \
+             mock.patch.object(fio_test, "_save_prefill_state"), \
+             mock.patch.object(fio_test, "run_prefill", side_effect=fake_prefill), \
+             mock.patch.object(fio_test, "_disk_iostats", side_effect=fake_iostats), \
+             mock.patch.object(fio_test, "_set_disk_iostats", side_effect=fake_set):
+            fio_test.prefill_disks([d1])
+
+        self.assertEqual(writes, [("nvme0n1", "1"), ("nvme0n1", "0")])
+
+
+class DurationTests(unittest.TestCase):
+    def test_fmt_duration_seconds(self):
+        self.assertEqual(fio_test._fmt_duration(42), "42 с")
+
+    def test_fmt_duration_minutes(self):
+        self.assertEqual(fio_test._fmt_duration(125), "2 мин 05 с")
+
+    def test_fmt_duration_hours(self):
+        self.assertEqual(fio_test._fmt_duration(3725), "1 ч 02 мин")
+
+    def test_fmt_duration_rounds(self):
+        self.assertEqual(fio_test._fmt_duration(42.4), "42 с")
+
+    def test_elapsed_parsed_from_job(self):
+        raw = json.dumps({
+            "jobs": [{
+                "read": {"bw_bytes": 1000, "iops": 1},
+                "elapsed": 120,
+            }]
+        })
+        res = fio_test._parse_fio_result("seq_read", raw)
+        self.assertEqual(res["elapsed_s"], 120.0)
+
+    def test_elapsed_missing_defaults_zero(self):
+        raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1, "iops": 1}}]})
+        res = fio_test._parse_fio_result("seq_read", raw)
+        self.assertEqual(res["elapsed_s"], 0.0)
+
+
+class BuildRunInfoTimingTests(unittest.TestCase):
+    def test_durations_appear_in_flags(self):
+        args = mock.Mock()
+        args.sequential = False
+        args.prefill = True
+        args.logging = False
+        args.no_tune = False
+        args.runtime = 60
+        args.add = None
+        args.delete = None
+        args.threshold_nvme = None
+        args.threshold_sas = None
+        args.threshold_sata = None
+        args.output = None
+        info = fio_test._build_run_info(
+            args, prefill_duration=125, tests_duration=3725
+        )
+        flags = dict(info["flags"])
+        self.assertEqual(flags["Время предзаполнения"], "2 мин 05 с")
+        self.assertEqual(flags["Время тестов"], "1 ч 02 мин")
+
+    def test_no_durations_no_extra_flags(self):
+        args = mock.Mock()
+        args.sequential = False
+        args.prefill = False
+        args.logging = False
+        args.no_tune = True
+        args.runtime = None
+        args.add = None
+        args.delete = None
+        args.threshold_nvme = None
+        args.threshold_sas = None
+        args.threshold_sata = None
+        args.output = None
+        info = fio_test._build_run_info(args)
+        self.assertEqual(
+            dict(info["flags"]).get("Время предзаполнения"), None
+        )
+        self.assertEqual(dict(info["flags"]).get("Время тестов"), None)
 
 
 if __name__ == "__main__":
