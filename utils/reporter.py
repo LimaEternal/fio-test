@@ -225,6 +225,7 @@ def generate_report(
                 res.get("diag")
                 for disk_results in results
                 for res in disk_results.values()
+                if isinstance(res, dict)
             )
         )
 

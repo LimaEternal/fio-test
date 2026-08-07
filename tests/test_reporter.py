@@ -194,6 +194,28 @@ class GenerateReportDiagStoreTests(unittest.TestCase):
         self.assertNotIn("| NUMA |", text)
         self.assertIn("## Результаты тестирования", text)
 
+    def test_report_survives_wall_s_float_in_results(self):
+        results = [
+            {
+                "_thresholds": {},
+                "_wall_s": 302.0,
+                "seq_read": {
+                    "iops": 44050, "bw_mb": 5773.8, "lat_avg": 0.73,
+                    "lat_p99": 1.2, "cpu_user": 2.0, "cpu_sys": 16.0,
+                    "status": "ok",
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], results, TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("## Результаты тестирования", text)
+        self.assertIn("— тесты: 5 мин 02 с", text)
+
 
 class GenerateReportRunInfoTests(unittest.TestCase):
     def test_report_contains_run_info_command_and_flags(self):
