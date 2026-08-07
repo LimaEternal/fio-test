@@ -294,10 +294,10 @@ def apply_disk_selection(disks: list, args) -> list:
     valid = set(range(1, len(disks) + 1))
     invalid = sorted(set(numbers) - valid)
     if invalid:
+        hint = "доступен номер 1" if len(disks) == 1 else f"доступны номера 1..{len(disks)}"
         console.print(
             f"[bold red]ОШИБКА:[/bold red] неверные номера дисков: "
-            f"{', '.join(str(n) for n in invalid)} "
-            f"(доступны номера 1..{len(disks)})"
+            f"{', '.join(str(n) for n in invalid)} ({hint})"
         )
         sys.exit(1)
 

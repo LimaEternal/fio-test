@@ -833,6 +833,22 @@ class ApplyDiskSelectionTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 fio_test.apply_disk_selection(self.disks, self._args(add=[1, 99]))
 
+    def test_out_of_range_message_single_disk(self):
+        one = [dict(self.disks[0])]
+        with mock.patch.object(fio_test, "console") as fake_console:
+            with self.assertRaises(SystemExit):
+                fio_test.apply_disk_selection(one, self._args(add=[2]))
+        text = " ".join(str(c) for c in fake_console.print.call_args.args)
+        self.assertIn("доступен номер 1", text)
+        self.assertNotIn("1..1", text)
+
+    def test_out_of_range_message_multi_disk(self):
+        with mock.patch.object(fio_test, "console") as fake_console:
+            with self.assertRaises(SystemExit):
+                fio_test.apply_disk_selection(self.disks, self._args(add=[99]))
+        text = " ".join(str(c) for c in fake_console.print.call_args.args)
+        self.assertIn("доступны номера 1..5", text)
+
 
 class MainDiskSelectionTests(unittest.TestCase):
     """Выбор дисков через -a/-d должен доходить до run_disk_tests."""
