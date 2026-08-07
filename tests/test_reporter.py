@@ -203,7 +203,6 @@ class GenerateReportRunInfoTests(unittest.TestCase):
                 ("Режим", "последовательный"),
                 ("Подробные логи", "включены"),
                 ("Длительность теста", "60 сек"),
-                ("Данные на дисках", "диски уже залиты данными"),
             ],
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,7 +218,6 @@ class GenerateReportRunInfoTests(unittest.TestCase):
         self.assertIn("| Параметр | Значение |", text)
         self.assertIn("| Режим | последовательный |", text)
         self.assertIn("| Длительность теста | 60 сек |", text)
-        self.assertIn("| Данные на дисках | диски уже залиты данными |", text)
 
     def test_report_without_run_info_has_no_params_section(self):
         with tempfile.TemporaryDirectory() as tmp:

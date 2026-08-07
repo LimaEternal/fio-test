@@ -70,6 +70,53 @@ class RunDiskTestsTests(unittest.TestCase):
         self.assertIn("seq_write", results[0])
 
 
+class TestProgressConsoleTests(unittest.TestCase):
+    """Консольный прогресс тестов (строки «Готово ...») — только в режиме -l."""
+
+    RESULT = {"iops": 1000000, "bw_mb": 5800.4, "lat_avg": 0.82, "lat_p99": 1.6}
+
+    def _run(self, diag_store):
+        plan = [(t, ["--rw=read"]) for t in NVME_TEST_IDS]
+        results = [{"_thresholds": {}}]
+        printed = []
+
+        def fake_console_print(*args, **kwargs):
+            printed.append(args[0] if args else kwargs.get("text", ""))
+
+        def fake_run(disk, test_id, fio_args, cancel_event=None, diag_store=None,
+                     tuner=None, state_lock=None, live_store=None):
+            return dict(self.RESULT)
+
+        with mock.patch.object(fio_test, "run_fio_test", side_effect=fake_run), \
+             mock.patch.object(fio_test, "console") as fake_console:
+            fake_console.print.side_effect = fake_console_print
+            fio_test.run_disk_tests(0, DISK, plan, results, diag_store=diag_store)
+        return printed
+
+    def test_logging_mode_prints_done_line_per_test(self):
+        printed = self._run(diag_store={})
+        done = [p for p in printed if "Готово" in str(p)]
+        self.assertEqual(len(done), len(NVME_TEST_IDS))
+
+    def test_non_logging_mode_prints_no_done_lines(self):
+        printed = self._run(diag_store=None)
+        self.assertFalse(any("Готово" in str(p) for p in printed))
+
+    def test_format_test_done_contains_metrics(self):
+        res = dict(self.RESULT, status="PASS")
+        line = fio_test._format_test_done(DISK, "seq_read", res)
+        self.assertIn("Готово /dev/nvme0n1", line)
+        self.assertIn("Послед. чтение", line)
+        self.assertIn("1,000,000 IOPS", line)
+        self.assertIn("5800.4 МБ/с", line)
+        self.assertIn("0.82 мс", line)
+        self.assertIn("PASS", line)
+
+    def test_format_test_done_fail_status(self):
+        res = dict(self.RESULT, status="FAIL")
+        self.assertIn("FAIL", fio_test._format_test_done(DISK, "seq_read", res))
+
+
 class ParseFioResultTests(unittest.TestCase):
     def test_deep_fields_parsed_from_fio_json(self):
         raw = json.dumps({
@@ -277,57 +324,6 @@ class MainParallelModeTests(unittest.TestCase):
         self.assertFalse(report_kwargs.get("show_lat_p99"))
         self.assertIsNotNone(report_kwargs.get("run_info"))
         self.assertIsNotNone(report_kwargs.get("fio_configs"))
-
-
-class MainDataStateTests(unittest.TestCase):
-    """Без префилла main должен читать диски и сообщать о заполненности."""
-
-    def test_data_state_detected_and_reported(self):
-        disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
-             mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
-             mock.patch.object(fio_test, "build_results_table", return_value=None), \
-             mock.patch.object(fio_test.subprocess, "run",
-                               return_value=mock.Mock(returncode=0)), \
-             mock.patch.object(fio_test, "SystemTuner"), \
-             mock.patch.object(fio_test.sys, "argv", ["fio-test.py"]), \
-             mock.patch.object(fio_test, "_default_report_path",
-                               return_value=Path("reports") / "t.md"), \
-             mock.patch.object(fio_test, "disk_has_data", return_value=True), \
-             mock.patch.object(fio_test, "run_disk_tests") as fake_runner:
-            fio_test.main()
-
-        self.assertEqual(fake_runner.call_count, 1)
-        self.assertEqual(disks[0]["_has_data"], True)
-        _, report_kwargs = fake_report.call_args
-        flags = dict(report_kwargs["run_info"]["flags"])
-        self.assertIn("Данные на дисках", flags)
-        self.assertIn(
-            "диски уже залиты данными", flags["Данные на дисках"]
-        )
-
-    def test_prefill_mode_skips_data_state_detection(self):
-        disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
-             mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
-             mock.patch.object(fio_test, "build_results_table", return_value=None), \
-             mock.patch.object(fio_test.subprocess, "run",
-                               return_value=mock.Mock(returncode=0)), \
-             mock.patch.object(fio_test, "SystemTuner"), \
-             mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-p"]), \
-             mock.patch.object(fio_test, "_default_report_path",
-                               return_value=Path("reports") / "t.md"), \
-             mock.patch.object(fio_test, "prefill_disks", return_value=100.0), \
-             mock.patch.object(fio_test, "disk_has_data") as detect, \
-             mock.patch.object(fio_test, "run_disk_tests"):
-            fio_test.main()
-
-        detect.assert_not_called()
-        self.assertNotIn("_has_data", disks[0])
-        _, report_kwargs = fake_report.call_args
-        self.assertNotIn(
-            "Данные на дисках", dict(report_kwargs["run_info"]["flags"])
-        )
 
 
 class RunFioTestDiagStoreTests(unittest.TestCase):
@@ -1015,40 +1011,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
             dict(info["flags"]).get("Время предзаполнения"), None
         )
         self.assertEqual(dict(info["flags"]).get("Время тестов"), None)
-
-    def test_data_state_appears_in_flags(self):
-        args = mock.Mock()
-        args.sequential = False
-        args.prefill = False
-        args.logging = False
-        args.no_tune = False
-        args.runtime = None
-        args.add = None
-        args.delete = None
-        args.threshold_nvme = None
-        args.threshold_sas = None
-        args.threshold_sata = None
-        args.output = None
-        info = fio_test._build_run_info(args, data_state="диски залиты данными")
-        self.assertEqual(
-            dict(info["flags"])["Данные на дисках"], "диски залиты данными"
-        )
-
-    def test_data_state_absent_when_not_provided(self):
-        args = mock.Mock()
-        args.sequential = False
-        args.prefill = False
-        args.logging = False
-        args.no_tune = False
-        args.runtime = None
-        args.add = None
-        args.delete = None
-        args.threshold_nvme = None
-        args.threshold_sas = None
-        args.threshold_sata = None
-        args.output = None
-        info = fio_test._build_run_info(args)
-        self.assertNotIn("Данные на дисках", dict(info["flags"]))
 
 
 class OptimizeNvmeArgsTests(unittest.TestCase):
