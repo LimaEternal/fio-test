@@ -31,6 +31,7 @@ from rich.progress import (
 from rich.text import Text
 
 from utils.format import format_bw, format_bytes, format_duration
+from utils.process import SIGKILL, kill_process_tree
 
 console = Console(color_system=None, highlight=False)
 
@@ -122,14 +123,12 @@ def _extract_prefill_stats(status: dict):
 
 
 def _kill_tree(proc) -> None:
-    """Завершает процесс вместе с группой (setsid), чтобы не осталось зомби."""
-    try:
-        os.killpg(os.getpgid(proc.pid), 9)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+    """Завершает процесс вместе с группой (setsid), чтобы не осталось зомби.
+
+    Обёртка над utils.process.kill_process_tree с SIGKILL: при стагне/отмене
+    fio должен умереть немедленно, без ожидания graceful-завершения.
+    """
+    kill_process_tree(proc, sig=SIGKILL)
 
 
 def _extract_fio_statuses(text):

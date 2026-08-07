@@ -26,10 +26,8 @@ fio-test.py — Автоматический бенчмаркинг несист
 import argparse
 import concurrent.futures
 import json
-import os
 from pathlib import Path
 import queue
-import signal
 import subprocess
 import sys
 import threading
@@ -42,6 +40,7 @@ from utils.diagnostics import DiagnosticSampler, collect_static_info
 from utils.format import format_duration
 from utils.fio_config import parse_fio_jobfile
 from utils.prefill import prefill_disks
+from utils.process import kill_process_tree, run_process
 from utils.reporter import generate_report
 from utils.scanner import scan_disks
 from utils.table_renderer import build_results_table
@@ -85,6 +84,11 @@ TEST_NAMES = {}
 for _tests in INTERFACE_CONFIGS.values():
     for _tid in _tests:
         TEST_NAMES[_tid] = FRIENDLY_TEST_NAMES.get(_tid, _tid)
+
+# Отношение p99 к среднему, выше которого перцентиль считается мусором.
+# На fio-3.28 c fixedbufs/sqthread_poll встречался clat p99 ~17 с при
+# avg < 10 мс (недостоверная гистограмма) — такие значения не выводим.
+P99_RELIABILITY_FACTOR = 500
 
 
 _SHORT_FLAGS = {"c", "s", "p", "t", "l", "n"}
@@ -478,43 +482,29 @@ def validate_configs():
                 sys.exit(1)
 
 
-def _kill_process_group(proc):
-    """Отправляет SIGTERM всей группе процессов."""
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except OSError:
-        pass
-
-
 def _run_io_process(cmd, cancel_event):
-    """Запускает процесс и ждёт завершения.
+    """Запускает процесс и ждёт завершения (обёртка над utils.process.run_process).
 
     Возвращает (proc, stdout, stderr) либо None при отмене или ошибке запуска.
     FileNotFoundError пробрасывается наверх для точной диагностики.
     """
-    proc = None
+    return run_process(cmd, cancel_event)
+
+
+def _save_raw_fio_output(disk_name: str, test_id: str, stdout: str) -> None:
+    """Сохраняет сырой stdout fio в reports/raw/ для диагностики метрик.
+
+    Нужно для расследования аномальных значений (например, недостоверных
+    перцентилей clat): по сохранённому JSON можно увидеть, что именно отдал
+    fio, не перезапуская тесты.
+    """
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
-        while proc.poll() is None:
-            if cancel_event and cancel_event.is_set():
-                _kill_process_group(proc)
-                proc.wait()
-                return None
-            try:
-                proc.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                continue
-        stdout, stderr = proc.communicate()
-        return proc, stdout, stderr
-    except FileNotFoundError:
-        raise
-    except Exception:
-        if proc and proc.poll() is None:
-            _kill_process_group(proc)
-        return None
+        raw_dir = Path("reports") / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        path = raw_dir / f"fio-{disk_name}-{test_id}-{int(time.time())}.json"
+        path.write_text(stdout, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _max_iodepth(iodepth_level: dict):
@@ -605,6 +595,13 @@ def _parse_fio_result(test_id, stdout):
         if val:
             res[f"clat_{key}_ms"] = round(val / 1e6, 3)
 
+    # Контроль достоверности перцентилей: p99, в сотни раз превышающий
+    # среднее, физически невозможен для стабильного теста. Такие значения
+    # помечаются, чтобы отчёт показал "—" вместо вводящих в заблуждение цифр.
+    res["lat_p99_unreliable"] = bool(
+        lat_p99 and lat_avg and lat_p99 > lat_avg * P99_RELIABILITY_FACTOR
+    )
+
     slat = mode.get("slat_ns") or {}
     if slat.get("mean"):
         res["slat_avg_ms"] = round(slat["mean"] / 1e6, 4)
@@ -691,6 +688,10 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
                 proc, stdout, stderr = result
                 stdout = stdout.decode() if stdout else ""
                 stderr = stderr.decode() if stderr else ""
+                # Сырой JSON сохраняем в диагностическом режиме (-l): по нему
+                # можно разобрать аномальные метрики без повторного прогона.
+                if diag_store is not None and stdout.strip():
+                    _save_raw_fio_output(disk_info["name"], test_id, stdout)
                 if proc.returncode != 0:
                     hint = stderr.strip()[:500] if stderr else "нет вывода stderr"
                     res = {"error": f"fio завершился с кодом {proc.returncode}: {hint}"}
@@ -740,6 +741,26 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     return res
 
 
+# Переопределения аргументов fio по поколению PCIe: что нужно насытить, чтобы
+# раскрыть линк. Единая таблица для Gen4/Gen5 — у Gen5 выше ёмкость линка,
+# поэтому глубже очереди и крупнее блок для seq_read; seq_write одинаков
+# (упирается в возможности контроллера, а не в линк).
+_NVME_OVERRIDES = {
+    4: {
+        "seq_read": {"--numjobs": 2, "--iodepth": 16},
+        "seq_write": {"--numjobs": 2, "--iodepth": 16},
+        "rand_read": {"--numjobs": 8, "--iodepth": 32},
+        "rand_write": {"--numjobs": 8, "--iodepth": 32},
+    },
+    5: {
+        "seq_read": {"--numjobs": 4, "--iodepth": 16, "--bs": "256k"},
+        "seq_write": {"--numjobs": 2, "--iodepth": 16},
+        "rand_read": {"--numjobs": 16, "--iodepth": 16},
+        "rand_write": {"--numjobs": 8, "--iodepth": 16},
+    },
+}
+
+
 def optimize_nvme_args(test_id, args_list, pcie_info):
     """Оптимизирует аргументы fio для NVMe в зависимости от поколения PCIe."""
     if not pcie_info:
@@ -768,29 +789,8 @@ def optimize_nvme_args(test_id, args_list, pcie_info):
         return new_args
 
     new_args = list(args_list)
-
-    if gen >= 5:
-        if test_id == "seq_read":
-            new_args = set_arg(new_args, "--numjobs", 4)
-            new_args = set_arg(new_args, "--iodepth", 16)
-            new_args = set_arg(new_args, "--bs", "256k")
-        elif test_id == "seq_write":
-            new_args = set_arg(new_args, "--numjobs", 2)
-            new_args = set_arg(new_args, "--iodepth", 16)
-        elif test_id == "rand_read":
-            new_args = set_arg(new_args, "--numjobs", 16)
-            new_args = set_arg(new_args, "--iodepth", 16)
-        elif test_id == "rand_write":
-            new_args = set_arg(new_args, "--numjobs", 8)
-            new_args = set_arg(new_args, "--iodepth", 16)
-    elif gen == 4:
-        if test_id == "seq_read":
-            new_args = set_arg(new_args, "--numjobs", 2)
-            new_args = set_arg(new_args, "--iodepth", 16)
-        elif test_id == "rand_read":
-            new_args = set_arg(new_args, "--numjobs", 8)
-            new_args = set_arg(new_args, "--iodepth", 32)
-
+    for key, value in (_NVME_OVERRIDES.get(gen, {}).get(test_id) or {}).items():
+        new_args = set_arg(new_args, key, value)
     return new_args
 
 
@@ -815,7 +815,11 @@ def process_task_result(results, idx, disk, t, fio_args, res, state_lock=None):
         )
         return
 
-    thresholds = results[idx].get("_thresholds", {})
+    if state_lock is not None:
+        with state_lock:
+            thresholds = results[idx].get("_thresholds", {})
+    else:
+        thresholds = results[idx].get("_thresholds", {})
     status = check_threshold(t, res, thresholds)
     res["status"] = status
     res["bs"] = bs
@@ -847,7 +851,11 @@ def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=
         if report_queue is not None:
             report_queue.put(disk_idx)
     duration = time.monotonic() - start
-    results[disk_idx]["_wall_s"] = duration
+    if state_lock is not None:
+        with state_lock:
+            results[disk_idx]["_wall_s"] = duration
+    else:
+        results[disk_idx]["_wall_s"] = duration
     console.print(
         f"  Диск /dev/{disk['name']}: тесты заняли {format_duration(duration)}"
     )
@@ -881,8 +889,10 @@ def _snapshot_state(results, diag_store, live_store, state_lock):
             for disk, tests in diag_store.items():
                 diag_snap[disk] = dict(tests)
             for disk, entry in (live_store or {}).items():
+                # Копия списка: сэмплер ещё аппендится во время идущего теста,
+                # а рендер итерирует снимок в фоновом потоке.
                 diag_snap.setdefault(disk, {})[entry["test_id"]] = {
-                    "samples": entry["samples"],
+                    "samples": list(entry["samples"]),
                     "summary": {},
                 }
     return results_snap, diag_snap

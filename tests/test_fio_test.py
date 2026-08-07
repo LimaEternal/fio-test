@@ -1,6 +1,7 @@
 import json
 import queue
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -152,6 +153,42 @@ class ParseFioResultTests(unittest.TestCase):
         res = fio_test._parse_fio_result("seq_write", raw)
         self.assertEqual(res["iops"], 10)
 
+    def test_p99_flagged_unreliable_when_far_above_avg(self):
+        # Мусорный clat p99 ~17 с при avg ~0.6 мс (случай из реального отчёта).
+        raw = json.dumps({
+            "jobs": [{
+                "read": {
+                    "bw_bytes": 1000, "iops": 1,
+                    "lat_ns": {"mean": 600000},
+                    "clat_ns": {"percentile": {
+                        "99.000000": 17112760000, "99.900000": 17112760000}},
+                },
+            }]
+        })
+        res = fio_test._parse_fio_result("seq_read", raw)
+        self.assertTrue(res["lat_p99_unreliable"])
+
+    def test_p99_reliable_when_within_sane_range(self):
+        raw = json.dumps({
+            "jobs": [{
+                "read": {
+                    "bw_bytes": 1000, "iops": 1,
+                    "lat_ns": {"mean": 100000},
+                    "clat_ns": {"percentile": {"99.000000": 400000}},
+                },
+            }]
+        })
+        res = fio_test._parse_fio_result("seq_read", raw)
+        self.assertFalse(res["lat_p99_unreliable"])
+
+    def test_p99_not_flagged_when_avg_missing(self):
+        raw = json.dumps({
+            "jobs": [{"read": {"bw_bytes": 1000, "iops": 1,
+                                "clat_ns": {"percentile": {"99.000000": 17112760000}}}}]
+        })
+        res = fio_test._parse_fio_result("seq_read", raw)
+        self.assertFalse(res["lat_p99_unreliable"])
+
     def test_bad_json_returns_error(self):
         res = fio_test._parse_fio_result("seq_read", "not json {{{")
         self.assertIn("error", res)
@@ -280,6 +317,43 @@ class RunFioTestDiagStoreTests(unittest.TestCase):
         self.assertEqual(
             diag_store["nvme0n1"]["seq_read"]["summary"]["temp_max_c"], 41.0
         )
+
+    def test_raw_fio_json_saved_in_diag_mode(self):
+        raw_text = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})
+        fake = (mock.Mock(returncode=0), raw_text.encode(), b"")
+        with tempfile.TemporaryDirectory() as tmp:
+            real_path = Path(tmp)
+
+            def fake_path(p):
+                return real_path / p
+
+            with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
+                 mock.patch.object(fio_test, "DiagnosticSampler") as fake_sampler_cls, \
+                 mock.patch.object(fio_test, "Path", side_effect=fake_path):
+                fake_sampler = fake_sampler_cls.return_value
+                fake_sampler.samples = []
+                fake_sampler.summary.return_value = {
+                    "samples": 0, "sources": {"link": True, "temp": True},
+                    "load_source": None,
+                }
+                fio_test.run_fio_test(
+                    DISK, "seq_read", ["--rw=read"], diag_store={}
+                )
+
+            files = list((real_path / "reports" / "raw").glob("fio-*.json"))
+            self.assertEqual(len(files), 1)
+            self.assertIn("nvme0n1", files[0].name)
+            self.assertIn("seq_read", files[0].name)
+            self.assertEqual(files[0].read_text(encoding="utf-8"), raw_text)
+
+    def test_raw_fio_json_not_saved_without_diag_store(self):
+        raw_text = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})
+        fake = (mock.Mock(returncode=0), raw_text.encode(), b"")
+        with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
+             mock.patch.object(fio_test, "_save_raw_fio_output") as saver, \
+             mock.patch.object(fio_test, "DiagnosticSampler"):
+            fio_test.run_fio_test(DISK, "seq_read", ["--rw=read"])
+        saver.assert_not_called()
 
     def test_no_diag_store_means_no_sampler(self):
         raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})
@@ -890,6 +964,68 @@ class BuildRunInfoTimingTests(unittest.TestCase):
             dict(info["flags"]).get("Время предзаполнения"), None
         )
         self.assertEqual(dict(info["flags"]).get("Время тестов"), None)
+
+
+class OptimizeNvmeArgsTests(unittest.TestCase):
+    """Единая таблица переопределений для Gen4/Gen5 (включая seq_write)."""
+
+    def _args(self, numjobs=None, iodepth=None, bs=None):
+        out = ["--rw=read", "--bs=128k", "--iodepth=64", "--numjobs=4"]
+        if numjobs is not None:
+            out[3] = f"--numjobs={numjobs}"
+        if iodepth is not None:
+            out[2] = f"--iodepth={iodepth}"
+        if bs is not None:
+            out[1] = f"--bs={bs}"
+        return out
+
+    def test_gen4_seq_write_overridden_like_gen5(self):
+        args = fio_test.optimize_nvme_args(
+            "seq_write", self._args(), {"gen": 4, "width": 4}
+        )
+        self.assertIn("--numjobs=2", args)
+        self.assertIn("--iodepth=16", args)
+
+    def test_gen4_seq_read_overridden(self):
+        args = fio_test.optimize_nvme_args(
+            "seq_read", self._args(), {"gen": 4, "width": 4}
+        )
+        self.assertIn("--numjobs=2", args)
+        self.assertIn("--iodepth=16", args)
+
+    def test_gen4_rand_read_overridden(self):
+        args = fio_test.optimize_nvme_args(
+            "rand_read", self._args(), {"gen": 4, "width": 4}
+        )
+        self.assertIn("--numjobs=8", args)
+        self.assertIn("--iodepth=32", args)
+
+    def test_gen5_seq_read_overridden(self):
+        args = fio_test.optimize_nvme_args(
+            "seq_read", self._args(), {"gen": 5, "width": 4}
+        )
+        self.assertIn("--numjobs=4", args)
+        self.assertIn("--iodepth=16", args)
+        self.assertIn("--bs=256k", args)
+
+    def test_gen5_rand_read_overridden(self):
+        args = fio_test.optimize_nvme_args(
+            "rand_read", self._args(), {"gen": 5, "width": 4}
+        )
+        self.assertIn("--numjobs=16", args)
+        self.assertIn("--iodepth=16", args)
+
+    def test_no_pcie_info_returns_unchanged(self):
+        args = self._args()
+        self.assertEqual(
+            fio_test.optimize_nvme_args("seq_read", args, None), args
+        )
+
+    def test_gen_without_overrides_returns_unchanged(self):
+        args = self._args()
+        self.assertEqual(
+            fio_test.optimize_nvme_args("seq_read", args, {"gen": 3}), args
+        )
 
 
 if __name__ == "__main__":

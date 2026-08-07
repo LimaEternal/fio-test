@@ -39,6 +39,14 @@ def _render_source_notes(disk_results: dict, test_names: dict) -> List[str]:
         res = disk_results.get(test_id) or {}
         diag = res.get("diag") or {}
 
+        if res.get("lat_p99_unreliable"):
+            note = (f"перцентили задержек по {test_names.get(test_id, test_id)} "
+                    "недостоверны (clat p99 на порядки выше среднего — мусор от fio), "
+                    "в таблицах показано '—'; сырой JSON в reports/raw/")
+            if note not in seen:
+                seen.add(note)
+                out.append(f"> {note}")
+
         for note in diag.get("notes") or []:
             if note not in seen:
                 seen.add(note)
@@ -75,11 +83,19 @@ def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_name
         if not samples:
             continue
 
+        # Когда нагрузка приходит из fio-логов, строки без неё — это ramp-период
+        # (fio ещё не пишет лог) и секунды до старта теста. Их пропускаем, чтобы
+        # таблица начиналась с реальной нагрузки. Если логов нет вовсе
+        # (load_source не "fio"), показываем все строки: там только линк/температура.
+        load_from_fio = (entry.get("summary") or {}).get("load_source") == "fio"
+
         lines.append(f"**Сэмплы линка/температуры/нагрузки — {test_name}**")
         lines.append("")
         lines.append("| Сек | Линк | t°C | Чтение МБ/с | Запись МБ/с | IOPS |")
         lines.append("|-----|------|-----|-------------|-------------|------|")
         for i, s in enumerate(samples, 1):
+            if load_from_fio and s.get("read_mbs") is None and s.get("write_mbs") is None:
+                continue
             link = "—"
             if s.get("gts") is not None:
                 link = f"{s['gts']:g} GT/s x{s.get('width') or '?'}"
@@ -92,6 +108,47 @@ def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_name
             )
         lines.append("")
 
+    return lines
+
+
+def _render_summary(disks: List[dict], results: List[dict], test_names: dict) -> List[str]:
+    """Сводная таблица: статус и ключевая метрика по каждому тесту и диску.
+
+    Для последовательных тестов — скорость (МБ/с), для случайных — IOPS.
+    Позволяет оценить все диски одним взглядом.
+    """
+    lines = ["## Сводка", ""]
+
+    def metric(test_id, res):
+        if test_id.startswith("seq_"):
+            bw = res.get("bw_mb")
+            return f"{_fmt(bw, '.0f')} МБ/с" if bw else ""
+        if test_id.startswith("rand_"):
+            iops = res.get("iops")
+            if not iops:
+                return ""
+            if iops >= 1_000_000:
+                return f"{_fmt(iops / 1e6, ',.2f')}M IOPS"
+            return f"{_fmt(iops / 1e3, ',.0f')}k IOPS"
+        return ""
+
+    header = ["Диск", "Модель"] + [test_names.get(t, t) for t in test_names]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("|" + "---|" * len(header))
+
+    for disk, disk_results in zip(disks, results):
+        row = [f"/dev/{disk['name']}", disk["model"]]
+        for test_id in test_names:
+            res = (disk_results or {}).get(test_id, {})
+            if "error" in res:
+                row.append("FAIL")
+                continue
+            status = res.get("status", "FAIL")
+            m = metric(test_id, res)
+            row.append(f"{status} {m}" if m else status)
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines.append("")
     return lines
 
 
@@ -273,7 +330,10 @@ def generate_report(
                         _fmt(res.get("lat_avg", 0), ".2f"),
                     ]
                     if show_lat_p99:
-                        cells.append(_fmt(res.get("lat_p99", 0), ".2f"))
+                        if res.get("lat_p99_unreliable"):
+                            cells.append("—")
+                        else:
+                            cells.append(_fmt(res.get("lat_p99", 0), ".2f"))
                     cells.append(res.get("status", "FAIL"))
                 lines.append("| " + " | ".join(cells) + " |")
 
@@ -305,9 +365,12 @@ def generate_report(
 
                     tmax = _fmt(diag["temp_max_c"], ".1f") if diag.get("temp_max_c") is not None else "—"
 
-                    p99 = res.get("clat_p99_ms", "—")
-                    p999 = res.get("clat_p99_9_ms", "—")
-                    clat = f"{p99} / {p999}" if p99 != "—" else "—"
+                    if res.get("lat_p99_unreliable"):
+                        clat = "—"
+                    else:
+                        p99 = res.get("clat_p99_ms", "—")
+                        p999 = res.get("clat_p99_9_ms", "—")
+                        clat = f"{p99} / {p999}" if p99 != "—" else "—"
 
                     iod = res.get("iodepth", "—")
                     io_kb = res.get("io_kb")
@@ -320,6 +383,8 @@ def generate_report(
                 lines.append("")
                 lines.extend(_render_source_notes(disk_results, test_names))
                 lines.extend(_render_sampler_tables(diag_store, disk["name"], test_names))
+
+        lines.extend(_render_summary(disks, results, test_names))
 
         lines.append("---")
         lines.append("*Отчёт сгенерирован автоматически*")

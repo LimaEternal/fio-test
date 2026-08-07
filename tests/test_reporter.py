@@ -142,6 +142,30 @@ class RenderSourceNotesTests(unittest.TestCase):
         lines = _render_source_notes(disk_results, TEST_NAMES)
         self.assertEqual(lines.count("> линк PCIe не удалось прочитать"), 1)
 
+    def test_note_when_p99_unreliable(self):
+        disk_results = {
+            "_thresholds": {},
+            "seq_read": {
+                "iops": 1, "bw_mb": 1, "lat_avg": 0.6, "lat_p99": 17112.76,
+                "lat_p99_unreliable": True,
+                "cpu_user": 0, "cpu_sys": 0, "status": "ok",
+            },
+        }
+        lines = _render_source_notes(disk_results, TEST_NAMES)
+        text = "\n".join(lines)
+        self.assertIn("недостоверны", text)
+        self.assertIn("reports/raw", text)
+
+    def test_no_note_when_p99_reliable(self):
+        disk_results = {
+            "_thresholds": {},
+            "seq_read": {
+                "iops": 1, "bw_mb": 1, "lat_avg": 0.6, "lat_p99": 1.83,
+                "cpu_user": 0, "cpu_sys": 0, "status": "ok",
+            },
+        }
+        self.assertEqual(_render_source_notes(disk_results, TEST_NAMES), [])
+
 
 class GenerateReportDiagStoreTests(unittest.TestCase):
     def test_report_contains_sampler_tables_with_diag_store(self):
@@ -257,6 +281,95 @@ class GenerateReportLatP99Tests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
 
         self.assertNotIn("Lat P99 (мс)", text)
+
+    def test_unreliable_p99_rendered_as_dash_and_noted(self):
+        res = make_results()[0]
+        res["seq_read"]["lat_p99"] = 17112.76
+        res["seq_read"]["lat_avg"] = 0.6
+        res["seq_read"]["lat_p99_unreliable"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], [res], TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+                show_lat_p99=True,
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("17112.76", text)
+        self.assertIn("недостоверны", text)
+
+
+class RenderSamplerTablesRampTests(unittest.TestCase):
+    def test_ramp_rows_without_load_skipped_when_fio_source(self):
+        samples = [
+            {"ts": 1.0, "gts": 32.0, "width": 4, "temp": 40.0,
+             "read_mbs": None, "write_mbs": None, "iops": None},
+            {"ts": 2.0, "gts": 32.0, "width": 4, "temp": 40.0,
+             "read_mbs": 12400.5, "write_mbs": 0.0, "iops": 47694},
+        ]
+        store = {
+            "nvme1n1": {
+                "seq_read": {
+                    "samples": samples,
+                    "summary": {"load_source": "fio"},
+                }
+            }
+        }
+        lines = _render_sampler_tables(
+            store, "nvme1n1", {"seq_read": "1. Послед. Чтение"}
+        )
+        text = "\n".join(lines)
+        self.assertNotIn("| 1 | 32 GT/s x4 | 40.0 | — |", text)
+        self.assertIn("| 2 | 32 GT/s x4 | 40.0 | 12400.5 | 0.0 | 47,694 |", text)
+
+    def test_empty_rows_kept_when_no_fio_load_source(self):
+        samples = [{"ts": 1.0, "gts": 32.0, "width": 4, "temp": 40.0,
+                    "read_mbs": None, "write_mbs": None, "iops": None}]
+        store = {
+            "nvme1n1": {
+                "seq_read": {"samples": samples, "summary": {"load_source": None}},
+            }
+        }
+        lines = _render_sampler_tables(
+            store, "nvme1n1", {"seq_read": "1. Послед. Чтение"}
+        )
+        text = "\n".join(lines)
+        self.assertIn("| 1 | 32 GT/s x4 | 40.0 | — | — | — |", text)
+
+
+class RenderSummaryTests(unittest.TestCase):
+    def test_summary_renders_status_and_metric_per_disk(self):
+        results = [{
+            "_thresholds": {},
+            "seq_read": {"iops": 47694, "bw_mb": 12400.5, "status": "PASS"},
+            "seq_write": {"iops": 10000, "bw_mb": 3000.0, "status": "PASS"},
+            "rand_read": {"iops": 1000000, "bw_mb": 0, "status": "PASS"},
+            "rand_write": {"iops": 0, "bw_mb": 0, "status": "FAIL"},
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], results, TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("## Сводка", text)
+        self.assertIn("PASS 12400 МБ/с", text)
+        self.assertIn("PASS 1.00M IOPS", text)
+        self.assertIn("| FAIL |", text)
+
+    def test_summary_error_test_shown_as_fail(self):
+        results = [{"_thresholds": {}, "seq_read": {"error": "boom"}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], results, TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("## Сводка", text)
+        self.assertIn("| FAIL |", text)
 
 
 if __name__ == "__main__":

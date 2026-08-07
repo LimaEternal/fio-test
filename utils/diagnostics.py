@@ -120,13 +120,6 @@ def parse_fio_logs(prefix: str) -> Optional[dict]:
                 iops.setdefault(ts, {}).setdefault(ddir, 0.0)
                 iops[ts][ddir] += val
 
-    for kind in ("bw", "iops"):
-        for path in _log_files(prefix, kind):
-            try:
-                path.unlink()
-            except OSError:
-                pass
-
     if not bw:
         return None
 
@@ -148,6 +141,15 @@ def parse_fio_logs(prefix: str) -> Optional[dict]:
         for v in result.values():
             v["iops"] /= 1000.0
 
+    # Логи удаляем только после успешного парсинга: при ошибке они остаются
+    # на диске, чтобы их можно было разобрать вручную.
+    for kind in ("bw", "iops"):
+        for path in _log_files(prefix, kind):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     return result or None
 
 
@@ -166,6 +168,9 @@ class DiagnosticSampler:
         self.nvme_dev = _nvme_dev_name(self.name)
         self.link_dir = find_nvme_link_dir(self.name)
         self.samples = []
+        # Защита samples: поток-сэмплер аппендится, а основной поток читает
+        # (merge_fio_logs/summary/рендер отчёта).
+        self._lock = threading.Lock()
         # Какие источники реально отдали данные (для диагностики в отчёте).
         self.source_status = {"link": False, "temp": False}
         # Кэш температуры (см. TEMP_CACHE_SEC).
@@ -252,17 +257,18 @@ class DiagnosticSampler:
         if not data:
             return False
         matched = False
-        for s in self.samples:
-            ts = s.get("ts")
-            row = data.get(round(ts)) if ts is not None else None
-            if row is None:
-                continue
-            s["read_mbs"] = row["read_mbs"]
-            s["write_mbs"] = row["write_mbs"]
-            s["iops"] = row["iops"]
-            s["load_source"] = "fio"
-            if row["read_mbs"] > 0 or row["write_mbs"] > 0:
-                matched = True
+        with self._lock:
+            for s in self.samples:
+                ts = s.get("ts")
+                row = data.get(round(ts)) if ts is not None else None
+                if row is None:
+                    continue
+                s["read_mbs"] = row["read_mbs"]
+                s["write_mbs"] = row["write_mbs"]
+                s["iops"] = row["iops"]
+                s["load_source"] = "fio"
+                if row["read_mbs"] > 0 or row["write_mbs"] > 0:
+                    matched = True
         return matched
 
     # --- сэмплирование ---
@@ -276,15 +282,16 @@ class DiagnosticSampler:
         if temp is not None:
             self.source_status["temp"] = True
 
-        self.samples.append({
-            "ts": time.time(),
-            "gts": gts,
-            "width": width,
-            "temp": temp,
-            "read_mbs": None,
-            "write_mbs": None,
-            "iops": None,
-        })
+        with self._lock:
+            self.samples.append({
+                "ts": time.time(),
+                "gts": gts,
+                "width": width,
+                "temp": temp,
+                "read_mbs": None,
+                "write_mbs": None,
+                "iops": None,
+            })
 
     def run(self, stop_event: threading.Event):
         """Поток-сэмплер: опрашивает источники до установки stop_event."""
@@ -297,17 +304,19 @@ class DiagnosticSampler:
 
     def summary(self) -> dict:
         """Сводит собранные сэмплы в итоговый отчёт."""
-        gts_vals = [s["gts"] for s in self.samples if s["gts"] is not None]
-        width_vals = [s["width"] for s in self.samples if s["width"] is not None]
-        temps = [s["temp"] for s in self.samples if s["temp"] is not None]
-        reads = [s["read_mbs"] for s in self.samples
+        with self._lock:
+            samples = list(self.samples)
+        gts_vals = [s["gts"] for s in samples if s["gts"] is not None]
+        width_vals = [s["width"] for s in samples if s["width"] is not None]
+        temps = [s["temp"] for s in samples if s["temp"] is not None]
+        reads = [s["read_mbs"] for s in samples
                  if s["read_mbs"] is not None and s["read_mbs"] > 0]
-        writes = [s["write_mbs"] for s in self.samples
+        writes = [s["write_mbs"] for s in samples
                   if s["write_mbs"] is not None and s["write_mbs"] > 0]
-        iops_vals = [s["iops"] for s in self.samples
+        iops_vals = [s["iops"] for s in samples
                      if s["iops"] is not None and s["iops"] > 0]
 
-        load_source = "fio" if any(s.get("load_source") == "fio" for s in self.samples) else None
+        load_source = "fio" if any(s.get("load_source") == "fio" for s in samples) else None
 
         return {
             "link_gts_min": min(gts_vals) if gts_vals else None,
@@ -316,7 +325,7 @@ class DiagnosticSampler:
             "read_mbs_avg": round(sum(reads) / len(reads), 1) if reads else None,
             "write_mbs_avg": round(sum(writes) / len(writes), 1) if writes else None,
             "iops_avg": round(sum(iops_vals) / len(iops_vals)) if iops_vals else None,
-            "samples": len(self.samples),
+            "samples": len(samples),
             "sources": dict(self.source_status),
             "load_source": load_source,
         }
