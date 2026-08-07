@@ -39,7 +39,7 @@ from rich.console import Console
 from utils.diagnostics import DiagnosticSampler, collect_static_info
 from utils.format import format_duration
 from utils.fio_config import parse_fio_jobfile
-from utils.prefill import prefill_disks
+from utils.prefill import disk_has_data, prefill_disks, summarize_data_state
 from utils.process import kill_process_tree, run_process
 from utils.reporter import generate_report
 from utils.scanner import scan_disks
@@ -307,7 +307,8 @@ def apply_disk_selection(disks: list, args) -> list:
     return [d for i, d in enumerate(disks, 1) if i not in selected]
 
 
-def _build_run_info(args, prefill_duration=None, tests_duration=None) -> dict:
+def _build_run_info(args, prefill_duration=None, tests_duration=None,
+                    data_state=None) -> dict:
     """Собирает мета-информацию о запуске для секции «Параметры запуска» отчёта."""
     mode = "последовательный" if args.sequential else "параллельный"
     flags = [
@@ -320,6 +321,8 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None) -> dict:
             f"{args.runtime} сек" if args.runtime is not None else "по конфигу (.fio)",
         ),
     ]
+    if data_state is not None:
+        flags.append(("Данные на дисках", data_state))
     if prefill_duration is not None:
         flags.append(("Время предзаполнения", format_duration(prefill_duration)))
     if tests_duration is not None:
@@ -1075,6 +1078,20 @@ def main():
 
     fio_configs = _collect_fio_configs(disks)
 
+    # Состояние заполненности дисков (только при запуске без префилла): читаем
+    # сам диск, а не маркеры — после format/blkdiscard диск пуст, после записи
+    # (префилл, рабочие данные) содержит данные. Признак попадает в отчёт
+    # одной строкой в «Параметры запуска».
+    data_state = None
+    if not args.prefill:
+        states = []
+        for d in disks:
+            st = disk_has_data(d["name"])
+            d["_has_data"] = st
+            states.append((d["name"], st))
+        data_state = summarize_data_state(states)
+        console.print(f"\n[bold]Данные на дисках:[/bold] {data_state}")
+
     if args.logging:
         for d in disks:
             d["diag_static"] = collect_static_info(d)
@@ -1134,7 +1151,8 @@ def main():
     try:
         _write_report(
             disks, results, diag_store, live_store, state_lock, output_path,
-            tuner, TEST_NAMES, _build_run_info(args), fio_configs,
+            tuner, TEST_NAMES, _build_run_info(args, data_state=data_state),
+            fio_configs,
             show_lat_p99=args.logging,
         )
     except Exception as exc:
@@ -1148,7 +1166,8 @@ def main():
         def render_report():
             _write_report(
                 disks, results, diag_store, live_store, state_lock, output_path,
-                tuner, TEST_NAMES, _build_run_info(args), fio_configs,
+                tuner, TEST_NAMES, _build_run_info(args, data_state=data_state),
+                fio_configs,
                 show_lat_p99=args.logging,
             )
         writer = _ReportWriter(
@@ -1261,6 +1280,7 @@ def main():
                     args,
                     prefill_duration=prefill_duration,
                     tests_duration=tests_duration,
+                    data_state=data_state,
                 ),
                 fio_configs,
                 show_lat_p99=args.logging,

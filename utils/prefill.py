@@ -16,7 +16,6 @@ import select
 import subprocess
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -36,45 +35,9 @@ from utils.process import SIGKILL, kill_process_tree
 console = Console(color_system=None, highlight=False)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "prefill.fio"
-PREFILL_STATE_PATH = Path("reports") / "prefill_state.json"
 DEFAULT_IOENGINE = "io_uring"
 FALLBACK_IOENGINE = "psync"
 STALL_SECONDS = 8
-
-
-def _prefill_state_path() -> Path:
-    """Путь к файлу маркеров предварительного заполнения."""
-    return PREFILL_STATE_PATH
-
-
-def _load_prefill_state() -> dict:
-    """Читает маркеры предзаполнения {serial: {model, size, name, filled_at}}."""
-    try:
-        with _prefill_state_path().open(encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except (OSError, ValueError):
-        pass
-    return {}
-
-
-def _save_prefill_state(state: dict) -> None:
-    """Атомарно сохраняет маркеры предзаполнения (temp + rename)."""
-    path = _prefill_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-
-def _needs_prefill(disk: dict, state: dict) -> bool:
-    """True, если диск ещё не заполнен или изменился его объём."""
-    entry = state.get(disk.get("serial", ""))
-    if entry is None:
-        return True
-    return entry.get("size") != disk.get("size")
 
 
 def _load_prefill_config():
@@ -324,6 +287,81 @@ def _disk_total_bytes(name: str):
         return None
 
 
+def _read_at(fd, size, offset):
+    """Читает `size` байт с позиции `offset`.
+
+    На POSIX — os.pread (не сдвигает указатель файла), на Windows (где
+    os.pread отсутствует) — lseek + read. Тесты мокают именно эту функцию.
+    """
+    pread = getattr(os, "pread", None)
+    if pread is not None:
+        return pread(fd, size, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.read(fd, size)
+
+
+def disk_has_data(name: str, points: int = 5, chunk: int = 1024 * 1024):
+    """Проверяет по содержимому самого диска, есть ли на нём записанные данные.
+
+    NVMe после format/blkdiscard читается нулями, после записи (префилл,
+    рабочие данные) — содержит ненулевые данные. Читаем по `chunk` байт
+    (только чтение) в `points` точках диска: 0/25/50/75/100%.
+    Возвращает True (на диске есть данные), False (диск пуст — все точки
+    нулевые), None (проверить не удалось).
+    """
+    total = _disk_total_bytes(name)
+    if not total:
+        return None
+    try:
+        fd = os.open(f"/dev/{name}", os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        for frac in (i / (points - 1) for i in range(points)):
+            offset = min(int(total * frac), max(0, total - chunk))
+            buf = _read_at(fd, chunk, offset)
+            if any(buf):
+                return True
+        return False
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def summarize_data_state(states) -> str:
+    """Собирает одну сводную строку о заполненности дисков.
+
+    `states` — список пар (name, bool|None), где True — данные есть,
+    False — диск пуст, None — проверить не удалось.
+    """
+    filled = [name for name, st in states if st is True]
+    empty = [name for name, st in states if st is False]
+    unknown = [name for name, st in states if st is None]
+
+    if filled and not empty and not unknown:
+        return (
+            "диски уже залиты данными — результаты будут как в тесте "
+            "с предварительным заполнением"
+        )
+    if empty and not filled and not unknown:
+        return "диски пусты — цифры записи будут максимальными (чистый диск)"
+    if unknown and not filled and not empty:
+        return "не удалось проверить заполненность дисков"
+
+    parts = []
+    if filled:
+        parts.append("залиты: " + ", ".join(filled))
+    if empty:
+        parts.append("пусты: " + ", ".join(empty))
+    if unknown:
+        parts.append("не проверены: " + ", ".join(unknown))
+    return "состояние дисков неоднородно (" + "; ".join(parts) + ")"
+
+
 class _BytesColumn(ProgressColumn):
     """Колонка прогрессбара: записано из общего объёма диска."""
 
@@ -334,27 +372,17 @@ class _BytesColumn(ProgressColumn):
 
 
 def prefill_disks(disks, tuner=None, cancel_event=None):
-    """Предварительно заполняет все диски параллельно, с маркером пропуска.
+    """Принудительно предварительно заполняет все диски параллельно.
 
-    Уже заполненные диски (маркер в reports/prefill_state.json) пропускаются;
-    перезапись происходит только при смене диска или изменении объёма.
-    Прогресс — Rich-бар на диск (проценты, объём, скорость, секундомер, ETA);
-    данные приходят из живых статусов fio через коллбеки run_prefill.
-    Возвращает длительность этапа в секундах (0, если заполнять было нечего).
+    Заполняются все переданные диски принудительно (флаг -p означает всегда
+    полный префилл). Прогресс — Rich-бар на диск (проценты, объём, скорость,
+    секундомер, ETA); данные приходят из живых статусов fio через коллбеки
+    run_prefill.
+    Возвращает длительность этапа в секундах.
     """
-    state = _load_prefill_state()
-    to_fill = []
-    for d in disks:
-        if _needs_prefill(d, state):
-            to_fill.append(d)
-        else:
-            console.print(f"  [dim]пропуск (уже заполнен)[/dim] /dev/{d['name']}")
-
     phase_start = time.monotonic()
-    if not to_fill:
-        return 0.0
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(to_fill))
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(disks))
     future_map = {}
     starts = {}
     finished = []
@@ -372,7 +400,7 @@ def prefill_disks(disks, tuner=None, cancel_event=None):
             transient=True,
         ) as progress:
             task_ids = {}
-            for d in to_fill:
+            for d in disks:
                 name = d["name"]
                 total = _disk_total_bytes(name) or 1
                 task_ids[name] = progress.add_task(
@@ -416,15 +444,6 @@ def prefill_disks(disks, tuner=None, cancel_event=None):
                         finished.append((d, False, dur, str(exc)))
                     else:
                         finished.append((d, ok, dur))
-                    if ok:
-                        state[d["serial"]] = {
-                            "model": d.get("model", ""),
-                            "size": d.get("size"),
-                            "name": d["name"],
-                            "filled_at": datetime.now().isoformat(
-                                timespec="seconds"
-                            ),
-                        }
                 if pending:
                     time.sleep(0.2)
     except KeyboardInterrupt:
@@ -434,7 +453,6 @@ def prefill_disks(disks, tuner=None, cancel_event=None):
         sys_exit(130)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-        _save_prefill_state(state)
 
     phase_dur = time.monotonic() - phase_start
     for d, ok, dur, *err in finished:

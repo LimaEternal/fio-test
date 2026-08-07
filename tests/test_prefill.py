@@ -192,76 +192,19 @@ class RunPrefillTests(unittest.TestCase):
 
 
 class PrefillDisksTests(unittest.TestCase):
-    def test_prefill_disks_runs_all_and_saves_state(self):
+    def test_prefill_disks_runs_all_disks(self):
         d1 = dict(DISK, name="nvme0n1", serial="S1")
         d2 = dict(DISK, name="nvme1n1", serial="S2")
         calls = []
-        saved = {}
 
         def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None):
             calls.append(disk["name"])
             return True
 
-        with mock.patch.object(prefill, "_load_prefill_state", return_value={}), \
-             mock.patch.object(
-                 prefill, "_save_prefill_state",
-                 side_effect=lambda s: saved.update(s),
-             ), mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
+        with mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
             prefill.prefill_disks([d1, d2])
 
         self.assertEqual(sorted(calls), ["nvme0n1", "nvme1n1"])
-        self.assertEqual(set(saved), {"S1", "S2"})
-        self.assertEqual(saved["S1"]["size"], "3.2T")
-
-    def test_prefill_disks_skips_already_filled(self):
-        d1 = dict(DISK, name="nvme0n1", serial="S1")
-        d2 = dict(DISK, name="nvme1n1", serial="S2")
-        state = {"S1": {"model": "M", "size": "3.2T", "name": "nvme0n1"}}
-        calls = []
-
-        def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None):
-            calls.append(disk["name"])
-            return True
-
-        with mock.patch.object(prefill, "_load_prefill_state", return_value=state), \
-             mock.patch.object(prefill, "_save_prefill_state"), \
-             mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
-            prefill.prefill_disks([d1, d2])
-
-        self.assertEqual(calls, ["nvme1n1"])
-
-    def test_prefill_disks_refills_when_size_changed(self):
-        d1 = dict(DISK, name="nvme0n1", serial="S1")
-        state = {"S1": {"model": "M", "size": "1.0T", "name": "nvme0n1"}}
-        calls = []
-
-        def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None):
-            calls.append(disk["name"])
-            return True
-
-        with mock.patch.object(prefill, "_load_prefill_state", return_value=state), \
-             mock.patch.object(prefill, "_save_prefill_state"), \
-             mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
-            prefill.prefill_disks([d1])
-
-        self.assertEqual(calls, ["nvme0n1"])
-
-    def test_prefill_disks_failure_not_saved(self):
-        d1 = dict(DISK, name="nvme0n1", serial="S1")
-        d2 = dict(DISK, name="nvme1n1", serial="S2")
-        saved = {}
-
-        def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None):
-            return disk["name"] == "nvme0n1"
-
-        with mock.patch.object(prefill, "_load_prefill_state", return_value={}), \
-             mock.patch.object(
-                 prefill, "_save_prefill_state",
-                 side_effect=lambda s: saved.update(s),
-             ), mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
-            prefill.prefill_disks([d1, d2])
-
-        self.assertEqual(set(saved), {"S1"})
 
     def test_prefill_disks_returns_phase_duration(self):
         d1 = dict(DISK, name="nvme0n1", serial="S1")
@@ -269,23 +212,128 @@ class PrefillDisksTests(unittest.TestCase):
         def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None):
             return True
 
-        with mock.patch.object(prefill, "_load_prefill_state", return_value={}), \
-             mock.patch.object(prefill, "_save_prefill_state"), \
-             mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
+        with mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
             dur = prefill.prefill_disks([d1])
 
         self.assertIsInstance(dur, float)
         self.assertGreaterEqual(dur, 0)
 
-    def test_prefill_disks_returns_zero_when_nothing_to_fill(self):
-        d1 = dict(DISK, name="nvme0n1", serial="S1")
-        state = {"S1": {"model": "M", "size": "3.2T", "name": "nvme0n1"}}
 
-        with mock.patch.object(prefill, "_load_prefill_state", return_value=state), \
-             mock.patch.object(prefill, "_save_prefill_state"):
-            dur = prefill.prefill_disks([d1])
+class DiskHasDataTests(unittest.TestCase):
+    def _patch(self, size=10 * 1024 * 1024, chunks=None, open_error=False):
+        total = mock.patch.object(prefill, "_disk_total_bytes", return_value=size)
+        if open_error:
+            open_ = mock.patch.object(
+                prefill.os, "open", side_effect=OSError("no such device")
+            )
+        else:
+            open_ = mock.patch.object(prefill.os, "open", return_value=3)
+        if chunks is None:
+            chunks = [b"\x00" * (1024 * 1024)] * 5
+        read = mock.patch.object(prefill, "_read_at", side_effect=chunks)
+        close = mock.patch.object(prefill.os, "close")
+        total.start()
+        open_.start()
+        read.start()
+        close.start()
+        return total, open_, read, close
 
-        self.assertEqual(dur, 0.0)
+    def test_filled_disk_detected(self):
+        chunk = b"\x00" * (1024 * 1024 - 1) + b"\x01"
+        patches = self._patch(chunks=[chunk] + [b"\x00" * (1024 * 1024)] * 4)
+        try:
+            self.assertIs(prefill.disk_has_data("nvme0n1"), True)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_empty_disk_detected(self):
+        patches = self._patch()
+        try:
+            self.assertIs(prefill.disk_has_data("nvme0n1"), False)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_read_failure_returns_none(self):
+        patches = self._patch(chunks=OSError("read failed"))
+        try:
+            self.assertIsNone(prefill.disk_has_data("nvme0n1"))
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_open_failure_returns_none(self):
+        patches = self._patch(open_error=True)
+        try:
+            self.assertIsNone(prefill.disk_has_data("nvme0n1"))
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_unknown_size_returns_none(self):
+        with mock.patch.object(prefill, "_disk_total_bytes", return_value=None) as size:
+            self.assertIsNone(prefill.disk_has_data("nvme0n1"))
+        size.assert_called_once_with("nvme0n1")
+
+    def test_offsets_cover_disk_extent(self):
+        size = 10 * 1024 * 1024
+        calls = []
+        chunks = [b"\x00" * (1024 * 1024)] * 5
+        chunks[-1] = b"\x01" + b"\x00" * (1024 * 1024 - 1)
+
+        def fake_read_at(fd, n, offset):
+            calls.append(offset)
+            return chunks.pop(0)
+
+        patches = self._patch(size=size)
+        patches[2].stop()
+        read = mock.patch.object(prefill, "_read_at", side_effect=fake_read_at)
+        read.start()
+        try:
+            self.assertIs(prefill.disk_has_data("nvme0n1"), True)
+        finally:
+            read.stop()
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(calls, [0, size // 4, size // 2, size * 3 // 4, size - 1024 * 1024])
+
+
+class SummarizeDataStateTests(unittest.TestCase):
+    def test_all_filled(self):
+        summary = prefill.summarize_data_state(
+            [("nvme0n1", True), ("nvme1n1", True)]
+        )
+        self.assertEqual(
+            summary,
+            "диски уже залиты данными — результаты будут как в тесте "
+            "с предварительным заполнением",
+        )
+
+    def test_all_empty(self):
+        summary = prefill.summarize_data_state(
+            [("nvme0n1", False), ("nvme1n1", False)]
+        )
+        self.assertEqual(
+            summary, "диски пусты — цифры записи будут максимальными (чистый диск)"
+        )
+
+    def test_all_unknown(self):
+        summary = prefill.summarize_data_state(
+            [("nvme0n1", None), ("nvme1n1", None)]
+        )
+        self.assertEqual(summary, "не удалось проверить заполненность дисков")
+
+    def test_mixed(self):
+        summary = prefill.summarize_data_state(
+            [("nvme0n1", True), ("nvme1n1", False), ("nvme2n1", None)]
+        )
+        self.assertEqual(
+            summary,
+            "состояние дисков неоднородно (залиты: nvme0n1; пусты: nvme1n1; "
+            "не проверены: nvme2n1)",
+        )
 
 
 PRETTY_STATUS = (

@@ -279,6 +279,57 @@ class MainParallelModeTests(unittest.TestCase):
         self.assertIsNotNone(report_kwargs.get("fio_configs"))
 
 
+class MainDataStateTests(unittest.TestCase):
+    """Без префилла main должен читать диски и сообщать о заполненности."""
+
+    def test_data_state_detected_and_reported(self):
+        disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
+             mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(fio_test, "SystemTuner"), \
+             mock.patch.object(fio_test.sys, "argv", ["fio-test.py"]), \
+             mock.patch.object(fio_test, "_default_report_path",
+                               return_value=Path("reports") / "t.md"), \
+             mock.patch.object(fio_test, "disk_has_data", return_value=True), \
+             mock.patch.object(fio_test, "run_disk_tests") as fake_runner:
+            fio_test.main()
+
+        self.assertEqual(fake_runner.call_count, 1)
+        self.assertEqual(disks[0]["_has_data"], True)
+        _, report_kwargs = fake_report.call_args
+        flags = dict(report_kwargs["run_info"]["flags"])
+        self.assertIn("Данные на дисках", flags)
+        self.assertIn(
+            "диски уже залиты данными", flags["Данные на дисках"]
+        )
+
+    def test_prefill_mode_skips_data_state_detection(self):
+        disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
+             mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(fio_test, "SystemTuner"), \
+             mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-p"]), \
+             mock.patch.object(fio_test, "_default_report_path",
+                               return_value=Path("reports") / "t.md"), \
+             mock.patch.object(fio_test, "prefill_disks", return_value=100.0), \
+             mock.patch.object(fio_test, "disk_has_data") as detect, \
+             mock.patch.object(fio_test, "run_disk_tests"):
+            fio_test.main()
+
+        detect.assert_not_called()
+        self.assertNotIn("_has_data", disks[0])
+        _, report_kwargs = fake_report.call_args
+        self.assertNotIn(
+            "Данные на дисках", dict(report_kwargs["run_info"]["flags"])
+        )
+
+
 class RunFioTestDiagStoreTests(unittest.TestCase):
     """run_fio_test в диагностическом режиме заполняет diag_store сэмплами."""
 
@@ -964,6 +1015,40 @@ class BuildRunInfoTimingTests(unittest.TestCase):
             dict(info["flags"]).get("Время предзаполнения"), None
         )
         self.assertEqual(dict(info["flags"]).get("Время тестов"), None)
+
+    def test_data_state_appears_in_flags(self):
+        args = mock.Mock()
+        args.sequential = False
+        args.prefill = False
+        args.logging = False
+        args.no_tune = False
+        args.runtime = None
+        args.add = None
+        args.delete = None
+        args.threshold_nvme = None
+        args.threshold_sas = None
+        args.threshold_sata = None
+        args.output = None
+        info = fio_test._build_run_info(args, data_state="диски залиты данными")
+        self.assertEqual(
+            dict(info["flags"])["Данные на дисках"], "диски залиты данными"
+        )
+
+    def test_data_state_absent_when_not_provided(self):
+        args = mock.Mock()
+        args.sequential = False
+        args.prefill = False
+        args.logging = False
+        args.no_tune = False
+        args.runtime = None
+        args.add = None
+        args.delete = None
+        args.threshold_nvme = None
+        args.threshold_sas = None
+        args.threshold_sata = None
+        args.output = None
+        info = fio_test._build_run_info(args)
+        self.assertNotIn("Данные на дисках", dict(info["flags"]))
 
 
 class OptimizeNvmeArgsTests(unittest.TestCase):
