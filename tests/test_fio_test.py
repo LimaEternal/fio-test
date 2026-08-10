@@ -933,41 +933,99 @@ class MainDiskSelectionTests(unittest.TestCase):
 
 
 class TestModeDiskSelectionTests(unittest.TestCase):
-    """В тестовом режиме -a/-d фильтруют фейковые диски."""
+    """В тестовом режиме используются реальные диски из сканирования; -a/-d фильтруют их."""
 
-    def _run(self, argv):
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], [])), \
+    def _scan(self):
+        return [
+            {"name": "nvme0n1", "model": "NVME A", "tran": "NVME"},
+            {"name": "sda", "model": "SATA B", "tran": "SATA"},
+            {"name": "sdb", "model": "SAS C", "tran": "SAS"},
+        ]
+
+    def _run(self, argv, scan):
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], scan)), \
              mock.patch.object(fio_test, "build_results_table", return_value=None) as fake_table, \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
+             mock.patch.object(fio_test, "SystemTuner") as fake_tuner_cls, \
              mock.patch.object(fio_test.sys, "argv", argv):
+            fake_tuner = fake_tuner_cls.return_value
+            fake_tuner.preview.return_value = []
+            fake_tuner.get_nvme_temps.return_value = {}
             fio_test.main()
         disks, _, _ = fake_table.call_args.args
         return [d["name"] for d in disks]
 
-    def test_add_filters_fake_disks(self):
+    def test_add_filters_real_disks(self):
         self.assertEqual(
-            self._run(["fio-test.py", "-t", "-a", "1", "3"]),
-            ["nvme0n1", "sda"],
+            self._run(["fio-test.py", "-t", "-a", "1", "3"], self._scan()),
+            ["nvme0n1", "sdb"],
         )
 
-    def test_delete_filters_fake_disks(self):
+    def test_delete_filters_real_disks(self):
         self.assertEqual(
-            self._run(["fio-test.py", "-t", "-d", "2", "4"]),
-            ["nvme0n1", "sda", "sdc"],
+            self._run(["fio-test.py", "-t", "-d", "2"], self._scan()),
+            ["nvme0n1", "sdb"],
         )
 
-    def test_no_selection_keeps_all_fake_disks(self):
+    def test_no_selection_keeps_all_real_disks(self):
+        self.assertEqual(
+            self._run(["fio-test.py", "-t"], self._scan()),
+            ["nvme0n1", "sda", "sdb"],
+        )
+
+    def test_empty_scan_falls_back_to_fake_disks(self):
         names = [d["name"] for d in fio_test.build_fake_disks()]
-        self.assertEqual(self._run(["fio-test.py", "-t"]), names)
+        self.assertEqual(self._run(["fio-test.py", "-t"], []), names)
 
-    def test_delete_all_fake_disks_exits(self):
+    def test_fallback_prints_warning(self):
+        printed = []
+
+        def fake_print(*args, **kwargs):
+            printed.append(args[0] if args else kwargs.get("text", ""))
+
         with mock.patch.object(fio_test, "scan_disks", return_value=([], [])), \
+             mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
+             mock.patch.object(fio_test, "SystemTuner"), \
+             mock.patch.object(fio_test, "console") as fake_console, \
+             mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-t"]):
+            fake_console.print.side_effect = fake_print
+            fio_test.main()
+        self.assertTrue(
+            any("Реальных дисков не найдено" in str(p) for p in printed)
+        )
+
+    def test_add_without_numbers_prompts_interactively(self):
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], self._scan())), \
+             mock.patch.object(fio_test, "build_results_table", return_value=None) as fake_table, \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
+             mock.patch.object(fio_test, "SystemTuner"), \
              mock.patch.object(fio_test, "console"), \
+             mock.patch.object(fio_test, "_input_disk_numbers", return_value=[2]) as fake_input, \
+             mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-t", "-a"]):
+            fio_test.main()
+        fake_input.assert_called_once()
+        disks, _, _ = fake_table.call_args.args
+        self.assertEqual([d["name"] for d in disks], ["sda"])
+
+    def test_delete_all_exits(self):
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], self._scan())), \
+             mock.patch.object(fio_test, "console"), \
+             mock.patch.object(fio_test, "SystemTuner"), \
              mock.patch.object(fio_test.sys, "argv",
-                               ["fio-test.py", "-t", "-d", "1", "2", "3", "4", "5"]):
+                               ["fio-test.py", "-t", "-d", "1", "2", "3"]):
             with self.assertRaises(SystemExit) as cm:
                 fio_test.main()
         self.assertEqual(cm.exception.code, 0)
+
+    def test_bad_threshold_value_does_not_crash_test_mode(self):
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], self._scan())), \
+             mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
+             mock.patch.object(fio_test, "SystemTuner"), \
+             mock.patch.object(fio_test.sys, "argv",
+                               ["fio-test.py", "-t", "--threshold-nvme", "abc"]):
+            fio_test.main()
 
 
 class ElapsedParseTests(unittest.TestCase):
@@ -1027,6 +1085,48 @@ class BuildRunInfoTimingTests(unittest.TestCase):
             dict(info["flags"]).get("Время предзаполнения"), None
         )
         self.assertEqual(dict(info["flags"]).get("Время тестов"), None)
+
+    def test_test_mode_marks_regime_and_skips_irrelevant_flags(self):
+        args = mock.Mock()
+        args.sequential = True
+        args.prefill = True
+        args.logging = True
+        args.no_tune = False
+        args.runtime = 60
+        args.add = [1]
+        args.delete = None
+        args.threshold_nvme = "seq_read=1"
+        args.threshold_sas = None
+        args.threshold_sata = None
+        args.output = "reports/t.md"
+        info = fio_test._build_run_info(args, test_mode=True)
+        flags = dict(info["flags"])
+        self.assertEqual(flags["Режим"], "тестовый")
+        self.assertNotIn("Предварительное заполнение", flags)
+        self.assertNotIn("Длительность теста", flags)
+        self.assertNotIn("Пороги NVMe", flags)
+        self.assertEqual(flags["Выбор дисков (--add)"], "1")
+        self.assertEqual(flags["Выходной отчёт"], "reports/t.md")
+
+    def test_normal_mode_keeps_runtime_prefill_and_thresholds(self):
+        args = mock.Mock()
+        args.sequential = True
+        args.prefill = True
+        args.logging = False
+        args.no_tune = False
+        args.runtime = 60
+        args.add = None
+        args.delete = None
+        args.threshold_nvme = "seq_read=1"
+        args.threshold_sas = None
+        args.threshold_sata = None
+        args.output = None
+        info = fio_test._build_run_info(args)
+        flags = dict(info["flags"])
+        self.assertEqual(flags["Режим"], "последовательный")
+        self.assertEqual(flags["Предварительное заполнение"], "включено")
+        self.assertEqual(flags["Длительность теста"], "60 сек")
+        self.assertEqual(flags["Пороги NVMe"], "seq_read=1")
 
 
 class OptimizeNvmeArgsTests(unittest.TestCase):

@@ -216,6 +216,23 @@ class GenerateReportDiagStoreTests(unittest.TestCase):
         self.assertIn("## Результаты тестирования", text)
         self.assertIn("— тесты: 5 мин 02 с", text)
 
+    def test_report_survives_string_test_values(self):
+        disk_results = {
+            test_id: {"bs": "test", "iops": "test", "bw_mb": "test",
+                      "lat_avg": "test", "lat_p99": "test", "status": "test"}
+            for test_id in TEST_NAMES
+        }
+        disk_results["_thresholds"] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], [disk_results], TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("## Сводка", text)
+        self.assertIn("test", text)
+
 
 class GenerateReportRunInfoTests(unittest.TestCase):
     def test_report_contains_run_info_command_and_flags(self):

@@ -122,10 +122,12 @@ def _render_summary(disks: List[dict], results: List[dict], test_names: dict) ->
     def metric(test_id, res):
         if test_id.startswith("seq_"):
             bw = res.get("bw_mb")
-            return f"{_fmt(bw, '.0f')} МБ/с" if bw else ""
+            if not isinstance(bw, (int, float)) or not bw:
+                return ""
+            return f"{_fmt(bw, '.0f')} МБ/с"
         if test_id.startswith("rand_"):
             iops = res.get("iops")
-            if not iops:
+            if not isinstance(iops, (int, float)) or not iops:
                 return ""
             if iops >= 1_000_000:
                 return f"{_fmt(iops / 1e6, ',.2f')}M IOPS"

@@ -307,19 +307,28 @@ def apply_disk_selection(disks: list, args) -> list:
     return [d for i, d in enumerate(disks, 1) if i not in selected]
 
 
-def _build_run_info(args, prefill_duration=None, tests_duration=None) -> dict:
-    """Собирает мета-информацию о запуске для секции «Параметры запуска» отчёта."""
-    mode = "последовательный" if args.sequential else "параллельный"
+def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=False) -> dict:
+    """Собирает мета-информацию о запуске для секции «Параметры запуска» отчёта.
+
+    В тестовом режиме (test_mode=True) флаги, не влияющие на вывод пробной
+    таблицы (-s, -p, -r, пороги), в отчёт не попадают: режим показывается
+    как «тестовый».
+    """
+    if test_mode:
+        mode = "тестовый"
+    else:
+        mode = "последовательный" if args.sequential else "параллельный"
     flags = [
         ("Режим", mode),
-        ("Предварительное заполнение", "включено" if args.prefill else "выключено"),
         ("Подробные логи", "включены" if args.logging else "выключены"),
         ("Автонастройка системы", "выключена" if args.no_tune else "включена"),
-        (
+    ]
+    if not test_mode:
+        flags.insert(1, ("Предварительное заполнение", "включено" if args.prefill else "выключено"))
+        flags.append((
             "Длительность теста",
             f"{args.runtime} сек" if args.runtime is not None else "по конфигу (.fio)",
-        ),
-    ]
+        ))
     if prefill_duration is not None:
         flags.append(("Время предзаполнения", format_duration(prefill_duration)))
     if tests_duration is not None:
@@ -328,12 +337,13 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None) -> dict:
         flags.append(("Выбор дисков (--add)", ", ".join(str(n) for n in args.add)))
     if args.delete is not None:
         flags.append(("Выбор дисков (--delete)", ", ".join(str(n) for n in args.delete)))
-    if args.threshold_nvme:
-        flags.append(("Пороги NVMe", args.threshold_nvme))
-    if args.threshold_sas:
-        flags.append(("Пороги SAS", args.threshold_sas))
-    if args.threshold_sata:
-        flags.append(("Пороги SATA", args.threshold_sata))
+    if not test_mode:
+        if args.threshold_nvme:
+            flags.append(("Пороги NVMe", args.threshold_nvme))
+        if args.threshold_sas:
+            flags.append(("Пороги SAS", args.threshold_sas))
+        if args.threshold_sata:
+            flags.append(("Пороги SATA", args.threshold_sata))
     if args.output:
         flags.append(("Выходной отчёт", args.output))
     command = "python fio-test.py " + " ".join(sys.argv[1:])
@@ -968,18 +978,6 @@ def main():
     args = parse_args()
     validate_configs()
 
-    # Настройка пороговых значений с возможностью переопределения
-    thresholds = {
-        iface: dict(thr_map)
-        for iface, thr_map in INTERFACE_THRESHOLDS.items()
-    }
-    if args.threshold_nvme:
-        thresholds["nvme"].update(parse_custom_thresholds(args.threshold_nvme))
-    if args.threshold_sas:
-        thresholds["sas"].update(parse_custom_thresholds(args.threshold_sas))
-    if args.threshold_sata:
-        thresholds["sata"].update(parse_custom_thresholds(args.threshold_sata))
-
     if args.test:
         # 1. Реальное сканирование (read-only) для предпросмотра оптимизаций.
         #    Ничего не применяется и не запускается — только показ "что будет".
@@ -1024,8 +1022,31 @@ def main():
                 console.print(f"[bold]Температура NVMe:[/bold] {temp_str}")
             console.print()
 
-        # 2. Фейковая таблица для проверки вёрстки (fio не запускается).
-        disks = build_fake_disks()
+        # 2. Пробная таблица для проверки вёрстки (fio не запускается).
+        #    Берём реальные диски; если их нет — фейковые, чтобы вёрстку
+        #    можно было проверить на любой машине.
+        if real_disks:
+            disks = real_disks
+        else:
+            disks = build_fake_disks()
+            console.print(
+                "[bold yellow]Реальных дисков не найдено, "
+                "показаны фейковые.[/bold yellow]"
+            )
+
+        console.print("\n[bold]Целевые диски:[/bold]")
+        for i, d in enumerate(disks, 1):
+            name = d["name"]
+            model = d.get("model", "N/A").strip()
+            console.print(f"  [green]{i}. /dev/{name}[/green] {model}")
+
+        # Ручной выбор дисков: -a/--add или -d/--delete.
+        # Если флаг передан без номеров — запрашиваем номера интерактивно.
+        if args.add is not None and not args.add:
+            args.add = _input_disk_numbers("Номера дисков для теста (через пробел): ")
+        elif args.delete is not None and not args.delete:
+            args.delete = _input_disk_numbers("Номера дисков для исключения (через пробел): ")
+
         if args.add is not None or args.delete is not None:
             disks = apply_disk_selection(disks, args)
             if not disks:
@@ -1039,12 +1060,24 @@ def main():
         report_path = generate_report(
             disks, results, TEST_NAMES, output_path=args.output,
             tuner_report=preview_rows or None,
-            run_info=_build_run_info(args),
+            run_info=_build_run_info(args, test_mode=True),
             fio_configs=_collect_fio_configs(disks),
             show_lat_p99=args.logging,
         )
         console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
         return
+
+    # Настройка пороговых значений с возможностью переопределения
+    thresholds = {
+        iface: dict(thr_map)
+        for iface, thr_map in INTERFACE_THRESHOLDS.items()
+    }
+    if args.threshold_nvme:
+        thresholds["nvme"].update(parse_custom_thresholds(args.threshold_nvme))
+    if args.threshold_sas:
+        thresholds["sas"].update(parse_custom_thresholds(args.threshold_sas))
+    if args.threshold_sata:
+        thresholds["sata"].update(parse_custom_thresholds(args.threshold_sata))
 
     console.print("[bold]Сканирование дисков...[/bold]")
 
