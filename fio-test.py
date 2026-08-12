@@ -28,11 +28,13 @@ import concurrent.futures
 import json
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
+from typing import Dict, List, Optional
 
 from rich.console import Console
 
@@ -751,57 +753,123 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     return res
 
 
-# Переопределения аргументов fio по поколению PCIe: что нужно насытить, чтобы
-# раскрыть линк. Единая таблица для Gen4/Gen5 — у Gen5 выше ёмкость линка,
-# поэтому глубже очереди и крупнее блок для seq_read; seq_write одинаков
-# (упирается в возможности контроллера, а не в линк).
-_NVME_OVERRIDES = {
-    4: {
-        "seq_read": {"--numjobs": 2, "--iodepth": 16},
-        "seq_write": {"--numjobs": 2, "--iodepth": 16},
-        "rand_read": {"--numjobs": 8, "--iodepth": 32},
-        "rand_write": {"--numjobs": 8, "--iodepth": 32},
-    },
-    5: {
-        "seq_read": {"--numjobs": 4, "--iodepth": 16, "--bs": "256k"},
-        "seq_write": {"--numjobs": 2, "--iodepth": 16},
-        "rand_read": {"--numjobs": 16, "--iodepth": 16},
-        "rand_write": {"--numjobs": 8, "--iodepth": 16},
-    },
-}
+def _link_generation(speed_gts: float) -> int:
+    """Сопоставляет скорость линка (GT/s) с поколением PCIe."""
+    if speed_gts >= 128.0:
+        return 7
+    if speed_gts >= 64.0:
+        return 6
+    if speed_gts >= 32.0:
+        return 5
+    if speed_gts >= 16.0:
+        return 4
+    if speed_gts >= 8.0:
+        return 3
+    if speed_gts >= 5.0:
+        return 2
+    return 1
 
 
-def optimize_nvme_args(test_id, args_list, pcie_info):
-    """Оптимизирует аргументы fio для NVMe в зависимости от поколения PCIe."""
-    if not pcie_info:
-        return args_list
+def _estimate_ceiling_mbps(interface: str, link: Optional[Dict], rotational: int) -> float:
+    """Оценивает максимальную реальную скорость диска в МБ/с."""
+    if interface == "nvme" and link:
+        gen = link.get("gen")
+        width = link.get("width")
+        if gen and width:
+            gen_speeds = {3: 4000, 4: 8000, 5: 16000, 6: 32000, 7: 64000}
+            base = gen_speeds.get(gen, 4000)
+            return base * width // 4
 
-    gen = pcie_info.get("gen")
-    if gen is None:
-        return args_list
+    if interface == "sas" and link:
+        neg_gbps = link.get("negotiated_gbps")
+        if neg_gbps:
+            return neg_gbps * 1000 * 0.85
 
-    def set_arg(args, key, value):
-        new_args = []
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            if arg == key and i + 1 < len(args):
-                new_args.append(key)
-                new_args.append(str(value))
-                i += 2
-                continue
-            if arg.startswith(f"{key}="):
-                new_args.append(f"{key}={value}")
-                i += 1
-                continue
-            new_args.append(arg)
-            i += 1
-        return new_args
+    if interface == "sata":
+        return 250.0 if rotational == 1 else 550.0
 
-    new_args = list(args_list)
-    for key, value in (_NVME_OVERRIDES.get(gen, {}).get(test_id) or {}).items():
-        new_args = set_arg(new_args, key, value)
-    return new_args
+    return 0.0
+
+
+def build_test_plan(disk: dict, base_tests: dict) -> list:
+    """
+    Строит динамический план тестов на основе профиля железа диска.
+
+    Возвращает список [(test_id, fio_args), ...] с переопределёнными
+    параметрами (bs, iodepth, numjobs) согласно:
+      - интерфейсу (NVMe/SAS/SATA)
+      - поколению линка (для NVMe: PCIe gen×width)
+      - физическому блоку (bs ≥ physical_block_size, кратный)
+      - потолку скорости (ceiling_mbps)
+
+    Для NVMe Gen5+: seq_read использует 256k bs и больше numjobs.
+    Для SAS/SATA: iodepth ограничивается ~8-16 (контроллер не масштабирует).
+    """
+    profile = disk.get("profile") or {}
+    interface = profile.get("interface", disk.get("tran", "sata").lower())
+    link = profile.get("link")
+    rotational = profile.get("rotational", 0)
+    phys_block = profile.get("physical_block_size", 4096)
+
+    if interface == "nvme":
+        gen = link.get("gen") if link else None
+        width = link.get("width") if link else None
+    else:
+        gen = width = None
+
+    plan = []
+    for test_id, fio_args in base_tests.items():
+        args = list(fio_args)
+
+        bs_override = None
+        iodepth_override = None
+        numjobs_override = None
+
+        if interface == "nvme":
+            if gen and gen >= 5:
+                if test_id == "seq_read":
+                    bs_override = "256k"
+                    numjobs_override = 4
+                    iodepth_override = 16
+                elif test_id == "seq_write":
+                    numjobs_override = 2
+                    iodepth_override = 16
+                elif test_id == "rand_read":
+                    numjobs_override = 16
+                    iodepth_override = 16
+                elif test_id == "rand_write":
+                    numjobs_override = 8
+                    iodepth_override = 16
+            elif gen and gen == 4:
+                if test_id == "seq_read":
+                    numjobs_override = 2
+                    iodepth_override = 16
+                elif test_id == "seq_write":
+                    numjobs_override = 2
+                    iodepth_override = 16
+                elif test_id == "rand_read":
+                    numjobs_override = 8
+                    iodepth_override = 32
+                elif test_id == "rand_write":
+                    numjobs_override = 8
+                    iodepth_override = 32
+        elif interface == "sas":
+            iodepth_override = 8
+            numjobs_override = 2
+        elif interface == "sata":
+            iodepth_override = 4
+            numjobs_override = 1
+
+        if bs_override:
+            args = [a if not a.startswith("--bs=") else f"--bs={bs_override}" for a in args]
+        if iodepth_override:
+            args = [a if not a.startswith("--iodepth=") else f"--iodepth={iodepth_override}" for a in args]
+        if numjobs_override:
+            args = [a if not a.startswith("--numjobs=") else f"--numjobs={numjobs_override}" for a in args]
+
+        plan.append((test_id, args))
+
+    return plan
 
 
 def process_task_result(results, idx, disk, t, fio_args, res, state_lock=None):
@@ -1055,7 +1123,7 @@ def main():
         results = build_fake_results(disks)
         console.print("[bold]Тестовый режим: пробные данные, fio не запускается[/bold]")
         console.print()
-        table = build_results_table(disks, results, TEST_NAMES)
+        table = build_results_table(disks, results, TEST_NAMES, show_lat_p99=args.logging)
         console.print(table)
         report_path = generate_report(
             disks, results, TEST_NAMES, output_path=args.output,
@@ -1227,26 +1295,18 @@ def main():
             tran_key = "sata"
 
         tests = INTERFACE_CONFIGS.get(tran_key, INTERFACE_CONFIGS["sata"])
-        pcie_info = disk.get("pcie_info") if "nvme" in tran else None
         results[disk_idx]["_thresholds"] = thresholds.get(tran_key, {})
 
-        plan = []
-        for t, fio_args in tests.items():
-            fio_args = list(fio_args)
+        plan = build_test_plan(disk, tests)
 
-            # Длительность теста: только если задан явно через -r; иначе
-            # остаётся значение runtime= из .fio-конфига.
-            if args.runtime is not None:
-                fio_args = [
+        if args.runtime is not None:
+            plan = [
+                (t, [
                     f"--runtime={args.runtime}" if a.startswith("--runtime=") else a
                     for a in fio_args
-                ]
-
-            # Оптимизация для NVMe
-            if "nvme" in tran and pcie_info:
-                fio_args = optimize_nvme_args(t, fio_args, pcie_info)
-
-            plan.append((t, fio_args))
+                ])
+                for t, fio_args in plan
+            ]
 
         disk_plans.append((disk_idx, disk, plan))
 
@@ -1291,7 +1351,7 @@ def main():
                 pool.shutdown(wait=False, cancel_futures=True)
 
         # Вывод результатов (только при успешном завершении всех тестов)
-        table = build_results_table(disks, results, TEST_NAMES)
+        table = build_results_table(disks, results, TEST_NAMES, show_lat_p99=args.logging)
         console.print()
         console.print(table)
     finally:

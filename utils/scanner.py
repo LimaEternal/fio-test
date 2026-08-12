@@ -14,6 +14,171 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
+def _read_queue_file(path: Path, default: int) -> int:
+    """Читает целое число из sysfs-файла, возвращает default при ошибке."""
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return default
+
+
+def _read_queue_info(disk_name: str) -> Dict[str, int]:
+    """Читает информацию о блоках из /sys/block/<d>/queue/."""
+    queue_dir = Path(f"/sys/block/{disk_name}/queue")
+    return {
+        "logical_block_size": _read_queue_file(queue_dir / "logical_block_size", 512),
+        "physical_block_size": _read_queue_file(queue_dir / "physical_block_size", 4096),
+        "minimum_io_size": _read_queue_file(queue_dir / "minimum_io_size", 512),
+        "optimal_io_size": _read_queue_file(queue_dir / "optimal_io_size", 0),
+        "rotational": _read_queue_file(queue_dir / "rotational", 0),
+    }
+
+
+def _read_nvme_link(disk_name: str) -> Optional[Dict]:
+    """Читает текущий и максимальный линк PCIe для NVMe."""
+    link_dir = find_nvme_link_dir(disk_name)
+    if not link_dir:
+        return None
+
+    try:
+        speed_cur = (link_dir / "current_link_speed").read_text(encoding="utf-8").strip()
+        width_cur = (link_dir / "current_link_width").read_text(encoding="utf-8").strip()
+        speed_max = (link_dir / "max_link_speed").read_text(encoding="utf-8").strip()
+        width_max = (link_dir / "max_link_width").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+    def parse_speed(s: str) -> Optional[float]:
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
+        return float(m.group(1)) if m else None
+
+    def parse_width(w: str) -> Optional[int]:
+        m = re.search(r"(\d+)", w)
+        return int(m.group(1)) if m else None
+
+    cur_gts = parse_speed(speed_cur)
+    cur_width = parse_width(width_cur)
+    max_gts = parse_speed(speed_max)
+    max_width = parse_width(width_max)
+
+    if cur_gts is None or cur_width is None:
+        return None
+
+    return {
+        "gen": _link_generation(cur_gts),
+        "width": cur_width,
+        "speed_gts": cur_gts,
+        "max_gen": _link_generation(max_gts) if max_gts else None,
+        "max_width": max_width,
+        "max_speed_gts": max_gts,
+        "source": "sysfs",
+    }
+
+
+def _read_sas_link(disk_name: str) -> Optional[Dict]:
+    """Читает negotiated/max linkrate для SAS диска через sas_address."""
+    try:
+        scsi_dev = Path(f"/sys/block/{disk_name}/device")
+        if not scsi_dev.exists():
+            return None
+
+        dev_path = scsi_dev.resolve()
+        sas_addr_file = dev_path / "sas_address"
+        if not sas_addr_file.exists():
+            return None
+
+        sas_address = sas_addr_file.read_text(encoding="utf-8").strip()
+        if not sas_address:
+            return None
+
+        for phy_dir in Path("/sys/class/sas_phy").iterdir():
+            if not phy_dir.is_dir():
+                continue
+            addr_file = phy_dir / "sas_address"
+            if not addr_file.exists():
+                continue
+            if addr_file.read_text(encoding="utf-8").strip() != sas_address:
+                continue
+
+            neg_file = phy_dir / "negotiated_linkrate"
+            max_file = phy_dir / "maximum_linkrate"
+            if not neg_file.exists() or not max_file.exists():
+                continue
+
+            neg_str = neg_file.read_text(encoding="utf-8").strip()
+            max_str = max_file.read_text(encoding="utf-8").strip()
+
+            def parse_gbps(s: str) -> Optional[float]:
+                m = re.search(r"(\d+(?:\.\d+)?)", s)
+                return float(m.group(1)) if m else None
+
+            return {
+                "negotiated_gbps": parse_gbps(neg_str),
+                "maximum_gbps": parse_gbps(max_str),
+                "source": "sas_phy",
+            }
+    except OSError:
+        pass
+    return None
+
+
+def _read_sata_link(disk_name: str) -> Optional[Dict]:
+    """Читает sata_spd_limit для SATA диска через ata_link."""
+    try:
+        dev_path = Path(f"/sys/block/{disk_name}").resolve()
+        path_str = str(dev_path)
+
+        link_match = re.search(r"/link(\d+)\.(\d+)", path_str)
+        if not link_match:
+            return None
+
+        link_num = link_match.group(1)
+        link_port = link_match.group(2)
+        link_dir = Path(f"/sys/class/ata_link/link{link_num}.{link_port}")
+
+        if not link_dir.exists():
+            return None
+
+        spd_file = link_dir / "sata_spd_limit"
+        hw_spd_file = link_dir / "hw_sata_spd_limit"
+
+        if not spd_file.exists():
+            return None
+
+        def parse_gbps(s: str) -> Optional[float]:
+            m = re.search(r"(\d+(?:\.\d+)?)", s)
+            return float(m.group(1)) if m else None
+
+        spd_str = spd_file.read_text(encoding="utf-8").strip()
+        hw_spd_str = hw_spd_file.read_text(encoding="utf-8").strip() if hw_spd_file.exists() else ""
+
+        return {
+            "spd_limit_gbps": parse_gbps(spd_str),
+            "hw_spd_limit_gbps": parse_gbps(hw_spd_str) if hw_spd_str else None,
+            "source": "ata_link",
+        }
+    except OSError:
+        pass
+    return None
+
+
+def _link_generation(speed_gts: float) -> int:
+    """Сопоставляет скорость линка (GT/s) с поколением PCIe."""
+    if speed_gts >= 128.0:
+        return 7
+    if speed_gts >= 64.0:
+        return 6
+    if speed_gts >= 32.0:
+        return 5
+    if speed_gts >= 16.0:
+        return 4
+    if speed_gts >= 8.0:
+        return 3
+    if speed_gts >= 5.0:
+        return 2
+    return 1
+
+
 def _detect_interface(disk_name: str, raw_tran: Optional[str]) -> str:
     """
     Определяет тип интерфейса диска.
@@ -32,6 +197,81 @@ def _detect_interface(disk_name: str, raw_tran: Optional[str]) -> str:
         return tran
 
     return "sata"
+
+
+def collect_hw_profile(disk_name: str, tran: str) -> Dict:
+    """
+    Собирает полный профиль железа диска из sysfs.
+
+    Возвращает dict с ключами:
+      - interface: "nvme"/"sas"/"sata"
+      - logical_block_size, physical_block_size, minimum_io_size, optimal_io_size
+      - rotational: 0=SSD, 1=HDD
+      - link: dict с информацией о линке (см. ниже)
+      - ceiling_mbps: оценочный потолок скорости в МБ/с
+
+    link для NVMe:
+      {"gen": int, "width": int, "speed_gts": float,
+       "max_gen": int, "max_width": int, "max_speed_gts": float, "source": "sysfs"}
+    link для SAS:
+      {"negotiated_gbps": float, "maximum_gbps": float, "source": "sas_phy"}
+    link для SATA:
+      {"spd_limit_gbps": float, "hw_spd_limit_gbps": float, "source": "ata_link"}
+    """
+    queue_info = _read_queue_info(disk_name)
+    interface = tran
+
+    if interface == "nvme":
+        link = _read_nvme_link(disk_name)
+    elif interface == "sas":
+        link = _read_sas_link(disk_name)
+    else:  # sata
+        link = _read_sata_link(disk_name)
+
+    ceiling = estimate_ceiling_mbps(interface, link, queue_info["rotational"])
+
+    return {
+        "interface": interface,
+        "logical_block_size": queue_info["logical_block_size"],
+        "physical_block_size": queue_info["physical_block_size"],
+        "minimum_io_size": queue_info["minimum_io_size"],
+        "optimal_io_size": queue_info["optimal_io_size"],
+        "rotational": queue_info["rotational"],
+        "link": link,
+        "ceiling_mbps": ceiling,
+    }
+
+
+def estimate_ceiling_mbps(interface: str, link: Optional[Dict], rotational: int) -> float:
+    """
+    Оценивает максимальную реальную скорость диска в МБ/с.
+
+    NVMe: потолок по gen×width (приближённо по теоретической пропускной способности PCIe)
+    SAS: negotiated_gbps × 0.85 (учёт накладных расходов)
+    SATA: SSD ≈ 550 МБ/с, HDD ≈ 250 МБ/с
+    """
+    if interface == "nvme" and link:
+        gen = link.get("gen")
+        width = link.get("width")
+        if gen and width:
+            # Приблизительные значения по поколениям PCIe (x4)
+            # Gen3=3.94 GB/s, Gen4=7.88 GB/s, Gen5=15.75 GB/s
+            gen_speeds = {3: 4000, 4: 8000, 5: 16000, 6: 32000, 7: 64000}
+            base = gen_speeds.get(gen, 4000)
+            return base * width // 4
+
+    if interface == "sas" and link:
+        neg_gbps = link.get("negotiated_gbps")
+        if neg_gbps:
+            return neg_gbps * 1000 * 0.85
+
+    if interface == "sata":
+        if rotational == 1:  # HDD
+            return 250.0
+        else:  # SSD
+            return 550.0
+
+    return 0.0
 
 
 def _is_system_mount(mp: str) -> bool:
@@ -272,6 +512,8 @@ def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict
         if tran == "nvme":
             pcie_info = get_nvme_pcie_info(d["name"])
 
+        profile = collect_hw_profile(d["name"], tran)
+
         disk_info = {
             "name": d["name"],
             "path": f"/dev/{d['name']}",
@@ -282,6 +524,7 @@ def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict
             "phy_sec": int(d.get("phy-sec") or 512),
             "slot": slot,
             "pcie_info": pcie_info,
+            "profile": profile,
             "root_partition": root_partition,
             "numa_node": _get_numa_node(d["name"]),
         }

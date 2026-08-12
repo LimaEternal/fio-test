@@ -14,14 +14,13 @@ from rich.text import Text
 
 TITLE = "Результаты тестирования накопителей (FIO)"
 
-# Поставьте True, чтобы вернуть колонку Lat p99
-# (метрика по-прежнему парсится в fio-test.py, скрыт только вывод).
-SHOW_LAT_P99 = False
+SHOW_DIAG_COLS = False
 
 RESULT_HEADERS = tuple(
     [("Профиль теста", "left", 9), ("Блок", "center", 5), ("IOPS", "center", 7),
      ("Скорость (МБ/с)", "center", 8), ("Lat Avg (мс)", "center", 11)]
-    + ([("Lat p99 (мс)", "center", 10)] if SHOW_LAT_P99 else [])
+    + ([("Lat p99 (мс)", "center", 10)] if SHOW_DIAG_COLS else [])
+    + ([("Tmax (°C)", "center", 8)] if SHOW_DIAG_COLS else [])
     + [("Статус", "center", 6)]
 )
 
@@ -56,17 +55,14 @@ def _fmt(value, spec):
 
 
 def _test_rows(disk_results, test_names):
-    """Преобразует результаты тестов в строки вложенной таблицы.
-
-    Имя теста завершается переводом строки: перенос имени даёт
-    пустую строку после каждого теста (включая последний).
-    """
+    """Преобразует результаты тестов в строки вложенной таблицы."""
     rows = []
     for test_id, test_name in test_names.items():
         result = disk_results.get(test_id, {})
         if "error" in result:
             row = [test_name + "\n", "—", "—", "—", "—"]
-            if SHOW_LAT_P99:
+            if SHOW_DIAG_COLS:
+                row.append("—")
                 row.append("—")
             row.append("FAIL")
         else:
@@ -77,8 +73,13 @@ def _test_rows(disk_results, test_names):
                 _fmt(result.get("bw_mb", 0), ".1f"),
                 _fmt(result.get("lat_avg", 0), ".2f"),
             ]
-            if SHOW_LAT_P99:
-                row.append(_fmt(result.get("lat_p99", 0), ".2f"))
+            if SHOW_DIAG_COLS:
+                if result.get("lat_p99_unreliable"):
+                    row.append("—")
+                else:
+                    row.append(_fmt(result.get("lat_p99", 0), ".2f"))
+                diag = result.get("diag") or {}
+                row.append(_fmt(diag.get("temp_max_c"), ".1f") if diag.get("temp_max_c") is not None else "—")
             row.append(result.get("status", "FAIL"))
         rows.append(tuple(row))
     return rows
@@ -105,8 +106,11 @@ def _results_cell(disk_results, test_names):
     return sub
 
 
-def build_results_table(disks, results, test_names):
+def build_results_table(disks, results, test_names, show_lat_p99=False):
     """Строит одну непрерывную таблицу для всех накопителей."""
+    global SHOW_DIAG_COLS
+    SHOW_DIAG_COLS = show_lat_p99
+
     table = Table(
         box=box.ROUNDED,
         show_header=True,

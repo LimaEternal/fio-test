@@ -254,13 +254,47 @@ def generate_report(
         lines.append("## Обнаруженные диски")
         lines.append("")
         if has_diag:
-            lines.append("| Диск | Модель | Серийный номер | Интерфейс | Объём | NUMA | CPU-аффинити |")
-            lines.append("|------|--------|----------------|-----------|-------|------|--------------|")
+            lines.append("| Диск | Модель | Серийный номер | Интерфейс | Объём | Link | Блок (физ/лог) | Потолок (МБ/с) | NUMA | CPU-аффинити |")
+            lines.append("|------|--------|----------------|-----------|-------|------|----------------|----------------|------|--------------|")
         else:
             lines.append("| Диск | Модель | Серийный номер | Интерфейс | Объём |")
             lines.append("|------|--------|----------------|-----------|-------|")
 
         for d in disks:
+            profile = d.get("profile") or {}
+            interface = profile.get("interface", d.get("tran", "N/A").upper())
+            link = profile.get("link")
+            phys_block = profile.get("physical_block_size", "—")
+            log_block = profile.get("logical_block_size", "—")
+            ceiling = profile.get("ceiling_mbps")
+
+            link_str = ""
+            if interface == "nvme" and link:
+                gen = link.get("gen")
+                width = link.get("width")
+                max_gen = link.get("max_gen")
+                if gen and width:
+                    link_str = f"PCIe {gen} x{width}"
+                    if max_gen:
+                        link_str += f" (max: {max_gen})"
+            elif interface == "sas" and link:
+                neg = link.get("negotiated_gbps")
+                max_l = link.get("maximum_gbps")
+                if neg:
+                    link_str = f"{neg} Gbps"
+                    if max_l:
+                        link_str += f" / {max_l} Gbps"
+            elif interface == "sata" and link:
+                spd = link.get("spd_limit_gbps")
+                hw_spd = link.get("hw_spd_limit_gbps")
+                if spd:
+                    link_str = f"{spd} Gbps"
+                    if hw_spd and hw_spd != spd:
+                        link_str += f" (hw: {hw_spd})"
+
+            block_str = f"{phys_block}/{log_block}" if phys_block != "—" and log_block != "—" else "—"
+            ceiling_str = f"{ceiling:.0f}" if ceiling else "—"
+
             pcie_str = ""
             if d.get("pcie_info") and d["pcie_info"].get("gen"):
                 pcie_str = f" (PCIe Gen{d['pcie_info']['gen']} x{d['pcie_info'].get('width', '?')})"
@@ -271,12 +305,12 @@ def generate_report(
                 affinity = static.get("cpu_affinity") or "—"
                 lines.append(
                     f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
-                    f"| {d['tran'].upper()}{pcie_str} | {d['size']} | {numa} | {affinity} |"
+                    f"| {interface}{pcie_str} | {d['size']} | {link_str or '—'} | {block_str} | {ceiling_str} | {numa} | {affinity} |"
                 )
             else:
                 lines.append(
                     f"| /dev/{d['name']} | {d['model']} | {d['serial']} "
-                    f"| {d['tran'].upper()}{pcie_str} | {d['size']} |"
+                    f"| {interface}{pcie_str} | {d['size']} |"
                 )
 
         lines.append("")

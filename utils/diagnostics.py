@@ -196,36 +196,40 @@ class DiagnosticSampler:
         return gts, width
 
     def _read_temp(self) -> Optional[float]:
-        """Возвращает температуру контроллера NVMe в °C через nvme smart-log.
+        """Возвращает температуру диска в °C.
 
-        Результат кэшируется на TEMP_CACHE_SEC секунд, чтобы не дёргать
-        subprocess каждый сэмпл. Сначала пробуем контроллер (/dev/nvmeX),
-        при ошибке — namespace (/dev/nvmeXn1).
+        Для NVMe — через `nvme smart-log`, для SAS/SATA — через `smartctl -H`.
+        Результат кэшируется на TEMP_CACHE_SEC секунд.
         """
-        if not self.nvme_dev:
-            return None
         now = time.time()
         if self._temp_cache is not None and now - self._temp_cache_ts < TEMP_CACHE_SEC:
             return self._temp_cache
-        for dev in (f"/dev/{self.nvme_dev}", self.disk.get("path", "")):
-            if not dev or not dev.startswith("/dev/"):
-                continue
-            value = self._nvme_smart_temp(dev)
+
+        interface = self.disk.get("tran", "").lower()
+
+        if "nvme" in interface and self.nvme_dev:
+            for dev in (f"/dev/{self.nvme_dev}", self.disk.get("path", "")):
+                if not dev or not dev.startswith("/dev/"):
+                    continue
+                value = self._nvme_smart_temp(dev)
+                if value is not None:
+                    self._temp_cache = value
+                    self._temp_cache_ts = now
+                    return value
+
+        if interface in ("sas", "sata"):
+            value = self._smartctl_temp(self.disk.get("path", ""))
             if value is not None:
                 self._temp_cache = value
                 self._temp_cache_ts = now
                 return value
+
         self._temp_cache = None
         self._temp_cache_ts = now
         return None
 
     def _nvme_smart_temp(self, dev: str) -> Optional[float]:
-        """Запускает `nvme smart-log <dev>` и вытаскивает temperature.
-
-        Разные версии nvme-cli форматируют по-разному:
-        `temperature: 31 C (304 Kelvin)` или `temperature: 28°C (301 Kelvin)`
-        (градус может идти без пробела). Первое число перед `C` — температура.
-        """
+        """Запускает `nvme smart-log <dev>` и вытаскивает temperature."""
         try:
             proc = subprocess.run(
                 ["nvme", "smart-log", dev],
@@ -240,6 +244,35 @@ class DiagnosticSampler:
             if not line.strip().lower().startswith("temperature"):
                 continue
             m = re.search(r"(\d+(?:\.\d+)?)\s*°?\s*C\b", line)
+            if m:
+                return float(m.group(1))
+        return None
+
+    def _smartctl_temp(self, dev: str) -> Optional[float]:
+        """Запускает `smartctl -H <dev>` и вытаскивает температуру для SAS/SATA.
+
+        Формат вывода smartctl различается по версиям:
+        - `Temperature: 31 Celsius`
+        - `Current Drive Temperature: 31 C`
+        - `Temperature: 31°C`
+        """
+        if not dev or not dev.startswith("/dev/"):
+            return None
+        try:
+            proc = subprocess.run(
+                ["smartctl", "-H", dev],
+                capture_output=True, timeout=3.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        text = proc.stdout.decode(errors="replace")
+        for line in text.splitlines():
+            line_lower = line.lower()
+            if "temperature" not in line_lower:
+                continue
+            m = re.search(r"(\d+(?:\.\d+)?)\s*°?\s*C(?:elsius)?\b", line, re.IGNORECASE)
             if m:
                 return float(m.group(1))
         return None
