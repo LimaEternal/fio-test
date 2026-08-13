@@ -1050,7 +1050,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
     def test_durations_appear_in_flags(self):
         args = mock.Mock()
         args.sequential = False
-        args.prefill = True
+        args.no_prefill = False
         args.logging = False
         args.no_tune = False
         args.runtime = 60
@@ -1070,7 +1070,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
     def test_no_durations_no_extra_flags(self):
         args = mock.Mock()
         args.sequential = False
-        args.prefill = False
+        args.no_prefill = True
         args.logging = False
         args.no_tune = True
         args.runtime = None
@@ -1089,7 +1089,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
     def test_test_mode_marks_regime_and_skips_irrelevant_flags(self):
         args = mock.Mock()
         args.sequential = True
-        args.prefill = True
+        args.no_prefill = True
         args.logging = True
         args.no_tune = False
         args.runtime = 60
@@ -1111,7 +1111,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
     def test_normal_mode_keeps_runtime_prefill_and_thresholds(self):
         args = mock.Mock()
         args.sequential = True
-        args.prefill = True
+        args.no_prefill = False
         args.logging = False
         args.no_tune = False
         args.runtime = 60
@@ -1129,66 +1129,64 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         self.assertEqual(flags["Пороги NVMe"], "seq_read=1")
 
 
-class OptimizeNvmeArgsTests(unittest.TestCase):
-    """Единая таблица переопределений для Gen4/Gen5 (включая seq_write)."""
+class BuildTestPlanTests(unittest.TestCase):
+    """build_test_plan: переопределения bs/iodepth/numjobs по интерфейсу и линку."""
 
-    def _args(self, numjobs=None, iodepth=None, bs=None):
-        out = ["--rw=read", "--bs=128k", "--iodepth=64", "--numjobs=4"]
-        if numjobs is not None:
-            out[3] = f"--numjobs={numjobs}"
-        if iodepth is not None:
-            out[2] = f"--iodepth={iodepth}"
-        if bs is not None:
-            out[1] = f"--bs={bs}"
-        return out
+    BASE_TESTS = {
+        "seq_read": ["--rw=read", "--bs=128k", "--iodepth=64", "--numjobs=4"],
+        "seq_write": ["--rw=write", "--bs=128k", "--iodepth=64", "--numjobs=4"],
+        "rand_read": ["--rw=randread", "--bs=4k", "--iodepth=32", "--numjobs=8"],
+        "rand_write": ["--rw=randwrite", "--bs=4k", "--iodepth=32", "--numjobs=8"],
+    }
+
+    def _disk(self, interface="nvme", gen=None, width=4):
+        profile = {"interface": interface, "physical_block_size": 4096}
+        if gen is not None:
+            profile["link"] = {"gen": gen, "width": width}
+        return {"tran": interface, "profile": profile}
+
+    def _plan_args(self, disk, test_id):
+        plan = fio_test.build_test_plan(disk, self.BASE_TESTS)
+        return dict(plan)[test_id]
 
     def test_gen4_seq_write_overridden_like_gen5(self):
-        args = fio_test.optimize_nvme_args(
-            "seq_write", self._args(), {"gen": 4, "width": 4}
-        )
+        args = self._plan_args(self._disk(gen=4), "seq_write")
         self.assertIn("--numjobs=2", args)
         self.assertIn("--iodepth=16", args)
 
     def test_gen4_seq_read_overridden(self):
-        args = fio_test.optimize_nvme_args(
-            "seq_read", self._args(), {"gen": 4, "width": 4}
-        )
+        args = self._plan_args(self._disk(gen=4), "seq_read")
         self.assertIn("--numjobs=2", args)
         self.assertIn("--iodepth=16", args)
 
     def test_gen4_rand_read_overridden(self):
-        args = fio_test.optimize_nvme_args(
-            "rand_read", self._args(), {"gen": 4, "width": 4}
-        )
+        args = self._plan_args(self._disk(gen=4), "rand_read")
         self.assertIn("--numjobs=8", args)
         self.assertIn("--iodepth=32", args)
 
     def test_gen5_seq_read_overridden(self):
-        args = fio_test.optimize_nvme_args(
-            "seq_read", self._args(), {"gen": 5, "width": 4}
-        )
+        args = self._plan_args(self._disk(gen=5), "seq_read")
         self.assertIn("--numjobs=4", args)
         self.assertIn("--iodepth=16", args)
         self.assertIn("--bs=256k", args)
 
     def test_gen5_rand_read_overridden(self):
-        args = fio_test.optimize_nvme_args(
-            "rand_read", self._args(), {"gen": 5, "width": 4}
-        )
+        args = self._plan_args(self._disk(gen=5), "rand_read")
         self.assertIn("--numjobs=16", args)
         self.assertIn("--iodepth=16", args)
 
     def test_no_pcie_info_returns_unchanged(self):
-        args = self._args()
-        self.assertEqual(
-            fio_test.optimize_nvme_args("seq_read", args, None), args
-        )
+        args = self._plan_args(self._disk(gen=None), "seq_read")
+        self.assertEqual(args, self.BASE_TESTS["seq_read"])
 
     def test_gen_without_overrides_returns_unchanged(self):
-        args = self._args()
-        self.assertEqual(
-            fio_test.optimize_nvme_args("seq_read", args, {"gen": 3}), args
-        )
+        args = self._plan_args(self._disk(gen=3), "seq_read")
+        self.assertEqual(args, self.BASE_TESTS["seq_read"])
+
+    def test_sata_lowers_depth(self):
+        args = self._plan_args(self._disk(interface="sata"), "seq_read")
+        self.assertIn("--numjobs=1", args)
+        self.assertIn("--iodepth=4", args)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -s           — тестирование (последовательно)
     python fio-test.py -c           — тестирование с подтверждением
     python fio-test.py -c -s        — с подтверждением, последовательно
-    python fio-test.py -c -p        — с подтверждением и предварительным заполнением
+    python fio-test.py -p           — без предварительного заполнения (по умолчанию
+                                      префилл выполняется перед тестами)
     python fio-test.py -r 60            — 60 сек на тест
     python fio-test.py -l               — подробное логирование: отчёт обновляется
                                           по мере завершения тестов (мониторинг в отчёте)
@@ -113,11 +114,11 @@ def parse_args():
         description="Тестирование производительности NVMe/SAS/SATA накопителей через fio",
         epilog=(
             "Примеры:\n"
-            "  python fio-test.py                           — тестирование (параллельно)\n"
+            "  python fio-test.py                           — тестирование (префилл по умолчанию)\n"
             "  python fio-test.py -s                        — тестирование (последовательно)\n"
             "  python fio-test.py -c                        — с подтверждением перед стартом\n"
             "  python fio-test.py -c -s                     — с подтверждением, последовательно\n"
-            "  python fio-test.py -c -p                     — с подтверждением и предварительным заполнением\n"
+            "  python fio-test.py -p                        — без предварительного заполнения\n"
             "  python fio-test.py -r 60                     — 60 секунд на каждый тест\n"
             "  python fio-test.py -l                        — подробное логирование (мониторинг в отчёте)\n"
             "  python fio-test.py -t                        — тестовый режим (пробные данные)\n"
@@ -137,8 +138,9 @@ def parse_args():
         help="Последовательный режим (для виртуальных машин)",
     )
     parser.add_argument(
-        "-p", "--prefill", action="store_true",
-        help="Предварительное заполнение перед тестами",
+        "-p", "--no-prefill", action="store_true",
+        help="Отключить предварительное заполнение перед тестами "
+             "(по умолчанию выполняется)",
     )
     parser.add_argument(
         "-l", "--logging", action="store_true",
@@ -326,7 +328,7 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
         ("Автонастройка системы", "выключена" if args.no_tune else "включена"),
     ]
     if not test_mode:
-        flags.insert(1, ("Предварительное заполнение", "включено" if args.prefill else "выключено"))
+        flags.insert(1, ("Предварительное заполнение", "выключено" if args.no_prefill else "включено"))
         flags.append((
             "Длительность теста",
             f"{args.runtime} сек" if args.runtime is not None else "по конфигу (.fio)",
@@ -1273,9 +1275,9 @@ def main():
         )
         writer.start()
 
-    # Предварительное заполнение
+    # Предварительное заполнение (по умолчанию выполняется, отключается -p)
     prefill_duration = None
-    if args.prefill:
+    if not args.no_prefill:
         console.print("\n[bold]Предварительное заполнение...[/bold]")
         prefill_duration = prefill_disks(disks, tuner=tuner, cancel_event=cancel_event)
 
