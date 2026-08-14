@@ -30,6 +30,8 @@ def _read_queue_info(disk_name: str) -> Dict[str, int]:
         "physical_block_size": _read_queue_file(queue_dir / "physical_block_size", 4096),
         "minimum_io_size": _read_queue_file(queue_dir / "minimum_io_size", 512),
         "optimal_io_size": _read_queue_file(queue_dir / "optimal_io_size", 0),
+        "max_hw_sectors_kb": _read_queue_file(queue_dir / "max_hw_sectors_kb", 4096),
+        "max_sectors_kb": _read_queue_file(queue_dir / "max_sectors_kb", 4096),
         "rotational": _read_queue_file(queue_dir / "rotational", 0),
     }
 
@@ -206,6 +208,7 @@ def collect_hw_profile(disk_name: str, tran: str) -> Dict:
     Возвращает dict с ключами:
       - interface: "nvme"/"sas"/"sata"
       - logical_block_size, physical_block_size, minimum_io_size, optimal_io_size
+      - max_hw_sectors_kb, max_sectors_kb: лимиты размера одного I/O (sysfs)
       - rotational: 0=SSD, 1=HDD
       - link: dict с информацией о линке (см. ниже)
       - ceiling_mbps: оценочный потолок скорости в МБ/с
@@ -236,40 +239,48 @@ def collect_hw_profile(disk_name: str, tran: str) -> Dict:
         "physical_block_size": queue_info["physical_block_size"],
         "minimum_io_size": queue_info["minimum_io_size"],
         "optimal_io_size": queue_info["optimal_io_size"],
+        "max_hw_sectors_kb": queue_info["max_hw_sectors_kb"],
+        "max_sectors_kb": queue_info["max_sectors_kb"],
         "rotational": queue_info["rotational"],
         "link": link,
         "ceiling_mbps": ceiling,
     }
 
 
+# Коэффициенты кодирования линии: Gen3+ и PAM4 (Gen6/7) используют
+# 128b/130b, Gen1/2, SAS и SATA — 8b/10b.
+_ENC_128B130B = 0.9846
+_ENC_8B10B = 0.8
+
+
 def estimate_ceiling_mbps(interface: str, link: Optional[Dict], rotational: int) -> float:
     """
     Оценивает максимальную реальную скорость диска в МБ/с.
 
-    NVMe: потолок по gen×width (приближённо по теоретической пропускной способности PCIe)
-    SAS: negotiated_gbps × 0.85 (учёт накладных расходов)
-    SATA: SSD ≈ 550 МБ/с, HDD ≈ 250 МБ/с
+    Потолок считается напрямую из физики линка (без таблицы поколений):
+      NVMe: current_link_speed (GT/s) × width × кодирование;
+      SAS:  negotiated_linkrate (Gbps) — 8b/10b;
+      SATA: sata_spd_limit (Gbps) — 8b/10b, с поправкой на реальные диски.
     """
     if interface == "nvme" and link:
-        gen = link.get("gen")
+        gts = link.get("speed_gts")
         width = link.get("width")
-        if gen and width:
-            # Приблизительные значения по поколениям PCIe (x4)
-            # Gen3=3.94 GB/s, Gen4=7.88 GB/s, Gen5=15.75 GB/s
-            gen_speeds = {3: 4000, 4: 8000, 5: 16000, 6: 32000, 7: 64000}
-            base = gen_speeds.get(gen, 4000)
-            return base * width // 4
+        if gts and width:
+            enc = _ENC_128B130B if gts >= 8.0 else _ENC_8B10B
+            return gts * width * 1000 / 8 * enc
 
     if interface == "sas" and link:
         neg_gbps = link.get("negotiated_gbps")
         if neg_gbps:
-            return neg_gbps * 1000 * 0.85
+            # 8b/10b: 12 Gbps → 1200 МБ/с (Gbps / 10 × 1000)
+            return neg_gbps * 100
 
     if interface == "sata":
-        if rotational == 1:  # HDD
-            return 250.0
-        else:  # SSD
-            return 550.0
+        real_world = 250.0 if rotational == 1 else 550.0
+        spd_gbps = (link or {}).get("spd_limit_gbps")
+        if spd_gbps:
+            return min(spd_gbps * 100, real_world)
+        return real_world
 
     return 0.0
 
@@ -331,21 +342,6 @@ def _find_root_mount_name(node: dict) -> Optional[str]:
         if result:
             return result
     return None
-
-
-def _link_generation(speed_gts: float) -> int:
-    """Сопоставляет скорость линка (GT/s) с поколением PCIe."""
-    if speed_gts >= 64.0:
-        return 6
-    if speed_gts >= 32.0:
-        return 5
-    if speed_gts >= 16.0:
-        return 4
-    if speed_gts >= 8.0:
-        return 3
-    if speed_gts >= 5.0:
-        return 2
-    return 1
 
 
 def _find_link_files(start_dir: Path):

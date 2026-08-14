@@ -154,6 +154,46 @@ def _render_summary(disks: List[dict], results: List[dict], test_names: dict) ->
     return lines
 
 
+def _render_test_plans(test_plans: dict) -> List[str]:
+    """Секция фактических параметров тестов (вместо сырых .fio-шаблонов)."""
+    lines = ["## Фактические параметры тестов", ""]
+    lines.append(
+        "> Глобальные опции (ioengine, direct, runtime) задаются шаблонами "
+        "`configs/<interface>.fio`; ниже — параметры, с которыми реально "
+        "прошли тесты."
+    )
+    lines.append("")
+    for disk_name, info in test_plans.items():
+        header = f"**/dev/{disk_name}**"
+        details = []
+        ceiling = info.get("ceiling_mbps")
+        if ceiling:
+            details.append(f"потолок шины {ceiling:.0f} МБ/с")
+        max_sectors = info.get("max_sectors_kb")
+        if max_sectors:
+            details.append(f"лимит I/O ядра {max_sectors}k")
+        if info.get("target_iops"):
+            details.append(f"target {info['target_iops']} IOPS/поток")
+        if details:
+            header += " — " + ", ".join(details)
+        lines.append(header)
+        lines.append("")
+        lines.append("| Тест | Блок | iodepth | numjobs |")
+        lines.append("|------|------|---------|---------|")
+        tests = info.get("tests") or {}
+        if not tests:
+            lines.append("| — | — | — | — |")
+        else:
+            for test_id, params in tests.items():
+                lines.append(
+                    f"| {TEST_NAMES.get(test_id, test_id)} | "
+                    f"{params.get('bs', '—')} | {params.get('iodepth', '—')} | "
+                    f"{params.get('numjobs', '—')} |"
+                )
+        lines.append("")
+    return lines
+
+
 def generate_report(
     disks: List[dict],
     results: List[dict],
@@ -162,7 +202,7 @@ def generate_report(
     diag_store: Optional[dict] = None,
     tuner_report: Optional[List[dict]] = None,
     run_info: Optional[dict] = None,
-    fio_configs: Optional[dict] = None,
+    test_plans: Optional[dict] = None,
     show_lat_p99: bool = False,
     show_tmax: bool = False,
 ) -> Path:
@@ -178,7 +218,9 @@ def generate_report(
                         при наличии добавляет посекундные таблицы сэмплера
         tuner_report  — список применённых настроек тюнера (из SystemTuner.report())
         run_info      — метаданные запуска {"command": str, "flags": [(label, value), ...]}
-        fio_configs   — {интерфейс: сырое содержимое .fio-файла} для секции конфигов
+        test_plans    — фактические параметры тестов {диск: {интерфейс, ceiling_mbps,
+                        max_sectors_kb, target_iops, tests: {тест: {bs/iodepth/numjobs}}}};
+                        при наличии добавляет секцию «Фактические параметры тестов»
         show_lat_p99  — добавлять колонку Lat P99 в таблицу результатов
         show_tmax     — добавлять колонку Tmax (°C) в таблицу результатов
                         (в обычном режиме, без посекундного мониторинга)
@@ -321,16 +363,8 @@ def generate_report(
                 )
 
         lines.append("")
-        if fio_configs:
-            lines.append("## Конфигурация тестов (fio)")
-            lines.append("")
-            for name, content in fio_configs.items():
-                lines.append(f"Использован файл: `configs/{name}.fio`")
-                lines.append("")
-                lines.append("```ini")
-                lines.extend(content.splitlines())
-                lines.append("```")
-                lines.append("")
+        if test_plans:
+            lines.extend(_render_test_plans(test_plans))
 
         lines.append("## Результаты тестирования")
         lines.append("")

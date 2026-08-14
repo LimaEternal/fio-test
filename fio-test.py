@@ -27,6 +27,7 @@ fio-test.py — Автоматический бенчмаркинг несист
 import argparse
 import concurrent.futures
 import json
+import math
 from pathlib import Path
 import queue
 import re
@@ -45,7 +46,7 @@ from utils.fio_config import parse_fio_jobfile
 from utils.prefill import prefill_disks
 from utils.process import kill_process_tree, run_process
 from utils.reporter import generate_report
-from utils.scanner import scan_disks
+from utils.scanner import estimate_ceiling_mbps, scan_disks
 from utils.table_renderer import build_results_table
 from utils.tuner import SystemTuner
 
@@ -92,6 +93,23 @@ for _tests in INTERFACE_CONFIGS.values():
 # На fio-3.28 c fixedbufs/sqthread_poll встречался clat p99 ~17 с при
 # avg < 10 мс (недостоверная гистограмма) — такие значения не выводим.
 P99_RELIABILITY_FACTOR = 500
+
+# --- Динамический подбор параметров тестов ---------------------------------
+# Целевая нагрузка на один поток fio (IOPS), при которой оверхед ядра/прерываний
+# минимален. Чем больше блок, тем меньше системных вызовов на байт: поток,
+# генерирующий больше target_iops, упрётся в CPU раньше, чем в скорость диска.
+DEFAULT_TARGET_IOPS = 50000
+
+SEQUENTIAL_TESTS = {"seq_read", "seq_write"}
+MIN_SEQ_BS_KB = 64          # нижняя граница блока для последовательного доступа
+HDD_SEQ_BS_KB = 1024        # механические диски: всегда крупный блок (1M)
+MAX_JOBS = 32               # потолок numjobs на тест
+DEFAULT_MAX_SECTORS_KB = 4096  # фоллбек, если /sys/block/<d>/queue/max_sectors_kb не читается
+# RTT диска под нагрузкой (мс) — для расчёта iodepth по закону Литтла
+RTT_MS = {"nvme": 2, "sas": 5, "sata": 5}
+HDD_RTT_MS = 10
+# Аппаратный потолок глубины очереди по интерфейсу (AHCI SATA — QD32)
+MAX_QD = {"nvme": 128, "sas": 64, "sata": 32}
 
 
 _SHORT_FLAGS = {"c", "s", "f", "t", "l", "n"}
@@ -184,6 +202,12 @@ def parse_args():
         help="Размер тестовой области в гигабайтах на диск (по умолчанию 100). "
              "0 — весь диск",
     )
+    parser.add_argument(
+        "--target-iops", type=int, default=DEFAULT_TARGET_IOPS,
+        help="Целевая нагрузка на один поток fio в IOPS для расчёта размера "
+             "блока (по умолчанию 50000). Меньше — крупнее блоки и меньше "
+             "нагрузка на CPU, но ниже точность",
+    )
     def disk_token_type(token: str):
         try:
             return _expand_token(token)
@@ -222,6 +246,8 @@ def parse_args():
         args.add = [n for tok in args.add for n in tok]
     if args.delete is not None:
         args.delete = [n for tok in args.delete for n in tok]
+    if args.target_iops <= 0:
+        parser.error("--target-iops должен быть больше нуля")
     return args
 
 
@@ -379,27 +405,119 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
     return {"command": command.strip(), "flags": flags}
 
 
-def _collect_fio_configs(disks: list) -> dict:
-    """Возвращает {интерфейс: сырое содержимое .fio} для интерфейсов целевых дисков."""
-    used = set()
-    for disk in disks:
-        tran = disk.get("tran", "").lower()
-        if "nvme" in tran:
-            used.add("nvme")
-        elif "sas" in tran:
-            used.add("sas")
-        else:
-            used.add("sata")
+def _disk_interface(disk: dict) -> str:
+    """Возвращает ключ интерфейса (nvme/sas/sata) для диска."""
+    tran = disk.get("tran", "").lower()
+    if "nvme" in tran:
+        return "nvme"
+    if "sas" in tran:
+        return "sas"
+    return "sata"
 
-    configs = {}
-    for name in INTERFACES:
-        if name in used:
-            path = CONFIG_DIR / f"{name}.fio"
-            try:
-                configs[name] = path.read_text(encoding="utf-8")
-            except OSError:
-                configs[name] = f"# Файл {path.name} не найден"
-    return configs
+
+def collect_plan_info(disks: list, disk_plans=None,
+                      target_iops: int = DEFAULT_TARGET_IOPS) -> dict:
+    """
+    Собирает фактические параметры тестов для отчёта.
+
+    Возвращает {имя_диска: {"interface", "ceiling_mbps", "max_sectors_kb",
+    "target_iops", "tests": {тест: {"bs", "iodepth", "numjobs"}}}}.
+
+    В реальном режиме параметры берутся из уже построенного плана
+    (disk_plans) — ровно те, с которыми пойдут тесты; в тестовом режиме
+    (disk_plans=None) — считаются из профиля диска.
+    """
+    info = {}
+    plans_by_disk = {}
+    if disk_plans:
+        for _, disk, plan in disk_plans:
+            params = {}
+            for test_id, fio_args in plan:
+                params[test_id] = {}
+                for a in fio_args:
+                    for key in ("bs", "iodepth", "numjobs"):
+                        if a.startswith(f"--{key}="):
+                            params[test_id][key] = a.split("=", 1)[1]
+            plans_by_disk[disk["name"]] = params
+
+    for disk in disks:
+        profile = disk.get("profile") or {}
+        interface = profile.get("interface", _disk_interface(disk))
+        name = disk["name"]
+
+        if name in plans_by_disk:
+            tests = plans_by_disk[name]
+        else:
+            tests = {}
+            base = INTERFACE_CONFIGS.get(interface, INTERFACE_CONFIGS["sata"])
+            for test_id in base:
+                overrides = compute_test_overrides(profile, interface, test_id, target_iops)
+                tests[test_id] = dict(overrides)
+
+        info[name] = {
+            "interface": interface,
+            "ceiling_mbps": profile.get("ceiling_mbps"),
+            "max_sectors_kb": profile.get("max_sectors_kb"),
+            "target_iops": target_iops,
+            "tests": tests,
+        }
+    return info
+
+
+def build_disk_plans(disks: list, thresholds: dict, args) -> tuple:
+    """
+    Строит планы тестов для всех дисков.
+
+    Возвращает (disk_plans, disk_thresholds): disk_plans — список
+    [(disk_idx, disk, plan)], где plan — [(test_id, fio_args)] с
+    переопределёнными bs/iodepth/numjobs и добавленными --runtime/--size;
+    disk_thresholds — {disk_idx: пороги интерфейса}.
+    """
+    disk_plans = []
+    disk_thresholds = {}
+
+    for disk_idx, disk in enumerate(disks):
+        tran_key = _disk_interface(disk)
+        tests = INTERFACE_CONFIGS.get(tran_key, INTERFACE_CONFIGS["sata"])
+        disk_thresholds[disk_idx] = thresholds.get(tran_key, {})
+
+        plan = build_test_plan(disk, tests, target_iops=args.target_iops)
+
+        if args.runtime is not None:
+            plan = [
+                (t, [
+                    f"--runtime={args.runtime}" if a.startswith("--runtime=") else a
+                    for a in fio_args
+                ])
+                for t, fio_args in plan
+            ]
+
+        if args.block:
+            plan = [
+                (t, list(fio_args) + [f"--size={args.block}G"])
+                for t, fio_args in plan
+            ]
+
+        disk_plans.append((disk_idx, disk, plan))
+
+    return disk_plans, disk_thresholds
+
+
+def _fake_profile(tran: str, rotational: int = 0, **link) -> dict:
+    """Профиль железа в формате utils.scanner.collect_hw_profile()."""
+    nvme = tran.lower() == "nvme"
+    return {
+        "interface": tran.lower(),
+        "logical_block_size": 512,
+        "physical_block_size": 512,
+        "minimum_io_size": 512,
+        "optimal_io_size": 131072 if nvme else 0,
+        "max_hw_sectors_kb": 65535 if nvme else 32767,
+        "max_sectors_kb": 4096,
+        "rotational": rotational,
+        "link": link,
+        "ceiling_mbps": estimate_ceiling_mbps(tran.lower(), link, rotational),
+    }
 
 
 def build_fake_disks() -> list:
@@ -410,30 +528,42 @@ def build_fake_disks() -> list:
             "model": "SAMSUNG MZWLO1T9HCJR-00A07", "serial": "S795NC0Y101175",
             "tran": "NVME", "size": "1.7T", "phy_sec": 512, "slot": "nvme0",
             "pcie_info": {"gen": 5, "width": 4, "speed_gts": 32.0}, "root_partition": None,
+            "profile": _fake_profile("nvme", gen=5, width=4, speed_gts=32.0,
+                                     max_gen=5, max_width=4, max_speed_gts=32.0,
+                                     source="sysfs"),
         },
         {
             "name": "nvme1n1", "path": "/dev/nvme1n1",
             "model": "SAMSUNG MZWLO1T9HCJR-00A07", "serial": "S795NC0Y101184",
             "tran": "NVME", "size": "1.7T", "phy_sec": 512, "slot": "nvme1",
             "pcie_info": {"gen": 4, "width": 4, "speed_gts": 16.0}, "root_partition": None,
+            "profile": _fake_profile("nvme", gen=4, width=4, speed_gts=16.0,
+                                     max_gen=4, max_width=4, max_speed_gts=16.0,
+                                     source="sysfs"),
         },
         {
             "name": "sda", "path": "/dev/sda",
             "model": "SEAGATE ST1800MM0129", "serial": "ABC12345",
             "tran": "SAS", "size": "1.8T", "phy_sec": 512, "slot": "0:2:0:0",
             "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+            "profile": _fake_profile("sas", negotiated_gbps=12.0,
+                                     maximum_gbps=12.0, source="sas_phy"),
         },
         {
             "name": "sdb", "path": "/dev/sdb",
             "model": "SAMSUNG PM883 960GB", "serial": "S3Z7NB0T0000001",
             "tran": "SATA", "size": "960G", "phy_sec": 512, "slot": "1:0:0:0",
             "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+            "profile": _fake_profile("sata", spd_limit_gbps=6.0,
+                                     hw_spd_limit_gbps=6.0, source="ata_link"),
         },
         {
             "name": "sdc", "path": "/dev/sdc",
             "model": "WDC WD4004FZWX", "serial": "WD-WCC4E0TST01",
             "tran": "SATA", "size": "4T", "phy_sec": 4096, "slot": "1:0:0:1",
             "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+            "profile": _fake_profile("sata", rotational=1, spd_limit_gbps=3.0,
+                                     hw_spd_limit_gbps=3.0, source="ata_link"),
         },
     ]
 
@@ -781,119 +911,140 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     return res
 
 
-def _link_generation(speed_gts: float) -> int:
-    """Сопоставляет скорость линка (GT/s) с поколением PCIe."""
-    if speed_gts >= 128.0:
-        return 7
-    if speed_gts >= 64.0:
-        return 6
-    if speed_gts >= 32.0:
-        return 5
-    if speed_gts >= 16.0:
-        return 4
-    if speed_gts >= 8.0:
-        return 3
-    if speed_gts >= 5.0:
-        return 2
-    return 1
+def _pow2_down(x: float) -> int:
+    """Наибольшая степень двойки, не превосходящая x."""
+    if x < 1:
+        return 1
+    return 1 << int(math.floor(math.log2(x)))
 
 
-def _estimate_ceiling_mbps(interface: str, link: Optional[Dict], rotational: int) -> float:
-    """Оценивает максимальную реальную скорость диска в МБ/с."""
-    if interface == "nvme" and link:
-        gen = link.get("gen")
-        width = link.get("width")
-        if gen and width:
-            gen_speeds = {3: 4000, 4: 8000, 5: 16000, 6: 32000, 7: 64000}
-            base = gen_speeds.get(gen, 4000)
-            return base * width // 4
-
-    if interface == "sas" and link:
-        neg_gbps = link.get("negotiated_gbps")
-        if neg_gbps:
-            return neg_gbps * 1000 * 0.85
-
-    if interface == "sata":
-        return 250.0 if rotational == 1 else 550.0
-
-    return 0.0
+def _pow2_up(x: float) -> int:
+    """Наименьшая степень двойки, не меньшая x."""
+    if x <= 1:
+        return 1
+    return 1 << int(math.ceil(math.log2(x)))
 
 
-def build_test_plan(disk: dict, base_tests: dict) -> list:
+def _format_bs_kb(bs_kb: int) -> str:
+    """Форматирует блок в KB как строку fio (1024k → 1m)."""
+    if bs_kb >= 1024 and bs_kb % 1024 == 0:
+        return f"{bs_kb // 1024}m"
+    return f"{bs_kb}k"
+
+
+def _sequential_overrides(profile: dict, interface: str, target_iops: int) -> dict:
+    """
+    Считает bs/numjobs/iodepth для последовательного теста.
+
+    Потолок шины берётся из sysfs (GT/s × width × кодирование), блок — такой,
+    чтобы нагрузка на поток не превышала target_iops. Ограничения:
+      - не меньше минимального последовательного блока (64k);
+      - не больше лимита ядра max_sectors_kb на один I/O;
+      - не меньше физического блока диска;
+      - механические диски (rotational) всегда читают блоком 1M — формула
+        потолка шины к ним не применима.
+
+    numjobs добирает оставшиеся IOPS, iodepth — по закону Литтла (глубина
+    очереди покрывает задержку при целевой нагрузке на поток).
+
+    Возвращает {"bs", "iodepth", "numjobs"} или {} при отсутствии потолка
+    (фоллбек на базовые параметры .fio-конфига).
+    """
+    rotational = profile.get("rotational", 0)
+    ceiling = profile.get("ceiling_mbps")
+    if not ceiling:
+        ceiling = estimate_ceiling_mbps(interface, profile.get("link") or {}, rotational)
+    if ceiling <= 0:
+        return {}
+
+    max_sectors_kb = profile.get("max_sectors_kb") or DEFAULT_MAX_SECTORS_KB
+
+    if rotational == 1:
+        bs_kb = HDD_SEQ_BS_KB
+    else:
+        bs_kb = _pow2_down(ceiling * 1024 / target_iops)
+        if bs_kb < MIN_SEQ_BS_KB:
+            bs_kb = MIN_SEQ_BS_KB
+
+    bs_kb = min(bs_kb, max_sectors_kb)
+    phys_kb = max(1, math.ceil((profile.get("physical_block_size") or 4096) / 1024))
+    if bs_kb < phys_kb:
+        bs_kb = phys_kb
+
+    iops_needed = ceiling * 1024 / bs_kb
+    numjobs = min(max(1, math.ceil(iops_needed / target_iops)), MAX_JOBS)
+    iops_per_job = iops_needed / numjobs
+    rtt_ms = HDD_RTT_MS if rotational else RTT_MS.get(interface, 2)
+    qd_max = MAX_QD.get(interface, 32)
+    iodepth = min(max(8, _pow2_up(iops_per_job * rtt_ms / 1000)), qd_max)
+
+    return {"bs": _format_bs_kb(bs_kb), "iodepth": iodepth, "numjobs": numjobs}
+
+
+def _random_overrides(interface: str, link: dict, test_id: str) -> dict:
+    """
+    Параметры случайных тестов (bs всегда 4k). numjobs/iodepth подбираются
+    по правилам интерфейса/поколения: IOPS случайного доступа упираются
+    в сам накопитель, а не в шину, поэтому формула потолка тут не применяется.
+    """
+    gen = link.get("gen") if interface == "nvme" else None
+
+    if interface == "nvme":
+        if gen and gen >= 5:
+            if test_id == "rand_read":
+                return {"numjobs": 16, "iodepth": 16}
+            if test_id == "rand_write":
+                return {"numjobs": 8, "iodepth": 16}
+        elif gen and gen == 4:
+            if test_id in ("rand_read", "rand_write"):
+                return {"numjobs": 8, "iodepth": 32}
+    elif interface == "sas":
+        return {"iodepth": 8, "numjobs": 2}
+    elif interface == "sata":
+        return {"iodepth": 4, "numjobs": 1}
+
+    return {}
+
+
+def compute_test_overrides(profile: dict, interface: str, test_id: str,
+                           target_iops: int) -> dict:
+    """Возвращает переопределения (bs/iodepth/numjobs) для одного теста."""
+    if test_id in SEQUENTIAL_TESTS:
+        return _sequential_overrides(profile, interface, target_iops)
+    return _random_overrides(interface, profile.get("link") or {}, test_id)
+
+
+def build_test_plan(disk: dict, base_tests: dict,
+                    target_iops: int = DEFAULT_TARGET_IOPS) -> list:
     """
     Строит динамический план тестов на основе профиля железа диска.
 
     Возвращает список [(test_id, fio_args), ...] с переопределёнными
-    параметрами (bs, iodepth, numjobs) согласно:
-      - интерфейсу (NVMe/SAS/SATA)
-      - поколению линка (для NVMe: PCIe gen×width)
-      - физическому блоку (bs ≥ physical_block_size, кратный)
-      - потолку скорости (ceiling_mbps)
+    параметрами (bs, iodepth, numjobs):
+      - последовательные тесты: блок/потоки/глубина считаются из потолка
+        шины (sysfs: GT/s × width) под целевую нагрузку target_iops на поток;
+      - случайные тесты: bs=4k, numjobs/iodepth по правилам интерфейса.
 
-    Для NVMe Gen5+: seq_read использует 256k bs и больше numjobs.
-    Для SAS/SATA: iodepth ограничивается ~8-16 (контроллер не масштабирует).
+    Если потолок не определён (нет линка в sysfs) — параметры остаются
+    из базового .fio-конфига.
     """
     profile = disk.get("profile") or {}
     interface = profile.get("interface", disk.get("tran", "sata").lower())
-    link = profile.get("link")
-    rotational = profile.get("rotational", 0)
-    phys_block = profile.get("physical_block_size", 4096)
-
-    if interface == "nvme":
-        gen = link.get("gen") if link else None
-        width = link.get("width") if link else None
-    else:
-        gen = width = None
 
     plan = []
     for test_id, fio_args in base_tests.items():
         args = list(fio_args)
+        overrides = compute_test_overrides(profile, interface, test_id, target_iops)
 
-        bs_override = None
-        iodepth_override = None
-        numjobs_override = None
-
-        if interface == "nvme":
-            if gen and gen >= 5:
-                if test_id == "seq_read":
-                    bs_override = "256k"
-                    numjobs_override = 4
-                    iodepth_override = 16
-                elif test_id == "seq_write":
-                    numjobs_override = 2
-                    iodepth_override = 16
-                elif test_id == "rand_read":
-                    numjobs_override = 16
-                    iodepth_override = 16
-                elif test_id == "rand_write":
-                    numjobs_override = 8
-                    iodepth_override = 16
-            elif gen and gen == 4:
-                if test_id == "seq_read":
-                    numjobs_override = 2
-                    iodepth_override = 16
-                elif test_id == "seq_write":
-                    numjobs_override = 2
-                    iodepth_override = 16
-                elif test_id == "rand_read":
-                    numjobs_override = 8
-                    iodepth_override = 32
-                elif test_id == "rand_write":
-                    numjobs_override = 8
-                    iodepth_override = 32
-        elif interface == "sas":
-            iodepth_override = 8
-            numjobs_override = 2
-        elif interface == "sata":
-            iodepth_override = 4
-            numjobs_override = 1
-
-        if bs_override:
-            args = [a if not a.startswith("--bs=") else f"--bs={bs_override}" for a in args]
-        if iodepth_override:
-            args = [a if not a.startswith("--iodepth=") else f"--iodepth={iodepth_override}" for a in args]
-        if numjobs_override:
-            args = [a if not a.startswith("--numjobs=") else f"--numjobs={numjobs_override}" for a in args]
+        bs = overrides.get("bs")
+        iodepth = overrides.get("iodepth")
+        numjobs = overrides.get("numjobs")
+        if bs:
+            args = [a if not a.startswith("--bs=") else f"--bs={bs}" for a in args]
+        if iodepth:
+            args = [a if not a.startswith("--iodepth=") else f"--iodepth={iodepth}" for a in args]
+        if numjobs:
+            args = [a if not a.startswith("--numjobs=") else f"--numjobs={numjobs}" for a in args]
 
         plan.append((test_id, args))
 
@@ -1019,7 +1170,7 @@ def _snapshot_state(results, diag_store, live_store, state_lock):
 
 
 def _write_report(disks, results, diag_store, live_store, state_lock, output_path, tuner,
-                  test_names, run_info, fio_configs, show_lat_p99, show_tmax):
+                  test_names, run_info, test_plans, show_lat_p99, show_tmax):
     """Перегенерирует MD-отчёт по текущему (возможно, неполному) состоянию."""
     results_snap, diag_snap = _snapshot_state(results, diag_store, live_store, state_lock)
     return generate_report(
@@ -1027,7 +1178,7 @@ def _write_report(disks, results, diag_store, live_store, state_lock, output_pat
         diag_store=diag_snap,
         tuner_report=tuner.report() if tuner else None,
         run_info=run_info,
-        fio_configs=fio_configs,
+        test_plans=test_plans,
         show_lat_p99=show_lat_p99,
         show_tmax=show_tmax,
     )
@@ -1158,7 +1309,7 @@ def main():
             disks, results, TEST_NAMES, output_path=args.output,
             tuner_report=preview_rows or None,
             run_info=_build_run_info(args, test_mode=True),
-            fio_configs=_collect_fio_configs(disks),
+            test_plans=collect_plan_info(disks, target_iops=args.target_iops),
             show_lat_p99=args.logging,
             show_tmax=not args.logging,
         )
@@ -1218,8 +1369,6 @@ def main():
         console.print("[bold yellow]После фильтрации целевые диски не найдены.[/bold yellow]")
         sys.exit(0)
 
-    fio_configs = _collect_fio_configs(disks)
-
     if args.logging:
         for d in disks:
             d["diag_static"] = collect_static_info(d)
@@ -1274,12 +1423,19 @@ def main():
     state_lock = threading.Lock()
     results = [{} for _ in disks]
 
+    # Планы тестов строятся до первой записи отчёта: отчёт сразу показывает
+    # фактические параметры (bs/iodepth/numjobs), с которыми пойдут тесты.
+    disk_plans, disk_thresholds = build_disk_plans(disks, thresholds, args)
+    for disk_idx, thr in disk_thresholds.items():
+        results[disk_idx]["_thresholds"] = thr
+    test_plans = collect_plan_info(disks, disk_plans, target_iops=args.target_iops)
+
     # Начальная запись отчёта: файл существует с самого начала прогона,
     # даже если тесты ещё не начались или прогон прервётся.
     try:
         _write_report(
             disks, results, diag_store, live_store, state_lock, output_path,
-            tuner, TEST_NAMES, _build_run_info(args), fio_configs,
+            tuner, TEST_NAMES, _build_run_info(args), test_plans,
             show_lat_p99=args.logging,
             show_tmax=not args.logging,
         )
@@ -1294,7 +1450,7 @@ def main():
         def render_report():
             _write_report(
                 disks, results, diag_store, live_store, state_lock, output_path,
-                tuner, TEST_NAMES, _build_run_info(args), fio_configs,
+                tuner, TEST_NAMES, _build_run_info(args), test_plans,
                 show_lat_p99=args.logging,
                 show_tmax=not args.logging,
             )
@@ -1315,40 +1471,6 @@ def main():
 
     if args.runtime is not None:
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")
-
-    # Подготовка задач: по одному плану тестов на диск (тесты диска — подряд)
-    disk_plans = []
-
-    for disk_idx, disk in enumerate(disks):
-        tran = disk.get("tran", "").lower()
-        if "nvme" in tran:
-            tran_key = "nvme"
-        elif "sas" in tran:
-            tran_key = "sas"
-        else:
-            tran_key = "sata"
-
-        tests = INTERFACE_CONFIGS.get(tran_key, INTERFACE_CONFIGS["sata"])
-        results[disk_idx]["_thresholds"] = thresholds.get(tran_key, {})
-
-        plan = build_test_plan(disk, tests)
-
-        if args.runtime is not None:
-            plan = [
-                (t, [
-                    f"--runtime={args.runtime}" if a.startswith("--runtime=") else a
-                    for a in fio_args
-                ])
-                for t, fio_args in plan
-            ]
-
-        if args.block:
-            plan = [
-                (t, list(fio_args) + [f"--size={args.block}G"])
-                for t, fio_args in plan
-            ]
-
-        disk_plans.append((disk_idx, disk, plan))
 
     # Запуск тестов
     if args.logging:
@@ -1411,7 +1533,7 @@ def main():
                     prefill_duration=prefill_duration,
                     tests_duration=tests_duration,
                 ),
-                fio_configs,
+                test_plans,
                 show_lat_p99=args.logging,
                 show_tmax=not args.logging,
             )

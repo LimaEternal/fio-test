@@ -387,7 +387,7 @@ class MainParallelModeTests(unittest.TestCase):
         self.assertIsNone(report_kwargs.get("diag_store"))
         self.assertFalse(report_kwargs.get("show_lat_p99"))
         self.assertIsNotNone(report_kwargs.get("run_info"))
-        self.assertIsNotNone(report_kwargs.get("fio_configs"))
+        self.assertIsNotNone(report_kwargs.get("test_plans"))
 
 
 class MainBlockSizeTests(unittest.TestCase):
@@ -1269,7 +1269,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
 
 
 class BuildTestPlanTests(unittest.TestCase):
-    """build_test_plan: переопределения bs/iodepth/numjobs по интерфейсу и линку."""
+    """build_test_plan: динамический расчёт bs/numjobs/iodepth по потолку шины."""
 
     BASE_TESTS = {
         "seq_read": ["--rw=read", "--bs=128k", "--iodepth=64", "--numjobs=4"],
@@ -1278,52 +1278,104 @@ class BuildTestPlanTests(unittest.TestCase):
         "rand_write": ["--rw=randwrite", "--bs=4k", "--iodepth=32", "--numjobs=8"],
     }
 
-    def _disk(self, interface="nvme", gen=None, width=4):
-        profile = {"interface": interface, "physical_block_size": 4096}
-        if gen is not None:
-            profile["link"] = {"gen": gen, "width": width}
+    def _gen(self, gts):
+        if gts >= 32:
+            return 5
+        if gts >= 16:
+            return 4
+        if gts >= 8:
+            return 3
+        return 2
+
+    def _disk(self, interface="nvme", gts=None, width=4, rotational=0,
+              max_sectors_kb=4096, phys=4096, link=None):
+        profile = {
+            "interface": interface,
+            "rotational": rotational,
+            "physical_block_size": phys,
+            "max_sectors_kb": max_sectors_kb,
+        }
+        if link is None:
+            if gts is not None:
+                link = {"speed_gts": gts, "width": width, "gen": self._gen(gts)}
+            elif interface == "sas":
+                link = {"negotiated_gbps": 12.0}
+            elif interface == "sata":
+                link = {"spd_limit_gbps": 6.0}
+        if link is not None:
+            profile["link"] = link
         return {"tran": interface, "profile": profile}
 
     def _plan_args(self, disk, test_id):
         plan = fio_test.build_test_plan(disk, self.BASE_TESTS)
         return dict(plan)[test_id]
 
-    def test_gen4_seq_write_overridden_like_gen5(self):
-        args = self._plan_args(self._disk(gen=4), "seq_write")
+    def test_gen4_seq_read(self):
+        args = self._plan_args(self._disk(gts=16), "seq_read")
+        self.assertIn("--bs=128k", args)
         self.assertIn("--numjobs=2", args)
-        self.assertIn("--iodepth=16", args)
+        self.assertIn("--iodepth=64", args)
 
-    def test_gen4_seq_read_overridden(self):
-        args = self._plan_args(self._disk(gen=4), "seq_read")
+    def test_gen5_seq_read(self):
+        args = self._plan_args(self._disk(gts=32), "seq_read")
+        self.assertIn("--bs=256k", args)
         self.assertIn("--numjobs=2", args)
-        self.assertIn("--iodepth=16", args)
+        self.assertIn("--iodepth=64", args)
 
-    def test_gen4_rand_read_overridden(self):
-        args = self._plan_args(self._disk(gen=4), "rand_read")
-        self.assertIn("--numjobs=8", args)
-        self.assertIn("--iodepth=32", args)
+    def test_gen6_seq_read(self):
+        args = self._plan_args(self._disk(gts=64), "seq_read")
+        self.assertIn("--bs=512k", args)
+        self.assertIn("--numjobs=2", args)
 
-    def test_gen5_seq_read_overridden(self):
-        args = self._plan_args(self._disk(gen=5), "seq_read")
-        self.assertIn("--numjobs=4", args)
-        self.assertIn("--iodepth=16", args)
+    def test_gen7_seq_read(self):
+        args = self._plan_args(self._disk(gts=128), "seq_read")
+        self.assertIn("--bs=1m", args)
+        self.assertIn("--numjobs=2", args)
+
+    def test_gen5_seq_write_same_bs_formula(self):
+        args = self._plan_args(self._disk(gts=32), "seq_write")
         self.assertIn("--bs=256k", args)
 
+    def test_sata_ssd_seq_read(self):
+        args = self._plan_args(self._disk(interface="sata"), "seq_read")
+        self.assertIn("--bs=64k", args)
+        self.assertIn("--numjobs=1", args)
+        self.assertIn("--iodepth=32", args)
+
+    def test_sata_hdd_seq_read_uses_1m(self):
+        args = self._plan_args(
+            self._disk(interface="sata", rotational=1), "seq_read"
+        )
+        self.assertIn("--bs=1m", args)
+        self.assertIn("--numjobs=1", args)
+
+    def test_sas_seq_read(self):
+        args = self._plan_args(self._disk(interface="sas"), "seq_read")
+        self.assertIn("--bs=64k", args)
+        self.assertIn("--numjobs=1", args)
+        self.assertIn("--iodepth=64", args)
+
+    def test_max_sectors_kb_clamps_bs(self):
+        args = self._plan_args(self._disk(gts=128, max_sectors_kb=256), "seq_read")
+        self.assertIn("--bs=256k", args)
+        self.assertIn("--numjobs=6", args)
+
+    def test_no_pcie_info_returns_unchanged(self):
+        args = self._plan_args(self._disk(), "seq_read")
+        self.assertEqual(args, self.BASE_TESTS["seq_read"])
+
     def test_gen5_rand_read_overridden(self):
-        args = self._plan_args(self._disk(gen=5), "rand_read")
+        args = self._plan_args(self._disk(gts=32), "rand_read")
         self.assertIn("--numjobs=16", args)
         self.assertIn("--iodepth=16", args)
 
-    def test_no_pcie_info_returns_unchanged(self):
-        args = self._plan_args(self._disk(gen=None), "seq_read")
-        self.assertEqual(args, self.BASE_TESTS["seq_read"])
+    def test_gen4_rand_read_overridden(self):
+        args = self._plan_args(self._disk(gts=16), "rand_read")
+        self.assertIn("--numjobs=8", args)
+        self.assertIn("--iodepth=32", args)
 
-    def test_gen_without_overrides_returns_unchanged(self):
-        args = self._plan_args(self._disk(gen=3), "seq_read")
-        self.assertEqual(args, self.BASE_TESTS["seq_read"])
-
-    def test_sata_lowers_depth(self):
-        args = self._plan_args(self._disk(interface="sata"), "seq_read")
+    def test_sata_rand_overridden(self):
+        args = self._plan_args(self._disk(interface="sata"), "rand_read")
         self.assertIn("--numjobs=1", args)
         self.assertIn("--iodepth=4", args)
 

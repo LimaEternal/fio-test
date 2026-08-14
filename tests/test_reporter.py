@@ -269,25 +269,35 @@ class GenerateReportRunInfoTests(unittest.TestCase):
         self.assertNotIn("## Параметры запуска", text)
 
 
-class GenerateReportFioConfigsTests(unittest.TestCase):
-    def test_report_contains_fio_config_content(self):
-        fio_configs = {
-            "nvme": "# FIO-конфиг для NVMe\n[global]\nioengine=io_uring\ndirect=1\n",
+class GenerateReportTestPlansTests(unittest.TestCase):
+    def test_report_contains_actual_test_params(self):
+        test_plans = {
+            "nvme0n1": {
+                "interface": "nvme",
+                "ceiling_mbps": 15753.6,
+                "max_sectors_kb": 1280,
+                "target_iops": 50000,
+                "tests": {
+                    "seq_read": {"bs": "256k", "iodepth": 64, "numjobs": 2},
+                    "rand_read": {"bs": "4k", "iodepth": 16, "numjobs": 16},
+                },
+            }
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = generate_report(
                 [DISK], make_results(), TEST_NAMES,
                 output_path=Path(tmp) / "report.md",
-                fio_configs=fio_configs,
+                test_plans=test_plans,
             )
             text = path.read_text(encoding="utf-8")
 
-        self.assertIn("## Конфигурация тестов (fio)", text)
-        self.assertIn("Использован файл: `configs/nvme.fio`", text)
-        self.assertIn("ioengine=io_uring", text)
-        self.assertIn("direct=1", text)
+        self.assertIn("## Фактические параметры тестов", text)
+        self.assertIn("**/dev/nvme0n1**", text)
+        self.assertIn("потолок шины 15754 МБ/с", text)
+        self.assertIn("256k", text)
+        self.assertIn("2", text)
 
-    def test_report_without_fio_configs_has_no_config_section(self):
+    def test_report_without_test_plans_has_no_config_section(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = generate_report(
                 [DISK], make_results(), TEST_NAMES,
@@ -295,7 +305,7 @@ class GenerateReportFioConfigsTests(unittest.TestCase):
             )
             text = path.read_text(encoding="utf-8")
 
-        self.assertNotIn("## Конфигурация тестов (fio)", text)
+        self.assertNotIn("## Фактические параметры тестов", text)
 
 
 class GenerateReportLatP99Tests(unittest.TestCase):
