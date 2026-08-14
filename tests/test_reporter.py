@@ -332,6 +332,7 @@ class GenerateReportLatP99Tests(unittest.TestCase):
                 [DISK], [res], TEST_NAMES,
                 output_path=Path(tmp) / "report.md",
                 show_lat_p99=True,
+                diag_store={},
             )
             text = path.read_text(encoding="utf-8")
 
@@ -409,6 +410,45 @@ class RenderSummaryTests(unittest.TestCase):
 
         self.assertIn("## Сводка", text)
         self.assertIn("| FAIL |", text)
+
+
+class GenerateReportShowTmaxTests(unittest.TestCase):
+    def test_plain_report_has_tmax_column_but_no_monitoring_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+                show_tmax=True,
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("Tmax (°C)", text)
+        self.assertIn("| 41.0 |", text)
+        self.assertNotIn("**Мониторинг —", text)
+        self.assertNotIn("| NUMA |", text)
+
+    def test_plain_report_tmax_dash_without_diag_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(include_diag=False), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+                show_tmax=True,
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("Tmax (°C)", text)
+        self.assertNotIn("**Мониторинг —", text)
+
+    def test_plain_report_without_tmax_flag_has_no_tmax_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("Tmax (°C)", text)
+        self.assertNotIn("**Мониторинг —", text)
 
 
 if __name__ == "__main__":

@@ -14,15 +14,26 @@ from rich.text import Text
 
 TITLE = "Результаты тестирования накопителей (FIO)"
 
-SHOW_DIAG_COLS = False
+SHOW_LAT_P99 = False
 
-RESULT_HEADERS = tuple(
+# Базовая раскладка: колонка Tmax (°C) показывается всегда, Lat p99 — только
+# в подробном режиме (-l), где добавляется динамически (см. _result_headers).
+BASE_RESULT_HEADERS = tuple(
     [("Профиль теста", "left", 9), ("Блок", "center", 5), ("IOPS", "center", 7),
      ("Скорость (МБ/с)", "center", 8), ("Lat Avg (мс)", "center", 11)]
-    + ([("Lat p99 (мс)", "center", 10)] if SHOW_DIAG_COLS else [])
-    + ([("Tmax (°C)", "center", 8)] if SHOW_DIAG_COLS else [])
+    + [("Tmax (°C)", "center", 8)]
     + [("Статус", "center", 6)]
 )
+
+RESULT_HEADERS = BASE_RESULT_HEADERS
+
+
+def _result_headers():
+    """Колонки вложенной таблицы с учётом текущего режима отображения."""
+    headers = list(BASE_RESULT_HEADERS)
+    if SHOW_LAT_P99:
+        headers.insert(-2, ("Lat p99 (мс)", "center", 10))
+    return headers
 
 
 def format_status(status):
@@ -61,9 +72,9 @@ def _test_rows(disk_results, test_names):
         result = disk_results.get(test_id, {})
         if "error" in result:
             row = [test_name + "\n", "—", "—", "—", "—"]
-            if SHOW_DIAG_COLS:
+            if SHOW_LAT_P99:
                 row.append("—")
-                row.append("—")
+            row.append("—")
             row.append("FAIL")
         else:
             row = [
@@ -73,13 +84,13 @@ def _test_rows(disk_results, test_names):
                 _fmt(result.get("bw_mb", 0), ".1f"),
                 _fmt(result.get("lat_avg", 0), ".2f"),
             ]
-            if SHOW_DIAG_COLS:
+            if SHOW_LAT_P99:
                 if result.get("lat_p99_unreliable"):
                     row.append("—")
                 else:
                     row.append(_fmt(result.get("lat_p99", 0), ".2f"))
-                diag = result.get("diag") or {}
-                row.append(_fmt(diag.get("temp_max_c"), ".1f") if diag.get("temp_max_c") is not None else "—")
+            diag = result.get("diag") or {}
+            row.append(_fmt(diag.get("temp_max_c"), ".1f") if diag.get("temp_max_c") is not None else "—")
             row.append(result.get("status", "FAIL"))
         rows.append(tuple(row))
     return rows
@@ -94,7 +105,7 @@ def _results_cell(disk_results, test_names):
         padding=0,
         collapse_padding=True,
     )
-    for header, justify, min_width in RESULT_HEADERS:
+    for header, justify, min_width in _result_headers():
         sub.add_column(
             header=header, justify=justify,
             min_width=min_width, overflow="fold",
@@ -108,8 +119,8 @@ def _results_cell(disk_results, test_names):
 
 def build_results_table(disks, results, test_names, show_lat_p99=False):
     """Строит одну непрерывную таблицу для всех накопителей."""
-    global SHOW_DIAG_COLS
-    SHOW_DIAG_COLS = show_lat_p99
+    global SHOW_LAT_P99
+    SHOW_LAT_P99 = show_lat_p99
 
     table = Table(
         box=box.ROUNDED,

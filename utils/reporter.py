@@ -164,6 +164,7 @@ def generate_report(
     run_info: Optional[dict] = None,
     fio_configs: Optional[dict] = None,
     show_lat_p99: bool = False,
+    show_tmax: bool = False,
 ) -> Path:
     """
     Генерирует MD-файл с таблицей результатов.
@@ -179,6 +180,8 @@ def generate_report(
         run_info      — метаданные запуска {"command": str, "flags": [(label, value), ...]}
         fio_configs   — {интерфейс: сырое содержимое .fio-файла} для секции конфигов
         show_lat_p99  — добавлять колонку Lat P99 в таблицу результатов
+        show_tmax     — добавлять колонку Tmax (°C) в таблицу результатов
+                        (в обычном режиме, без посекундного мониторинга)
 
     Возвращает:
         Path к созданному файлу
@@ -221,7 +224,11 @@ def generate_report(
                     lines.append(f"| {label} | {value} |")
                 lines.append("")
 
-        has_diag = (
+        # Мониторинг-секции (расширенная таблица дисков, «Мониторинг»,
+        # посекундные сэмплы, заметки) показываются только в подробном режиме
+        # (-l), когда diag_store передаётся; в обычном режиме res["diag"] тоже
+        # заполняется (для колонки Tmax), но посекундных данных в отчёте нет.
+        has_diag = diag_store is not None and (
             any(d.get("diag_static") for d in disks)
             or any(
                 res.get("diag")
@@ -342,6 +349,13 @@ def generate_report(
                 lines.append(
                     "|---------------|------|------|-----------------|--------------|--------------|--------|"
                 )
+            elif show_tmax:
+                lines.append(
+                    "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Tmax (°C) | Статус |"
+                )
+                lines.append(
+                    "|---------------|------|------|-----------------|--------------|-----------|--------|"
+                )
             else:
                 lines.append(
                     "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Статус |"
@@ -355,7 +369,7 @@ def generate_report(
 
                 if "error" in res:
                     cells = [test_name, res.get("bs", "—"), "—", "—", "—"]
-                    if show_lat_p99:
+                    if show_lat_p99 or show_tmax:
                         cells.append("—")
                     cells.append("FAIL")
                 else:
@@ -371,6 +385,12 @@ def generate_report(
                             cells.append("—")
                         else:
                             cells.append(_fmt(res.get("lat_p99", 0), ".2f"))
+                    elif show_tmax:
+                        diag = res.get("diag") or {}
+                        if diag.get("temp_max_c") is not None:
+                            cells.append(_fmt(diag["temp_max_c"], ".1f"))
+                        else:
+                            cells.append("—")
                     cells.append(res.get("status", "FAIL"))
                 lines.append("| " + " | ".join(cells) + " |")
 

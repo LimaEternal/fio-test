@@ -197,6 +197,29 @@ class TableRendererTests(unittest.TestCase):
         self.assertEqual(failed.plain, "FAIL")
         self.assertEqual(str(failed.style), "bold red")
 
+    def test_tmax_column_always_present_lat_p99_only_in_logging(self):
+        plain = render_table(build_results_table(DISKS, RESULTS, TEST_NAMES))
+        self.assertIn("Tmax (°C)", plain)
+        self.assertNotIn("Lat p99 (мс)", plain)
+
+        logging = render_table(
+            build_results_table(DISKS, RESULTS, TEST_NAMES, show_lat_p99=True)
+        )
+        self.assertIn("Tmax (°C)", logging)
+        self.assertIn("Lat p99 (мс)", logging)
+
+    def test_tmax_value_from_diag(self):
+        results = [
+            {"seq_read": {
+                "bs": "64k", "iops": 73390, "bw_mb": 4586.9,
+                "lat_avg": 0.44, "status": "PASS",
+                "diag": {"temp_max_c": 61.5},
+            }},
+            {},
+        ]
+        output = render_table(build_results_table(DISKS, results, TEST_NAMES))
+        self.assertIn("61.5", output)
+
     def test_fake_test_mode_data_renders_without_errors(self):
         entrypoint = load_entrypoint()
         disks = entrypoint.build_fake_disks()
@@ -211,6 +234,7 @@ class TableRendererTests(unittest.TestCase):
             self.assertIn(f"/dev/{name}", output)
         self.assertGreaterEqual(output.count("test"), 100)
         self.assertNotIn("Lat p99 (мс)", output)
+        self.assertIn("Tmax (°C)", output)
 
 
 if __name__ == "__main__":

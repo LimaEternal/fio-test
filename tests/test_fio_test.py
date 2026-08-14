@@ -418,15 +418,20 @@ class RunFioTestDiagStoreTests(unittest.TestCase):
             fio_test.run_fio_test(DISK, "seq_read", ["--rw=read"])
         saver.assert_not_called()
 
-    def test_no_diag_store_means_no_sampler(self):
+    def test_sampler_runs_and_diag_present_without_diag_store(self):
         raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})
         fake = (mock.Mock(returncode=0), raw.encode(), b"")
+        summary = {"temp_max_c": 41.0, "sources": {"link": True, "temp": True}}
         with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
              mock.patch.object(fio_test, "DiagnosticSampler") as fake_sampler_cls:
+            fake_sampler = fake_sampler_cls.return_value
+            fake_sampler.samples = []
+            fake_sampler.summary.return_value = dict(summary)
             res = fio_test.run_fio_test(DISK, "seq_read", ["--rw=read"])
 
-        self.assertNotIn("diag", res)
-        fake_sampler_cls.assert_not_called()
+        fake_sampler_cls.assert_called_once()
+        self.assertIn("diag", res)
+        self.assertEqual(res["diag"]["temp_max_c"], 41.0)
 
 
 class RunFioTestLogFlagsTests(unittest.TestCase):
@@ -473,7 +478,7 @@ class RunFioTestLogFlagsTests(unittest.TestCase):
         self.assertNotIn("--write_bw_log", cmd)
         self.assertNotIn("--write_iops_log", cmd)
         sampler.merge_fio_logs.assert_not_called()
-        self.assertNotIn("diag", res)
+        self.assertIn("diag", res)
 
     def test_notes_for_missing_temp(self):
         raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1, "iops": 1}}]})

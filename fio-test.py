@@ -631,9 +631,11 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
                  state_lock=None, live_store=None):
     """Запускает fio-тест. Поддерживает отмену через cancel_event.
 
-    В диагностическом режиме (diag_store) параллельно сэмплирует линк,
-    температуру и реальную нагрузку на диск; сэмплы и сводка сохраняются
-    в памяти и попадают в единый файл отчёта.
+    Параллельно с тестом всегда сэмплирует линк и температуру; сводка
+    (максимальная температура за тест и т.п.) попадает в res["diag"] — из неё
+    берётся колонка Tmax в консольной таблице. В диагностическом режиме
+    (diag_store) дополнительно пишутся посекундные логи нагрузки, raw JSON
+    и посекундные сэмплы в diag_store/live_store для единого файла отчёта.
 
     state_lock защищает запись в общие diag_store/live_store от гонок
     с фоновым writer-потоком инкрементального отчёта.
@@ -669,22 +671,21 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         ])
 
     stop_event = threading.Event()
-    sampler = None
-    sampler_thread = None
-
-    if diag_store is not None:
-        sampler = DiagnosticSampler(disk_info)
-        sampler_thread = threading.Thread(
-            target=sampler.run, args=(stop_event,), daemon=True
-        )
-        sampler_thread.start()
-        if live_store is not None:
-            live_entry = {"test_id": test_id, "samples": sampler.samples}
-            if state_lock is not None:
-                with state_lock:
-                    live_store[disk_info["name"]] = live_entry
-            else:
+    # Сэмплер линка/температуры запускается всегда: максимальная температура
+    # за тест нужна в обычном режиме (колонка Tmax). Посекундные логи нагрузки,
+    # raw JSON и живой отчёт остаются фичей диагностического режима (-l).
+    sampler = DiagnosticSampler(disk_info)
+    sampler_thread = threading.Thread(
+        target=sampler.run, args=(stop_event,), daemon=True
+    )
+    sampler_thread.start()
+    if diag_store is not None and live_store is not None:
+        live_entry = {"test_id": test_id, "samples": sampler.samples}
+        if state_lock is not None:
+            with state_lock:
                 live_store[disk_info["name"]] = live_entry
+        else:
+            live_store[disk_info["name"]] = live_entry
 
     res = None
     try:
@@ -726,25 +727,25 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
                 live_store.pop(disk_info["name"], None)
 
     if res is not None:
-        if sampler:
-            if fio_log_prefix:
-                merged = sampler.merge_fio_logs(fio_log_prefix)
-            else:
-                merged = False
-            summary = sampler.summary()
-            res["diag"] = summary
-            sources = summary.get("sources") or {}
-            notes = []
-            if not sources.get("link"):
-                notes.append("линк PCIe не удалось прочитать")
-            if not sources.get("temp"):
-                notes.append("температура недоступна: установите nvme-cli (нужен nvme smart-log)")
-            summary["notes"] = notes
-            if notes:
-                console.print(
-                    f"[yellow]Мониторинг /dev/{disk_info['name']} ({test_id}): "
-                    f"{'; '.join(notes)}[/yellow]"
-                )
+        if fio_log_prefix:
+            merged = sampler.merge_fio_logs(fio_log_prefix)
+        else:
+            merged = False
+        summary = sampler.summary()
+        res["diag"] = summary
+        sources = summary.get("sources") or {}
+        notes = []
+        if not sources.get("link"):
+            notes.append("линк PCIe не удалось прочитать")
+        if not sources.get("temp"):
+            notes.append("температура недоступна: установите nvme-cli (нужен nvme smart-log)")
+        summary["notes"] = notes
+        if notes and diag_store is not None:
+            console.print(
+                f"[yellow]Мониторинг /dev/{disk_info['name']} ({test_id}): "
+                f"{'; '.join(notes)}[/yellow]"
+            )
+        if diag_store is not None:
             entry = {"samples": sampler.samples, "summary": summary}
             if state_lock is not None:
                 with state_lock:
@@ -993,7 +994,7 @@ def _snapshot_state(results, diag_store, live_store, state_lock):
 
 
 def _write_report(disks, results, diag_store, live_store, state_lock, output_path, tuner,
-                  test_names, run_info, fio_configs, show_lat_p99):
+                  test_names, run_info, fio_configs, show_lat_p99, show_tmax):
     """Перегенерирует MD-отчёт по текущему (возможно, неполному) состоянию."""
     results_snap, diag_snap = _snapshot_state(results, diag_store, live_store, state_lock)
     return generate_report(
@@ -1003,6 +1004,7 @@ def _write_report(disks, results, diag_store, live_store, state_lock, output_pat
         run_info=run_info,
         fio_configs=fio_configs,
         show_lat_p99=show_lat_p99,
+        show_tmax=show_tmax,
     )
 
 
@@ -1133,6 +1135,7 @@ def main():
             run_info=_build_run_info(args, test_mode=True),
             fio_configs=_collect_fio_configs(disks),
             show_lat_p99=args.logging,
+            show_tmax=not args.logging,
         )
         console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
         return
@@ -1253,6 +1256,7 @@ def main():
             disks, results, diag_store, live_store, state_lock, output_path,
             tuner, TEST_NAMES, _build_run_info(args), fio_configs,
             show_lat_p99=args.logging,
+            show_tmax=not args.logging,
         )
     except Exception as exc:
         console.print(f"[dim]Не удалось создать отчёт: {exc}[/dim]")
@@ -1267,6 +1271,7 @@ def main():
                 disks, results, diag_store, live_store, state_lock, output_path,
                 tuner, TEST_NAMES, _build_run_info(args), fio_configs,
                 show_lat_p99=args.logging,
+                show_tmax=not args.logging,
             )
         writer = _ReportWriter(
             report_queue,
@@ -1375,6 +1380,7 @@ def main():
                 ),
                 fio_configs,
                 show_lat_p99=args.logging,
+                show_tmax=not args.logging,
             )
         except Exception as exc:
             console.print(f"[bold red]Не удалось записать отчёт:[/bold red] {exc}")
