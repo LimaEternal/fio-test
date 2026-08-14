@@ -1,7 +1,9 @@
 """
 Предварительное заполнение дисков (-f).
 
-Фаза, при которой весь объём дисков записывается данными до тестов.
+Фаза, при которой область дисков записывается данными до тестов. По умолчанию
+заполняется блок в block_gb гигабайт (CLI-флаг -b/--block), при block_gb=0 —
+весь объём диска (size=100% из configs/prefill.fio).
 Движок и параметры записи задаются в configs/prefill.fio (key=value -> аргументы
 fio). Если движок не записывает ни байта в течение STALL_SECONDS секунд, делается
 один авто-fallback на psync. Прогресс берётся из живых JSON-статусов fio
@@ -222,13 +224,16 @@ def _run_fio_stream(cmd, cancel_event=None, on_progress=None):
     return exit_code == 0
 
 
-def run_prefill(disk_info, cancel_event=None, tuner=None, on_progress=None):
+def run_prefill(disk_info, cancel_event=None, tuner=None, on_progress=None,
+                block_gb=100):
     """Запускает предварительное заполнение диска по configs/prefill.fio.
 
     Команда собирается из конфига + служебных аргументов fio (JSON-статусы,
-    имя задачи). Если движок не пишет (стагн) или fio не запускается, делается
-    один fallback на psync. Возвращает True при успехе, False при ошибке,
-    None при отмене.
+    имя задачи). При block_gb > 0 область заполнения ограничивается
+    --size={block_gb}G (конфиговый size= отбрасывается); при block_gb == 0
+    заполняется весь диск (size=100% из конфига). Если движок не пишет (стагн)
+    или fio не запускается, делается один fallback на psync.
+    Возвращает True при успехе, False при ошибке, None при отмене.
     """
     disk_path = disk_info["path"]
     config_args = _load_prefill_config()
@@ -244,9 +249,13 @@ def run_prefill(disk_info, cancel_event=None, tuner=None, on_progress=None):
         for arg in config_args:
             if engine_override and arg.startswith("--ioengine="):
                 continue
+            if block_gb and arg.startswith("--size="):
+                continue
             cmd.append(arg)
         if engine_override:
             cmd.append(f"--ioengine={engine_override}")
+        if block_gb:
+            cmd.append(f"--size={block_gb}G")
         if tuner:
             numa_cpus = tuner.get_numa_cpus(disk_info["name"])
             if numa_cpus:
@@ -287,6 +296,17 @@ def _disk_total_bytes(name: str):
         return None
 
 
+def _resolve_size_bytes(block_gb: int, disk_bytes) -> int:
+    """Размер заполняемой области в байтах.
+
+    block_gb == 0 → весь диск (disk_bytes); иначе — min(disk_bytes, N * 2**30).
+    """
+    disk_bytes = disk_bytes or 0
+    if block_gb <= 0:
+        return disk_bytes
+    return min(disk_bytes, block_gb * (2 ** 30))
+
+
 class _BytesColumn(ProgressColumn):
     """Колонка прогрессбара: записано из общего объёма диска."""
 
@@ -296,13 +316,14 @@ class _BytesColumn(ProgressColumn):
         )
 
 
-def prefill_disks(disks, tuner=None, cancel_event=None):
-    """Принудительно предварительно заполняет все диски параллельно.
+def prefill_disks(disks, tuner=None, cancel_event=None, block_gb=100):
+    """Предварительно заполняет все диски параллельно.
 
     Заполняются все переданные диски принудительно (флаг -f означает всегда
-    полный префилл). Прогресс — Rich-бар на диск (проценты, объём, скорость,
-    секундомер, ETA); данные приходят из живых статусов fio через коллбеки
-    run_prefill.
+    полный префилл). Область заполнения — block_gb гигабайт на диск (при
+    block_gb=0 — весь объём диска). Прогресс — Rich-бар на диск (проценты,
+    объём, скорость, секундомер, ETA); данные приходят из живых статусов fio
+    через коллбеки run_prefill.
     Возвращает длительность этапа в секундах.
     """
     phase_start = time.monotonic()
@@ -327,7 +348,8 @@ def prefill_disks(disks, tuner=None, cancel_event=None):
             task_ids = {}
             for d in disks:
                 name = d["name"]
-                total = _disk_total_bytes(name) or 1
+                disk_total = _disk_total_bytes(name) or 0
+                total = _resolve_size_bytes(block_gb, disk_total) or 1
                 task_ids[name] = progress.add_task(
                     f"Заполнение /dev/{name}", total=total, completed=0, speed=""
                 )
@@ -351,6 +373,7 @@ def prefill_disks(disks, tuner=None, cancel_event=None):
                         cancel_event=cancel_event,
                         tuner=tuner,
                         on_progress=on_progress,
+                        block_gb=block_gb,
                     )
                 ] = d
 

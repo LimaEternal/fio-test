@@ -109,6 +109,21 @@ def _expand_short_flags(argv: list[str]) -> list[str]:
     return expanded
 
 
+def _block_gb_type(value: str) -> int:
+    """Тип для -b/--block: целое число гигабайт, 0 = весь диск."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"не число гигабайт: '{value}'"
+        )
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            "размер области не может быть отрицательным (0 = весь диск)"
+        )
+    return n
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Тестирование производительности NVMe/SAS/SATA накопителей через fio",
@@ -120,6 +135,7 @@ def parse_args():
             "  python fio-test.py -c -s                     — с подтверждением, последовательно\n"
             "  python fio-test.py -f                        — быстрый режим без предварительного заполнения\n"
             "  python fio-test.py -r 60                     — 60 секунд на каждый тест\n"
+            "  python fio-test.py -b 200                    — тестовая область 200 ГБ на диск\n"
             "  python fio-test.py -l                        — подробное логирование (мониторинг в отчёте)\n"
             "  python fio-test.py -t                        — тестовый режим (пробные данные)\n"
             "  python fio-test.py -a 1 3-5                  — только диски 1 и 3..5 (номера/диапазоны)\n"
@@ -162,6 +178,11 @@ def parse_args():
     parser.add_argument(
         "-r", "--runtime", type=int, default=None,
         help="Длительность каждого теста в секундах (по умолчанию — из конфига .fio)",
+    )
+    parser.add_argument(
+        "-b", "--block", type=_block_gb_type, default=100,
+        help="Размер тестовой области в гигабайтах на диск (по умолчанию 100). "
+             "0 — весь диск",
     )
     def disk_token_type(token: str):
         try:
@@ -332,6 +353,10 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
         flags.append((
             "Длительность теста",
             f"{args.runtime} сек" if args.runtime is not None else "по конфигу (.fio)",
+        ))
+        flags.append((
+            "Размер тестовой области",
+            f"{args.block} ГБ" if args.block else "весь диск",
         ))
     if prefill_duration is not None:
         flags.append(("Время предзаполнения", format_duration(prefill_duration)))
@@ -1284,7 +1309,9 @@ def main():
     prefill_duration = None
     if not args.fast:
         console.print("\n[bold]Предварительное заполнение...[/bold]")
-        prefill_duration = prefill_disks(disks, tuner=tuner, cancel_event=cancel_event)
+        prefill_duration = prefill_disks(
+            disks, tuner=tuner, cancel_event=cancel_event, block_gb=args.block
+        )
 
     if args.runtime is not None:
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")
@@ -1312,6 +1339,12 @@ def main():
                     f"--runtime={args.runtime}" if a.startswith("--runtime=") else a
                     for a in fio_args
                 ])
+                for t, fio_args in plan
+            ]
+
+        if args.block:
+            plan = [
+                (t, list(fio_args) + [f"--size={args.block}G"])
                 for t, fio_args in plan
             ]
 
