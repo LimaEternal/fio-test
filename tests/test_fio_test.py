@@ -253,6 +253,22 @@ class ParseArgsLoggingTests(unittest.TestCase):
         self.assertTrue(args.sequential)
         self.assertTrue(args.logging)
 
+    def test_fast_short_flag_parses(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-f"]):
+            args = fio_test.parse_args()
+        self.assertTrue(args.fast)
+
+    def test_fast_long_flag_parses(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "--fast"]):
+            args = fio_test.parse_args()
+        self.assertTrue(args.fast)
+
+    def test_combined_short_flags_with_f(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-cf"]):
+            args = fio_test.parse_args()
+        self.assertTrue(args.confirm)
+        self.assertTrue(args.fast)
+
 
 class MainParallelModeTests(unittest.TestCase):
     """Параллельный режим должен отправлять в пул по одной задаче на диск."""
@@ -1050,7 +1066,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
     def test_durations_appear_in_flags(self):
         args = mock.Mock()
         args.sequential = False
-        args.no_prefill = False
+        args.fast = False
         args.logging = False
         args.no_tune = False
         args.runtime = 60
@@ -1070,7 +1086,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
     def test_no_durations_no_extra_flags(self):
         args = mock.Mock()
         args.sequential = False
-        args.no_prefill = True
+        args.fast = True
         args.logging = False
         args.no_tune = True
         args.runtime = None
@@ -1089,7 +1105,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
     def test_test_mode_marks_regime_and_skips_irrelevant_flags(self):
         args = mock.Mock()
         args.sequential = True
-        args.no_prefill = True
+        args.fast = True
         args.logging = True
         args.no_tune = False
         args.runtime = 60
@@ -1111,7 +1127,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
     def test_normal_mode_keeps_runtime_prefill_and_thresholds(self):
         args = mock.Mock()
         args.sequential = True
-        args.no_prefill = False
+        args.fast = False
         args.logging = False
         args.no_tune = False
         args.runtime = 60

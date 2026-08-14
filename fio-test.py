@@ -10,8 +10,8 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -s           — тестирование (последовательно)
     python fio-test.py -c           — тестирование с подтверждением
     python fio-test.py -c -s        — с подтверждением, последовательно
-    python fio-test.py -p           — без предварительного заполнения (по умолчанию
-                                      префилл выполняется перед тестами)
+    python fio-test.py -f           — быстрый режим без предварительного заполнения
+                                      (по умолчанию префилл выполняется перед тестами)
     python fio-test.py -r 60            — 60 сек на тест
     python fio-test.py -l               — подробное логирование: отчёт обновляется
                                           по мере завершения тестов (мониторинг в отчёте)
@@ -94,11 +94,11 @@ for _tests in INTERFACE_CONFIGS.values():
 P99_RELIABILITY_FACTOR = 500
 
 
-_SHORT_FLAGS = {"c", "s", "p", "t", "l", "n"}
+_SHORT_FLAGS = {"c", "s", "f", "t", "l", "n"}
 
 
 def _expand_short_flags(argv: list[str]) -> list[str]:
-    """Расширяет комбинированные короткие флаги: -sc → -s -c, -cp → -c -p."""
+    """Расширяет комбинированные короткие флаги: -sc → -s -c, -cf → -c -f."""
     expanded = []
     for arg in argv:
         if len(arg) > 2 and arg.startswith("-") and not arg.startswith("--") and all(ch in _SHORT_FLAGS for ch in arg[1:]):
@@ -118,7 +118,7 @@ def parse_args():
             "  python fio-test.py -s                        — тестирование (последовательно)\n"
             "  python fio-test.py -c                        — с подтверждением перед стартом\n"
             "  python fio-test.py -c -s                     — с подтверждением, последовательно\n"
-            "  python fio-test.py -p                        — без предварительного заполнения\n"
+            "  python fio-test.py -f                        — быстрый режим без предварительного заполнения\n"
             "  python fio-test.py -r 60                     — 60 секунд на каждый тест\n"
             "  python fio-test.py -l                        — подробное логирование (мониторинг в отчёте)\n"
             "  python fio-test.py -t                        — тестовый режим (пробные данные)\n"
@@ -138,9 +138,9 @@ def parse_args():
         help="Последовательный режим (для виртуальных машин)",
     )
     parser.add_argument(
-        "-p", "--no-prefill", action="store_true",
-        help="Отключить предварительное заполнение перед тестами "
-             "(по умолчанию выполняется)",
+        "-f", "--fast", action="store_true",
+        help="Быстрый режим: пропустить предварительное заполнение дисков "
+             "(результаты менее точны; по умолчанию выполняется)",
     )
     parser.add_argument(
         "-l", "--logging", action="store_true",
@@ -315,7 +315,7 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
     """Собирает мета-информацию о запуске для секции «Параметры запуска» отчёта.
 
     В тестовом режиме (test_mode=True) флаги, не влияющие на вывод пробной
-    таблицы (-s, -p, -r, пороги), в отчёт не попадают: режим показывается
+    таблицы (-s, -f, -r, пороги), в отчёт не попадают: режим показывается
     как «тестовый».
     """
     if test_mode:
@@ -328,7 +328,7 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
         ("Автонастройка системы", "выключена" if args.no_tune else "включена"),
     ]
     if not test_mode:
-        flags.insert(1, ("Предварительное заполнение", "выключено" if args.no_prefill else "включено"))
+        flags.insert(1, ("Предварительное заполнение", "выключено" if args.fast else "включено"))
         flags.append((
             "Длительность теста",
             f"{args.runtime} сек" if args.runtime is not None else "по конфигу (.fio)",
@@ -1275,9 +1275,9 @@ def main():
         )
         writer.start()
 
-    # Предварительное заполнение (по умолчанию выполняется, отключается -p)
+    # Предварительное заполнение (по умолчанию выполняется, отключается -f)
     prefill_duration = None
-    if not args.no_prefill:
+    if not args.fast:
         console.print("\n[bold]Предварительное заполнение...[/bold]")
         prefill_duration = prefill_disks(disks, tuner=tuner, cancel_event=cancel_event)
 
