@@ -1,3 +1,4 @@
+import argparse
 import json
 import queue
 import sys
@@ -270,6 +271,53 @@ class ParseArgsLoggingTests(unittest.TestCase):
         self.assertTrue(args.fast)
 
 
+class ParseArgsBlockTests(unittest.TestCase):
+    def test_default_block_is_100(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.block, 100)
+
+    def test_block_short_flag_parses(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-b", "200"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.block, 200)
+
+    def test_block_long_flag_parses(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "--block", "0"]):
+            args = fio_test.parse_args()
+        self.assertEqual(args.block, 0)
+
+    def test_block_invalid_value_exits(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-b", "abc"]):
+            with self.assertRaises(SystemExit):
+                fio_test.parse_args()
+
+    def test_block_negative_value_exits(self):
+        with mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "--block", "-5"]):
+            with self.assertRaises(SystemExit):
+                fio_test.parse_args()
+
+
+class BlockGbTypeTests(unittest.TestCase):
+    def test_zero_is_allowed(self):
+        self.assertEqual(fio_test._block_gb_type("0"), 0)
+
+    def test_positive_integer(self):
+        self.assertEqual(fio_test._block_gb_type("100"), 100)
+
+    def test_non_numeric_raises(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            fio_test._block_gb_type("abc")
+
+    def test_float_raises(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            fio_test._block_gb_type("1.5")
+
+    def test_negative_raises(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            fio_test._block_gb_type("-5")
+
+
 class MainParallelModeTests(unittest.TestCase):
     """Параллельный режим должен отправлять в пул по одной задаче на диск."""
 
@@ -340,6 +388,52 @@ class MainParallelModeTests(unittest.TestCase):
         self.assertFalse(report_kwargs.get("show_lat_p99"))
         self.assertIsNotNone(report_kwargs.get("run_info"))
         self.assertIsNotNone(report_kwargs.get("fio_configs"))
+
+
+class MainBlockSizeTests(unittest.TestCase):
+    """-b/--block должен доходить до префилла и плана тестов как --size=NG."""
+
+    def _run_main(self, argv):
+        disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+             mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
+             mock.patch.object(fio_test, "build_results_table", return_value=None), \
+             mock.patch.object(fio_test.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(fio_test, "SystemTuner"), \
+             mock.patch.object(fio_test, "prefill_disks") as fake_prefill, \
+             mock.patch.object(fio_test.sys, "argv", argv), \
+             mock.patch.object(fio_test, "_default_report_path",
+                               return_value=Path("reports") / "t.md"), \
+             mock.patch.object(fio_test, "run_disk_tests") as fake_runner:
+            fio_test.main()
+        return fake_prefill, fake_runner
+
+    def _plan_args(self, fake_runner):
+        _, disk, plan, _ = fake_runner.call_args.args
+        return [args for _, args in plan]
+
+    def test_default_block_100g_in_plan_and_prefill(self):
+        fake_prefill, fake_runner = self._run_main(["fio-test.py"])
+        _, kwargs = fake_prefill.call_args
+        self.assertEqual(kwargs.get("block_gb"), 100)
+        for args in self._plan_args(fake_runner):
+            self.assertIn("--size=100G", args)
+
+    def test_custom_block_in_plan_and_prefill(self):
+        fake_prefill, fake_runner = self._run_main(["fio-test.py", "-b", "200"])
+        _, kwargs = fake_prefill.call_args
+        self.assertEqual(kwargs.get("block_gb"), 200)
+        for args in self._plan_args(fake_runner):
+            self.assertIn("--size=200G", args)
+            self.assertNotIn("--size=100G", args)
+
+    def test_block_zero_omits_size(self):
+        fake_prefill, fake_runner = self._run_main(["fio-test.py", "-b", "0"])
+        _, kwargs = fake_prefill.call_args
+        self.assertEqual(kwargs.get("block_gb"), 0)
+        for args in self._plan_args(fake_runner):
+            self.assertFalse(any(a.startswith("--size=") for a in args))
 
 
 class RunFioTestDiagStoreTests(unittest.TestCase):
@@ -1075,6 +1169,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.logging = False
         args.no_tune = False
         args.runtime = 60
+        args.block = 100
         args.add = None
         args.delete = None
         args.threshold_nvme = None
@@ -1095,6 +1190,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.logging = False
         args.no_tune = True
         args.runtime = None
+        args.block = 100
         args.add = None
         args.delete = None
         args.threshold_nvme = None
@@ -1114,6 +1210,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.logging = True
         args.no_tune = False
         args.runtime = 60
+        args.block = 100
         args.add = [1]
         args.delete = None
         args.threshold_nvme = "seq_read=1"
@@ -1125,6 +1222,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         self.assertEqual(flags["Режим"], "тестовый")
         self.assertNotIn("Предварительное заполнение", flags)
         self.assertNotIn("Длительность теста", flags)
+        self.assertNotIn("Размер тестовой области", flags)
         self.assertNotIn("Пороги NVMe", flags)
         self.assertEqual(flags["Выбор дисков (--add)"], "1")
         self.assertEqual(flags["Выходной отчёт"], "reports/t.md")
@@ -1136,6 +1234,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.logging = False
         args.no_tune = False
         args.runtime = 60
+        args.block = 100
         args.add = None
         args.delete = None
         args.threshold_nvme = "seq_read=1"
@@ -1147,7 +1246,26 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         self.assertEqual(flags["Режим"], "последовательный")
         self.assertEqual(flags["Предварительное заполнение"], "включено")
         self.assertEqual(flags["Длительность теста"], "60 сек")
+        self.assertEqual(flags["Размер тестовой области"], "100 ГБ")
         self.assertEqual(flags["Пороги NVMe"], "seq_read=1")
+
+    def test_block_zero_rendered_as_full_disk(self):
+        args = mock.Mock()
+        args.sequential = False
+        args.fast = False
+        args.logging = False
+        args.no_tune = False
+        args.runtime = None
+        args.block = 0
+        args.add = None
+        args.delete = None
+        args.threshold_nvme = None
+        args.threshold_sas = None
+        args.threshold_sata = None
+        args.output = None
+        info = fio_test._build_run_info(args)
+        flags = dict(info["flags"])
+        self.assertEqual(flags["Размер тестовой области"], "весь диск")
 
 
 class BuildTestPlanTests(unittest.TestCase):

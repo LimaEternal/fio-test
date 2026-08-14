@@ -94,6 +94,25 @@ class PrefillStatsTests(unittest.TestCase):
         self.assertEqual(prefill._extract_prefill_stats({}), (0, 0))
 
 
+class ResolveSizeBytesTests(unittest.TestCase):
+    def test_zero_means_full_disk(self):
+        self.assertEqual(prefill._resolve_size_bytes(0, 123456), 123456)
+
+    def test_block_in_gib(self):
+        disk = 3 * (2 ** 40)
+        self.assertEqual(prefill._resolve_size_bytes(100, disk), 100 * (2 ** 30))
+
+    def test_small_disk_wins(self):
+        disk = 50 * (2 ** 30)
+        self.assertEqual(prefill._resolve_size_bytes(100, disk), disk)
+
+    def test_none_disk_becomes_zero(self):
+        self.assertEqual(prefill._resolve_size_bytes(100, None), 0)
+
+    def test_zero_with_none_disk(self):
+        self.assertEqual(prefill._resolve_size_bytes(0, None), 0)
+
+
 class RunPrefillTests(unittest.TestCase):
     def test_run_prefill_builds_cmd_from_config(self):
         cmd_seen = {}
@@ -120,6 +139,49 @@ class RunPrefillTests(unittest.TestCase):
         self.assertIn("--output-format=json", cmd)
         self.assertNotIn("--cpus_allowed", cmd)
         self.assertIsNotNone(cmd_seen["cb"])
+
+    def _capture_cmd(self, config_args=None, block_gb=100):
+        cmd_seen = {}
+
+        def fake_stream(cmd, cancel_event, on_progress):
+            cmd_seen["cmd"] = cmd
+            return True
+
+        with mock.patch.object(
+            prefill, "_load_prefill_config",
+            return_value=config_args if config_args is not None
+            else ["--ioengine=io_uring", "--direct=1", "--bs=128k"],
+        ), mock.patch.object(prefill, "_run_fio_stream", side_effect=fake_stream):
+            ok = prefill.run_prefill(DISK, on_progress=lambda *a: None, block_gb=block_gb)
+        self.assertTrue(ok)
+        return cmd_seen["cmd"]
+
+    def test_run_prefill_applies_default_block(self):
+        cmd = self._capture_cmd(block_gb=100)
+        self.assertIn("--size=100G", cmd)
+
+    def test_run_prefill_custom_block(self):
+        cmd = self._capture_cmd(block_gb=500)
+        self.assertIn("--size=500G", cmd)
+        self.assertNotIn("--size=100G", cmd)
+
+    def test_run_prefill_overrides_config_size(self):
+        cmd = self._capture_cmd(
+            config_args=["--ioengine=io_uring", "--size=100%"], block_gb=100
+        )
+        self.assertIn("--size=100G", cmd)
+        self.assertNotIn("--size=100%", cmd)
+
+    def test_run_prefill_block_zero_keeps_config_size(self):
+        cmd = self._capture_cmd(
+            config_args=["--ioengine=io_uring", "--size=100%"], block_gb=0
+        )
+        self.assertIn("--size=100%", cmd)
+        self.assertEqual(sum(1 for a in cmd if a.startswith("--size=")), 1)
+
+    def test_run_prefill_block_zero_no_extra_size(self):
+        cmd = self._capture_cmd(block_gb=0)
+        self.assertFalse(any(a.startswith("--size=") for a in cmd))
 
     def test_run_prefill_adds_numa_pinning(self):
         fake_tuner = mock.Mock()
@@ -197,7 +259,8 @@ class PrefillDisksTests(unittest.TestCase):
         d2 = dict(DISK, name="nvme1n1", serial="S2")
         calls = []
 
-        def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None):
+        def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None,
+                         block_gb=100):
             calls.append(disk["name"])
             return True
 
@@ -209,7 +272,8 @@ class PrefillDisksTests(unittest.TestCase):
     def test_prefill_disks_returns_phase_duration(self):
         d1 = dict(DISK, name="nvme0n1", serial="S1")
 
-        def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None):
+        def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None,
+                         block_gb=100):
             return True
 
         with mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
@@ -217,6 +281,29 @@ class PrefillDisksTests(unittest.TestCase):
 
         self.assertIsInstance(dur, float)
         self.assertGreaterEqual(dur, 0)
+
+    def _progress_total(self, block_gb, disk_bytes=4 * (2 ** 40)):
+        d1 = dict(DISK, name="nvme0n1", serial="S1")
+        progress_mock = mock.MagicMock()
+        progress_mock.__enter__.return_value = progress_mock
+        progress_mock.__exit__.return_value = False
+
+        def fake_prefill(disk, cancel_event=None, tuner=None, on_progress=None,
+                         block_gb=block_gb):
+            return True
+
+        with mock.patch.object(prefill, "_disk_total_bytes", return_value=disk_bytes), \
+             mock.patch.object(prefill, "Progress", return_value=progress_mock), \
+             mock.patch.object(prefill, "run_prefill", side_effect=fake_prefill):
+            prefill.prefill_disks([d1], block_gb=block_gb)
+        added = progress_mock.add_task.call_args_list[0]
+        return added.kwargs["total"]
+
+    def test_progress_total_capped_by_block(self):
+        self.assertEqual(self._progress_total(100), 100 * (2 ** 30))
+
+    def test_progress_total_full_disk_when_block_zero(self):
+        self.assertEqual(self._progress_total(0), 4 * (2 ** 40))
 
 
 PRETTY_STATUS = (
