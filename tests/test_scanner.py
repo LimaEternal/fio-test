@@ -12,6 +12,7 @@ from utils.scanner import (
     _detect_interface,
     _link_generation,
     _parse_max_payload,
+    compute_pass_thresholds,
     estimate_ceiling_mbps,
     get_nvme_pcie_info,
     link_bandwidth_mbps,
@@ -275,6 +276,62 @@ class NvmeMaxPayloadTests(unittest.TestCase):
             "utils.scanner.find_nvme_link_dir", return_value=None
         ):
             self.assertIsNone(read_nvme_max_payload("nvme0n1"))
+
+
+class ComputePassThresholdsTests(unittest.TestCase):
+    """Динамические пороги PASS/FAIL из профиля (ТЗ Zero-Config)."""
+
+    def _disk(self, interface, rotational=0, link=None):
+        return {"tran": interface, "profile": {
+            "interface": interface, "rotational": rotational, "link": link,
+        }}
+
+    def test_nvme_gen5_x4(self):
+        d = self._disk("nvme", link={"width": 4, "speed_gts": 32.0})
+        thr = compute_pass_thresholds(d)
+        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 12477.0, places=0)
+        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 6612.8, places=1)
+
+    def test_nvme_gen4_x4(self):
+        d = self._disk("nvme", link={"width": 4, "speed_gts": 16.0})
+        thr = compute_pass_thresholds(d)
+        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 6238.5, places=0)
+        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 3306.4, places=0)
+
+    def test_nvme_gen3_x4(self):
+        d = self._disk("nvme", link={"width": 4, "speed_gts": 8.0})
+        thr = compute_pass_thresholds(d)
+        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 3083.8, places=0)
+        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 1634.4, places=0)
+
+    def test_sata_iii(self):
+        d = self._disk("sata", link={"spd_limit_gbps": 6.0})
+        thr = compute_pass_thresholds(d)
+        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 495.0, places=0)
+        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 445.5, places=0)
+
+    def test_sas_12g(self):
+        d = self._disk("sas", link={"negotiated_gbps": 12.0})
+        thr = compute_pass_thresholds(d)
+        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 1035.0, places=0)
+        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 931.5, places=0)
+
+    def test_hdd_media_only(self):
+        d = self._disk("sata", rotational=1, link={"spd_limit_gbps": 3.0})
+        thr = compute_pass_thresholds(d)
+        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 198.0, places=0)
+        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 198.0, places=0)
+
+    def test_missing_sysfs_returns_empty(self):
+        # NVMe без линка → данных нет, пороги считаются из конфига (fallback)
+        self.assertEqual(compute_pass_thresholds(self._disk("nvme")), {})
+        self.assertEqual(compute_pass_thresholds(self._disk("sata")), {})
+
+    def test_target_percent_scales(self):
+        d = self._disk("sata", link={"spd_limit_gbps": 6.0})
+        thr = compute_pass_thresholds(d, target_percent=0.50)
+        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 275.0, places=0)
+        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 247.5, places=0)
 
 
 if __name__ == "__main__":

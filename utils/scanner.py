@@ -303,6 +303,89 @@ def estimate_ceiling_mbps(interface: str, link: Optional[Dict], rotational: int)
     return bw or 0.0
 
 
+# === Динамические пороги PASS/FAIL (Zero-Config, ТЗ) =========================
+# TARGET_PERCENT — базовый уровень PASS относительно теоретического потолка
+# шины/носителя. Задаётся константой или аргументом CLI --target-percent.
+DEFAULT_TARGET_PERCENT = 0.90
+
+# Эффективность TLP для NVMe: Gen4/Gen5+ (>=16 GT/s) держим 0.88,
+# Gen3 (8 GT/s) — 0.87. Умножается на кодирование 128b/130b.
+_NVME_TLP_EFF_GEN4PLUS = 0.88
+_NVME_TLP_EFF_GEN3 = 0.87
+# Доля записи NVMe от потолка шины (флеш-параллелизм/надёжность).
+_NVME_WRITE_FACTOR = 0.53
+# Доля записи SATA/SAS SSD от потолка шины (флеш/параллелизм).
+_SATA_SAS_WRITE_FACTOR = 0.90
+# Медиа-потолок HDD для последовательных операций (МБ/с).
+_HDD_MEDIA_MBPS = 220.0
+# Базовые потолки шин SATA III (6 Гбит/с) и SAS 12G (Гбит/с).
+_SATA_BUS_MBPS_PER_GBPS = 550.0 / 6.0
+_SAS_BUS_MBPS_PER_GBPS = 1150.0 / 12.0
+
+
+def compute_pass_thresholds(disk: Dict, target_percent: float = DEFAULT_TARGET_PERCENT) -> Dict:
+    """
+    Динамические пороги PASS/FAIL для последовательных тестов (МБ/с),
+    рассчитанные из профиля железа (sysfs) по ТЗ Zero-Config.
+
+    Возвращает {"seq_read": {"min_bw_mb": float},
+                 "seq_write": {"min_bw_mb": float}} или {} если данных
+    sysfs недостаточно (тогда используется fallback из configs/thresholds.json).
+
+    Категории:
+      1) HDD (rotational == 1): BW_media = 220 МБ/с;
+         read = write = BW_media * target_percent.
+      2) NVMe (PCIe): BW_bus = (gts*1000/8)*(128/130)*tlp*width,
+         tlp = 0.88 (>=16 GT/s) иначе 0.87;
+         read = BW_bus * target_percent;
+         write = BW_bus * 0.53 * target_percent.
+      3) SATA/SAS SSD (rotational == 0, не PCIe):
+         SATA bus = spd_limit_gbps * (550/6); SAS bus = neg_gbps * (1150/12);
+         read = bus * target_percent; write = bus * 0.90 * target_percent.
+    """
+    profile = disk.get("profile") or {}
+    interface = (profile.get("interface") or disk.get("tran") or "").lower()
+    rotational = profile.get("rotational")
+    link = profile.get("link")
+
+    # Категория 1: HDD — механика, порог не зависит от линка.
+    if rotational == 1:
+        val = round(_HDD_MEDIA_MBPS * target_percent, 1)
+        return {
+            "seq_read": {"min_bw_mb": val},
+            "seq_write": {"min_bw_mb": val},
+        }
+
+    # Категория 2: NVMe (PCIe).
+    if interface == "nvme":
+        if not link or not link.get("speed_gts") or not link.get("width"):
+            return {}
+        gts = float(link["speed_gts"])
+        width = int(link["width"])
+        tlp = _NVME_TLP_EFF_GEN4PLUS if gts >= 16.0 else _NVME_TLP_EFF_GEN3
+        bw_bus = (gts * 1000.0 / 8.0) * (128.0 / 130.0) * tlp * width
+        return {
+            "seq_read": {"min_bw_mb": round(bw_bus * target_percent, 1)},
+            "seq_write": {"min_bw_mb": round(bw_bus * _NVME_WRITE_FACTOR * target_percent, 1)},
+        }
+
+    # Категория 3: SATA/SAS SSD.
+    if not link:
+        return {}
+    if interface == "sata":
+        spd = link.get("spd_limit_gbps") or link.get("hw_spd_limit_gbps") or 0
+        bus = float(spd) * _SATA_BUS_MBPS_PER_GBPS
+    else:  # sas
+        spd = link.get("negotiated_gbps") or link.get("maximum_gbps") or 0
+        bus = float(spd) * _SAS_BUS_MBPS_PER_GBPS
+    if bus <= 0:
+        return {}
+    return {
+        "seq_read": {"min_bw_mb": round(bus * target_percent, 1)},
+        "seq_write": {"min_bw_mb": round(bus * _SATA_SAS_WRITE_FACTOR * target_percent, 1)},
+    }
+
+
 def _is_system_mount(mp: str) -> bool:
     """
     Проверяет, является ли точка монтирования системной (критической для работы ОС).

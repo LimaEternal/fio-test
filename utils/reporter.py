@@ -191,6 +191,30 @@ def _render_test_plans(test_plans: dict) -> List[str]:
                     f"{params.get('numjobs', '—')} |"
                 )
         lines.append("")
+
+        # Пороги PASS/FAIL (динамические из sysfs для seq + конфиг для rand).
+        thr = info.get("thresholds") or {}
+        src = info.get("threshold_source") or {}
+        if thr:
+            lines.append("**Пороги PASS/FAIL:**")
+            lines.append("")
+            lines.append("| Тест | Порог | Источник |")
+            lines.append("|------|--------|----------|")
+            for test_id in tests:
+                t = thr.get(test_id)
+                if not t:
+                    continue
+                if "min_bw_mb" in t:
+                    pct = f"{t['min_bw_mb']:.0f} МБ/с"
+                elif "min_iops" in t:
+                    pct = f"{t['min_iops']:,} IOPS"
+                else:
+                    pct = "—"
+                lines.append(
+                    f"| {TEST_NAMES.get(test_id, test_id)} | {pct} | "
+                    f"{src.get(test_id, '—')} |"
+                )
+            lines.append("")
     return lines
 
 

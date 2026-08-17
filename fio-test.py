@@ -46,7 +46,12 @@ from utils.fio_config import parse_fio_jobfile
 from utils.prefill import prefill_disks
 from utils.process import kill_process_tree, run_process
 from utils.reporter import generate_report
-from utils.scanner import estimate_ceiling_mbps, scan_disks
+from utils.scanner import (
+    DEFAULT_TARGET_PERCENT,
+    compute_pass_thresholds,
+    estimate_ceiling_mbps,
+    scan_disks,
+)
 from utils.table_renderer import build_results_table
 from utils.tuner import SystemTuner
 
@@ -159,7 +164,8 @@ def parse_args():
             "  python fio-test.py -a 1 3-5                  — только диски 1 и 3..5 (номера/диапазоны)\n"
             "  python fio-test.py -d 4 6-8                  — все диски, кроме 4 и 6..8\n"
             "  python fio-test.py -o reports/custom.md       — свой путь отчёта\n"
-            "  python fio-test.py -c --threshold-nvme \"seq_read=15000:seq_write=12000\""
+            "  python fio-test.py --target-percent 0.85       — порог PASS = 85% от потолка шины\n"
+            "  python fio-test.py -t                        — тестовый режим (динамические пороги из sysfs)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -230,16 +236,10 @@ def parse_args():
              "интерактивно",
     )
     parser.add_argument(
-        "--threshold-nvme", type=str, default=None,
-        help="Пороговые значения NVMe (формат: seq_read=5000:rand_read=500000)",
-    )
-    parser.add_argument(
-        "--threshold-sas", type=str, default=None,
-        help="Пороговые значения SAS (формат: seq_read=800:rand_read=30000)",
-    )
-    parser.add_argument(
-        "--threshold-sata", type=str, default=None,
-        help="Пороговые значения SATA (формат: seq_read=400:rand_read=10000)",
+        "--target-percent", type=float, default=DEFAULT_TARGET_PERCENT,
+        help="Доля от теоретического потолка шины/носителя, при которой "
+             "последовательный тест считается PASS (по умолчанию 0.90). "
+             "Используется при динамическом расчёте порогов из sysfs.",
     )
     args = parser.parse_args(_expand_short_flags(sys.argv[1:]))
     if args.add is not None:
@@ -248,6 +248,8 @@ def parse_args():
         args.delete = [n for tok in args.delete for n in tok]
     if args.target_iops <= 0:
         parser.error("--target-iops должен быть больше нуля")
+    if not (0.0 < args.target_percent <= 1.0):
+        parser.error("--target-percent должен быть в диапазоне (0, 1]")
     return args
 
 
@@ -263,23 +265,6 @@ def check_threshold(test_id, res, thresholds):
         if res.get("iops", 0) >= thr["min_iops"]:
             return "PASS"
     return "FAIL"
-
-
-def parse_custom_thresholds(raw):
-    """Парсит строку порогов вида 'seq_read=5000:rand_read=500000' в словарь."""
-    result = {}
-    if not raw:
-        return result
-    for part in raw.split(":"):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            k = k.strip()
-            v = int(v.strip())
-            if k.startswith("seq_"):
-                result.setdefault(k, {})["min_bw_mb"] = v
-            elif k.startswith("rand_"):
-                result.setdefault(k, {})["min_iops"] = v
-    return result
 
 
 def _expand_token(token: str) -> list:
@@ -393,12 +378,7 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
     if args.delete is not None:
         flags.append(("Выбор дисков (--delete)", ", ".join(str(n) for n in args.delete)))
     if not test_mode:
-        if args.threshold_nvme:
-            flags.append(("Пороги NVMe", args.threshold_nvme))
-        if args.threshold_sas:
-            flags.append(("Пороги SAS", args.threshold_sas))
-        if args.threshold_sata:
-            flags.append(("Пороги SATA", args.threshold_sata))
+        flags.append(("Целевая доля PASS (--target-percent)", f"{args.target_percent:.2f}"))
     if args.output:
         flags.append(("Выходной отчёт", args.output))
     command = "python fio-test.py " + " ".join(sys.argv[1:])
@@ -415,13 +395,33 @@ def _disk_interface(disk: dict) -> str:
     return "sata"
 
 
+def _resolve_thresholds(base: dict, disk: dict, target_percent: float) -> tuple:
+    """
+    Итоговые пороги диска: база (configs/thresholds.json) + динамические
+    seq-пороги из sysfs (Zero-Config), когда данные линка доступны.
+
+    Возвращает (merged, source): merged — {test_id: {min_bw_mb|min_iops}},
+    source — {test_id: "sysfs (формула)" | "конфиг (thresholds.json)"}.
+    """
+    dyn = compute_pass_thresholds(disk, target_percent)
+    merged = dict(base)
+    merged.update(dyn)
+    source = {}
+    for tid in INTERFACE_CONFIGS.get(_disk_interface(disk), {}):
+        source[tid] = "sysfs (формула)" if tid in dyn else "конфиг (thresholds.json)"
+    return merged, source
+
+
 def collect_plan_info(disks: list, disk_plans=None,
-                      target_iops: int = DEFAULT_TARGET_IOPS) -> dict:
+                      target_iops: int = DEFAULT_TARGET_IOPS,
+                      target_percent: float = DEFAULT_TARGET_PERCENT) -> dict:
     """
     Собирает фактические параметры тестов для отчёта.
 
     Возвращает {имя_диска: {"interface", "ceiling_mbps", "max_sectors_kb",
-    "target_iops", "tests": {тест: {"bs", "iodepth", "numjobs"}}}}.
+    "target_iops", "tests": {тест: {"bs", "iodepth", "numjobs"}},
+    "thresholds": {тест: {min_bw_mb|min_iops}},
+    "threshold_source": {тест: "sysfs (формула)" | "конфиг (thresholds.json)"}}}.
 
     В реальном режиме параметры берутся из уже построенного плана
     (disk_plans) — ровно те, с которыми пойдут тесты; в тестовом режиме
@@ -454,12 +454,18 @@ def collect_plan_info(disks: list, disk_plans=None,
                 overrides = compute_test_overrides(profile, interface, test_id, target_iops)
                 tests[test_id] = dict(overrides)
 
+        merged, source = _resolve_thresholds(
+            INTERFACE_THRESHOLDS.get(interface, {}), disk, target_percent
+        )
+
         info[name] = {
             "interface": interface,
             "ceiling_mbps": profile.get("ceiling_mbps"),
             "max_sectors_kb": profile.get("max_sectors_kb"),
             "target_iops": target_iops,
             "tests": tests,
+            "thresholds": merged,
+            "threshold_source": source,
         }
     return info
 
@@ -471,7 +477,8 @@ def build_disk_plans(disks: list, thresholds: dict, args) -> tuple:
     Возвращает (disk_plans, disk_thresholds): disk_plans — список
     [(disk_idx, disk, plan)], где plan — [(test_id, fio_args)] с
     переопределёнными bs/iodepth/numjobs и добавленными --runtime/--size;
-    disk_thresholds — {disk_idx: пороги интерфейса}.
+    disk_thresholds — {disk_idx: итоговые пороги (динамика из sysfs для
+    seq + fallback из configs/thresholds.json, который также даёт rand)}.
     """
     disk_plans = []
     disk_thresholds = {}
@@ -479,7 +486,10 @@ def build_disk_plans(disks: list, thresholds: dict, args) -> tuple:
     for disk_idx, disk in enumerate(disks):
         tran_key = _disk_interface(disk)
         tests = INTERFACE_CONFIGS.get(tran_key, INTERFACE_CONFIGS["sata"])
-        disk_thresholds[disk_idx] = thresholds.get(tran_key, {})
+        # Итоговые пороги: база из configs/thresholds.json (fallback для seq
+        # при отсутствии sysfs + rand_read/rand_write) + динамические seq из sysfs.
+        disk_thr, _ = _resolve_thresholds(thresholds.get(tran_key, {}), disk, args.target_percent)
+        disk_thresholds[disk_idx] = disk_thr
 
         plan = build_test_plan(disk, tests, target_iops=args.target_iops)
 
@@ -1319,16 +1329,13 @@ def main():
         return
 
     # Настройка пороговых значений с возможностью переопределения
+    # Базовые пороги из configs/thresholds.json (fallback для seq при отсутствии
+    # sysfs + источник rand_read/rand_write). Динамические seq-пороги из sysfs
+    # подставляются позже в build_disk_plans() поверх этого словаря.
     thresholds = {
         iface: dict(thr_map)
         for iface, thr_map in INTERFACE_THRESHOLDS.items()
     }
-    if args.threshold_nvme:
-        thresholds["nvme"].update(parse_custom_thresholds(args.threshold_nvme))
-    if args.threshold_sas:
-        thresholds["sas"].update(parse_custom_thresholds(args.threshold_sas))
-    if args.threshold_sata:
-        thresholds["sata"].update(parse_custom_thresholds(args.threshold_sata))
 
     console.print("[bold]Сканирование дисков...[/bold]")
 
