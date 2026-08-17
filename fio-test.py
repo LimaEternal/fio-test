@@ -530,6 +530,7 @@ def build_fake_disks() -> list:
             "pcie_info": {"gen": 5, "width": 4, "speed_gts": 32.0}, "root_partition": None,
             "profile": _fake_profile("nvme", gen=5, width=4, speed_gts=32.0,
                                      max_gen=5, max_width=4, max_speed_gts=32.0,
+                                     max_payload={"device": 256, "port": 512},
                                      source="sysfs"),
         },
         {
@@ -539,6 +540,7 @@ def build_fake_disks() -> list:
             "pcie_info": {"gen": 4, "width": 4, "speed_gts": 16.0}, "root_partition": None,
             "profile": _fake_profile("nvme", gen=4, width=4, speed_gts=16.0,
                                      max_gen=5, max_width=4, max_speed_gts=32.0,
+                                     max_payload={"device": 128, "port": 512},
                                      source="sysfs"),
         },
         {

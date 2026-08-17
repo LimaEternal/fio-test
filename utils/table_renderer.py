@@ -51,8 +51,10 @@ def _disk_link_lines(profile):
     """Возвращает строки линка/поколения PCIe для паспорта накопителя.
 
     Добавляет поколение интерфейса, теоретическую пропускную
-    способность шины и маркер downgrade (возможности накопителя
-    выше согласованного линка, напр. Gen5-накопитель в порту Gen4).
+    способность шины, MaxPayload (только NVMe — PCIe-уровень) и
+    статус downgrade. Ключевое слово 'downgrade' пишется ВСЕГДА,
+    далее через ':' — есть/нет/?. Для SAS/SATA MaxPayload неприменим
+    (шина PCIe относится к HBA-контроллеру, а не к самому диску).
     """
     interface = (profile.get("interface") or "").lower()
     link = profile.get("link")
@@ -69,8 +71,30 @@ def _disk_link_lines(profile):
         bw = link_bandwidth_mbps("nvme", link)
         if bw is not None:
             lines.append(f"Пропускная: {bw:.0f} МБ/с")
-        if gen and max_gen and max_gen > gen:
-            lines.append(f"⚠ downgrade: накопитель Gen{max_gen}, порт Gen{gen}")
+        # MaxPayload (PCIe-уровень, только для NVMe)
+        mp = link.get("max_payload")
+        if isinstance(mp, dict) and mp.get("device"):
+            dev = mp["device"]
+            port = mp.get("port")
+            if port and dev <= 128:
+                lines.append(
+                    f"⚠ MaxPayload: устройство {dev}B < порт {port}B "
+                    f"(лимитит пропускную способность)"
+                )
+            else:
+                lines.append(f"MaxPayload: {dev}B")
+        else:
+            lines.append("MaxPayload: N/A")
+        # downgrade (ключевое слово пишем всегда)
+        if gen and max_gen:
+            if max_gen > gen:
+                lines.append(
+                    f"downgrade: есть (накопитель Gen{max_gen}, порт Gen{gen})"
+                )
+            else:
+                lines.append("downgrade: нет")
+        else:
+            lines.append("downgrade: ?")
     elif interface == "sas":
         neg = link.get("negotiated_gbps")
         max_l = link.get("maximum_gbps")
@@ -79,8 +103,16 @@ def _disk_link_lines(profile):
         bw = link_bandwidth_mbps("sas", link)
         if bw is not None:
             lines.append(f"Пропускная: {bw:.0f} МБ/с")
-        if neg and max_l and max_l > neg:
-            lines.append(f"⚠ downgrade: порт {neg:.0f} Gbps, накопитель {max_l:.0f} Gbps")
+        lines.append("MaxPayload: HBA Only")
+        if neg and max_l:
+            if max_l > neg:
+                lines.append(
+                    f"downgrade: есть (порт {neg:.0f} Gbps, накопитель {max_l:.0f} Gbps)"
+                )
+            else:
+                lines.append("downgrade: нет")
+        else:
+            lines.append("downgrade: ?")
     elif interface == "sata":
         spd = link.get("spd_limit_gbps")
         hw = link.get("hw_spd_limit_gbps")
@@ -89,8 +121,16 @@ def _disk_link_lines(profile):
         bw = link_bandwidth_mbps("sata", link)
         if bw is not None:
             lines.append(f"Пропускная: {bw:.0f} МБ/с")
-        if spd and hw and hw > spd:
-            lines.append(f"⚠ downgrade: порт {spd:.0f} Gbps, накопитель {hw:.0f} Gbps")
+        lines.append("MaxPayload: HBA Only")
+        if spd and hw:
+            if hw > spd:
+                lines.append(
+                    f"downgrade: есть (порт {spd:.0f} Gbps, накопитель {hw:.0f} Gbps)"
+                )
+            else:
+                lines.append("downgrade: нет")
+        else:
+            lines.append("downgrade: ?")
 
     return tuple(lines)
 

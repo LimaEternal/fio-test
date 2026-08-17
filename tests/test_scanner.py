@@ -11,9 +11,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.scanner import (
     _detect_interface,
     _link_generation,
+    _parse_max_payload,
     estimate_ceiling_mbps,
     get_nvme_pcie_info,
     link_bandwidth_mbps,
+    read_nvme_max_payload,
     scan_disks,
 )
 
@@ -231,6 +233,48 @@ class LinkBandwidthTests(unittest.TestCase):
         self.assertAlmostEqual(
             estimate_ceiling_mbps("nvme", link, 0), 15753.6, places=1
         )
+
+
+class NvmeMaxPayloadTests(unittest.TestCase):
+    """Чтение MaxPayload (размер TLP PCIe) NVMe-контроллера."""
+
+    def test_parse_max_payload(self):
+        text = (
+            "LnkCap: Port #0, Speed 16GT/s, Width x4\n"
+            "DevCap: MaxPayload 256 bytes, MaxReadReq 512 bytes\n"
+        )
+        self.assertEqual(_parse_max_payload(text), 256)
+        self.assertIsNone(_parse_max_payload("no MaxPayload here"))
+
+    def test_read_device_and_port(self):
+        link_dir = Path("/sys/bus/pci/devices/0000:01:00.0")
+        dev_out = "DevCap: MaxPayload 256 bytes"
+        with mock.patch(
+            "utils.scanner.find_nvme_link_dir", return_value=link_dir
+        ), mock.patch(
+            "utils.scanner._read_upstream_max_payload", return_value=512
+        ), mock.patch("utils.scanner.subprocess.run") as run:
+            run.return_value = mock.Mock(stdout=dev_out, returncode=0)
+            result = read_nvme_max_payload("nvme0n1")
+        self.assertEqual(result, {"device": 256, "port": 512})
+
+    def test_read_device_only_when_port_unavailable(self):
+        link_dir = Path("/sys/bus/pci/devices/0000:01:00.0")
+        with mock.patch(
+            "utils.scanner.find_nvme_link_dir", return_value=link_dir
+        ), mock.patch("utils.scanner.subprocess.run") as run:
+            run.side_effect = [
+                mock.Mock(stdout="DevCap: MaxPayload 128 bytes", returncode=0),
+                mock.Mock(side_effect=OSError("no bridge")),
+            ]
+            result = read_nvme_max_payload("nvme0n1")
+        self.assertEqual(result, {"device": 128, "port": None})
+
+    def test_no_link_dir_returns_none(self):
+        with mock.patch(
+            "utils.scanner.find_nvme_link_dir", return_value=None
+        ):
+            self.assertIsNone(read_nvme_max_payload("nvme0n1"))
 
 
 if __name__ == "__main__":

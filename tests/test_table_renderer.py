@@ -260,7 +260,7 @@ class DiskDetailsPcieTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("PCIe 4 x4", text)
         self.assertIn("Пропускная: 7877 МБ/с", text)
-        self.assertIn("⚠ downgrade: накопитель Gen5, порт Gen4", text)
+        self.assertIn("downgrade: есть (накопитель Gen5, порт Gen4)", text)
 
     def test_nvme_no_downgrade_no_warning(self):
         disk = {
@@ -275,7 +275,56 @@ class DiskDetailsPcieTests(unittest.TestCase):
         text = "\n".join(_disk_details(disk))
         self.assertIn("PCIe 5 x4", text)
         self.assertIn("Пропускная: 15754 МБ/с", text)
-        self.assertNotIn("downgrade", text)
+        self.assertIn("downgrade: нет", text)
+        self.assertNotIn("⚠", text)
+        self.assertIn("MaxPayload: N/A", text)
+
+    def test_nvme_downgrade_unknown_max(self):
+        disk = {
+            "name": "nvme0n1", "model": "SAMSUNG", "tran": "NVME",
+            "serial": "SN", "slot": "nvme0", "size": "1.7T",
+            "profile": {
+                "interface": "nvme",
+                "link": {"gen": 4, "width": 4, "speed_gts": 16.0,
+                         "source": "sysfs"},
+            },
+        }
+        text = "\n".join(_disk_details(disk))
+        self.assertIn("downgrade: ?", text)
+
+    def test_nvme_maxpayload_limited(self):
+        disk = {
+            "name": "nvme1n1", "model": "SAMSUNG", "tran": "NVME",
+            "serial": "SN", "slot": "nvme1", "size": "1.7T",
+            "profile": {
+                "interface": "nvme",
+                "link": {"gen": 4, "width": 4, "speed_gts": 16.0,
+                         "max_gen": 5, "max_payload": {"device": 128, "port": 512},
+                         "source": "sysfs"},
+            },
+        }
+        text = "\n".join(_disk_details(disk))
+        self.assertIn("MaxPayload: устройство 128B", text)
+        self.assertIn(
+            "⚠ MaxPayload: устройство 128B < порт 512B (лимитит пропускную способность)",
+            text,
+        )
+        self.assertIn("downgrade: есть (накопитель Gen5, порт Gen4)", text)
+
+    def test_nvme_maxpayload_ok(self):
+        disk = {
+            "name": "nvme0n1", "model": "SAMSUNG", "tran": "NVME",
+            "serial": "SN", "slot": "nvme0", "size": "1.7T",
+            "profile": {
+                "interface": "nvme",
+                "link": {"gen": 5, "width": 4, "speed_gts": 32.0,
+                         "max_gen": 5, "max_payload": {"device": 256, "port": 512},
+                         "source": "sysfs"},
+            },
+        }
+        text = "\n".join(_disk_details(disk))
+        self.assertIn("MaxPayload: 256B", text)
+        self.assertNotIn("⚠", text)
 
     def test_sas_bandwidth_and_downgrade(self):
         disk = {
@@ -290,7 +339,8 @@ class DiskDetailsPcieTests(unittest.TestCase):
         text = "\n".join(_disk_details(disk))
         self.assertIn("SAS 6 Gbps", text)
         self.assertIn("Пропускная: 600 МБ/с", text)
-        self.assertIn("⚠ downgrade: порт 6 Gbps, накопитель 12 Gbps", text)
+        self.assertIn("MaxPayload: HBA Only", text)
+        self.assertIn("downgrade: есть (порт 6 Gbps, накопитель 12 Gbps)", text)
 
     def test_no_profile_keeps_legacy_lines(self):
         disk = {"name": "sda", "model": "QEMU", "tran": "SATA",

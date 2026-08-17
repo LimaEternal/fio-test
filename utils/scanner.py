@@ -231,6 +231,9 @@ def collect_hw_profile(disk_name: str, tran: str) -> Dict:
     else:  # sata
         link = _read_sata_link(disk_name)
 
+    if interface == "nvme" and link is not None:
+        link["max_payload"] = read_nvme_max_payload(disk_name)
+
     ceiling = estimate_ceiling_mbps(interface, link, queue_info["rotational"])
 
     return {
@@ -441,6 +444,61 @@ def get_nvme_pcie_info(disk_name: str) -> dict:
         pass
 
     return info
+
+
+def _parse_max_payload(text: str) -> Optional[int]:
+    """Извлекает MaxPayload (байты) из вывода 'lspci -vvv' (поле DevCap)."""
+    m = re.search(r"MaxPayload\s+(\d+)\s*bytes", text, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _read_upstream_max_payload(bdf: str) -> Optional[int]:
+    """Best-effort: читает MaxPayload upstream PCIe-моста (порта) по BDF.
+
+    Позволяет сравнить MaxPayload устройства с лимитом порта. При
+    любой ошибке возвращает None (признак «не удалось проверить»).
+    """
+    try:
+        dev_path = Path(f"/sys/bus/pci/devices/{bdf}")
+        if not dev_path.exists():
+            return None
+        bridge = dev_path.resolve().parent
+        if bridge.name == bdf:
+            return None
+        out = subprocess.run(
+            ["lspci", "-vvv", "-s", bridge.name],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        return _parse_max_payload(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def read_nvme_max_payload(disk_name: str) -> Optional[Dict[str, Optional[int]]]:
+    """
+    Читает MaxPayload (макс. размер TLP PCIe) NVMe-контроллера.
+
+    MaxPayload — PCIe-уровень, относится к самому контроллеру диска
+    (не к кабелю/протоколу SATA/SAS). Возвращает
+    {'device': int_байты, 'port': int_байты|None}. При отсутствии
+    данных или lspci — None.
+    """
+    link_dir = find_nvme_link_dir(disk_name)
+    if not link_dir:
+        return None
+    bdf = link_dir.name
+    try:
+        out = subprocess.run(
+            ["lspci", "-vvv", "-s", bdf],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+    device = _parse_max_payload(out)
+    if device is None:
+        return None
+    return {"device": device, "port": _read_upstream_max_payload(bdf)}
 
 
 def _get_numa_node(disk_name: str) -> Optional[int]:
