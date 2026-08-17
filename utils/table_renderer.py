@@ -11,6 +11,8 @@ from rich import box
 from rich.table import Table
 from rich.text import Text
 
+from utils.scanner import link_bandwidth_mbps
+
 
 TITLE = "Результаты тестирования накопителей (FIO)"
 
@@ -45,16 +47,68 @@ def format_status(status):
     return Text(str(status))
 
 
+def _disk_link_lines(profile):
+    """Возвращает строки линка/поколения PCIe для паспорта накопителя.
+
+    Добавляет поколение интерфейса, теоретическую пропускную
+    способность шины и маркер downgrade (возможности накопителя
+    выше согласованного линка, напр. Gen5-накопитель в порту Gen4).
+    """
+    interface = (profile.get("interface") or "").lower()
+    link = profile.get("link")
+    if not link:
+        return ()
+
+    lines = []
+    if interface == "nvme":
+        gen = link.get("gen")
+        width = link.get("width")
+        max_gen = link.get("max_gen")
+        if gen:
+            lines.append(f"PCIe {gen} x{width}" if width else f"PCIe {gen}")
+        bw = link_bandwidth_mbps("nvme", link)
+        if bw is not None:
+            lines.append(f"Пропускная: {bw:.0f} МБ/с")
+        if gen and max_gen and max_gen > gen:
+            lines.append(f"⚠ downgrade: накопитель Gen{max_gen}, порт Gen{gen}")
+    elif interface == "sas":
+        neg = link.get("negotiated_gbps")
+        max_l = link.get("maximum_gbps")
+        if neg:
+            lines.append(f"SAS {neg:.0f} Gbps")
+        bw = link_bandwidth_mbps("sas", link)
+        if bw is not None:
+            lines.append(f"Пропускная: {bw:.0f} МБ/с")
+        if neg and max_l and max_l > neg:
+            lines.append(f"⚠ downgrade: порт {neg:.0f} Gbps, накопитель {max_l:.0f} Gbps")
+    elif interface == "sata":
+        spd = link.get("spd_limit_gbps")
+        hw = link.get("hw_spd_limit_gbps")
+        if spd:
+            lines.append(f"SATA {spd:.0f} Gbps")
+        bw = link_bandwidth_mbps("sata", link)
+        if bw is not None:
+            lines.append(f"Пропускная: {bw:.0f} МБ/с")
+        if spd and hw and hw > spd:
+            lines.append(f"⚠ downgrade: порт {spd:.0f} Gbps, накопитель {hw:.0f} Gbps")
+
+    return tuple(lines)
+
+
 def _disk_details(disk):
     """Возвращает строки паспорта накопителя."""
-    return (
+    lines = [
         f"/dev/{disk['name']}",
         disk.get("model", "N/A").strip(),
         disk.get("tran", "N/A").upper(),
         f"SN: {disk.get('serial', 'N/A').strip()}",
         f"Slot: {disk.get('slot', 'N/A')}",
         f"Размер: {disk.get('size', 'N/A')}",
-    )
+    ]
+    profile = disk.get("profile")
+    if profile:
+        lines.extend(_disk_link_lines(profile))
+    return tuple(lines)
 
 
 def _fmt(value, spec):

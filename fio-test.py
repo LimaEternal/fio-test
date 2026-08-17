@@ -538,7 +538,7 @@ def build_fake_disks() -> list:
             "tran": "NVME", "size": "1.7T", "phy_sec": 512, "slot": "nvme1",
             "pcie_info": {"gen": 4, "width": 4, "speed_gts": 16.0}, "root_partition": None,
             "profile": _fake_profile("nvme", gen=4, width=4, speed_gts=16.0,
-                                     max_gen=4, max_width=4, max_speed_gts=16.0,
+                                     max_gen=5, max_width=4, max_speed_gts=32.0,
                                      source="sysfs"),
         },
         {

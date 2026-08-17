@@ -253,14 +253,15 @@ _ENC_128B130B = 0.9846
 _ENC_8B10B = 0.8
 
 
-def estimate_ceiling_mbps(interface: str, link: Optional[Dict], rotational: int) -> float:
+def link_bandwidth_mbps(interface: str, link: Optional[Dict]) -> Optional[float]:
     """
-    Оценивает максимальную реальную скорость диска в МБ/с.
+    Теоретическая пропускная способность шины в МБ/с (без поправок на диск).
 
-    Потолок считается напрямую из физики линка (без таблицы поколений):
+    Считается напрямую из физики линка (без таблицы поколений):
       NVMe: current_link_speed (GT/s) × width × кодирование;
       SAS:  negotiated_linkrate (Gbps) — 8b/10b;
-      SATA: sata_spd_limit (Gbps) — 8b/10b, с поправкой на реальные диски.
+      SATA: sata_spd_limit (Gbps) — 8b/10b.
+    Возвращает None, если данные линка отсутствуют.
     """
     if interface == "nvme" and link:
         gts = link.get("speed_gts")
@@ -276,13 +277,27 @@ def estimate_ceiling_mbps(interface: str, link: Optional[Dict], rotational: int)
             return neg_gbps * 100
 
     if interface == "sata":
-        real_world = 250.0 if rotational == 1 else 550.0
         spd_gbps = (link or {}).get("spd_limit_gbps")
         if spd_gbps:
-            return min(spd_gbps * 100, real_world)
-        return real_world
+            return spd_gbps * 100
 
-    return 0.0
+    return None
+
+
+def estimate_ceiling_mbps(interface: str, link: Optional[Dict], rotational: int) -> float:
+    """
+    Оценивает максимальную реальную скорость диска в МБ/с.
+
+    Для NVMe/SAS совпадает с пропускной способностью шины. Для SATA
+    дополнительно ограничивается реальным потолком флеш/механики.
+    """
+    bw = link_bandwidth_mbps(interface, link)
+    if interface == "sata":
+        real_world = 250.0 if rotational == 1 else 550.0
+        if bw is None:
+            return real_world
+        return min(bw, real_world)
+    return bw or 0.0
 
 
 def _is_system_mount(mp: str) -> bool:

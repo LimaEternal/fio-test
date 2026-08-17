@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.table_renderer import (
     RESULT_HEADERS,
     TITLE,
+    _disk_details,
     build_results_table,
     format_status,
 )
@@ -235,6 +236,69 @@ class TableRendererTests(unittest.TestCase):
         self.assertGreaterEqual(output.count("test"), 100)
         self.assertNotIn("Lat p99 (мс)", output)
         self.assertIn("Tmax (°C)", output)
+
+
+class DiskDetailsPcieTests(unittest.TestCase):
+    """Поколение PCIe, пропускная способность и downgrade в колонке 'Накопитель'."""
+
+    def _nvme_downgrade_disk(self):
+        return {
+            "name": "nvme1n1", "model": "SAMSUNG", "tran": "NVME",
+            "serial": "SN", "slot": "nvme1", "size": "1.7T",
+            "profile": {
+                "interface": "nvme",
+                "link": {
+                    "gen": 4, "width": 4, "speed_gts": 16.0,
+                    "max_gen": 5, "max_width": 4, "max_speed_gts": 32.0,
+                    "source": "sysfs",
+                },
+            },
+        }
+
+    def test_nvme_downgrade_renders_gen_bandwidth_and_warning(self):
+        lines = _disk_details(self._nvme_downgrade_disk())
+        text = "\n".join(lines)
+        self.assertIn("PCIe 4 x4", text)
+        self.assertIn("Пропускная: 7877 МБ/с", text)
+        self.assertIn("⚠ downgrade: накопитель Gen5, порт Gen4", text)
+
+    def test_nvme_no_downgrade_no_warning(self):
+        disk = {
+            "name": "nvme0n1", "model": "SAMSUNG", "tran": "NVME",
+            "serial": "SN", "slot": "nvme0", "size": "1.7T",
+            "profile": {
+                "interface": "nvme",
+                "link": {"gen": 5, "width": 4, "speed_gts": 32.0,
+                         "max_gen": 5, "source": "sysfs"},
+            },
+        }
+        text = "\n".join(_disk_details(disk))
+        self.assertIn("PCIe 5 x4", text)
+        self.assertIn("Пропускная: 15754 МБ/с", text)
+        self.assertNotIn("downgrade", text)
+
+    def test_sas_bandwidth_and_downgrade(self):
+        disk = {
+            "name": "sda", "model": "SEAGATE", "tran": "SAS",
+            "serial": "SN", "slot": "0:0:0:0", "size": "1.8T",
+            "profile": {
+                "interface": "sas",
+                "link": {"negotiated_gbps": 6.0, "maximum_gbps": 12.0,
+                         "source": "sas_phy"},
+            },
+        }
+        text = "\n".join(_disk_details(disk))
+        self.assertIn("SAS 6 Gbps", text)
+        self.assertIn("Пропускная: 600 МБ/с", text)
+        self.assertIn("⚠ downgrade: порт 6 Gbps, накопитель 12 Gbps", text)
+
+    def test_no_profile_keeps_legacy_lines(self):
+        disk = {"name": "sda", "model": "QEMU", "tran": "SATA",
+                "serial": "x", "slot": "0:0", "size": "32G"}
+        lines = _disk_details(disk)
+        self.assertEqual(lines, (
+            "/dev/sda", "QEMU", "SATA", "SN: x", "Slot: 0:0", "Размер: 32G",
+        ))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,14 @@ from unittest import mock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.scanner import _detect_interface, _link_generation, get_nvme_pcie_info, scan_disks
+from utils.scanner import (
+    _detect_interface,
+    _link_generation,
+    estimate_ceiling_mbps,
+    get_nvme_pcie_info,
+    link_bandwidth_mbps,
+    scan_disks,
+)
 
 
 KNOWN_INTERFACES = {"nvme": [], "sas": [], "sata": []}
@@ -195,6 +202,35 @@ class ScanDisksTests(unittest.TestCase):
 
         self.assertEqual([d["name"] for d in target_disks], ["nvme0n1"])
         self.assertEqual(target_disks[0]["tran"], "nvme")
+
+
+class LinkBandwidthTests(unittest.TestCase):
+    """Теоретическая пропускная способность шины (без поправок на диск)."""
+
+    def test_nvme_gen4_x4(self):
+        link = {"speed_gts": 16.0, "width": 4, "gen": 4}
+        self.assertAlmostEqual(link_bandwidth_mbps("nvme", link), 7876.8, places=1)
+
+    def test_nvme_gen5_x4(self):
+        link = {"speed_gts": 32.0, "width": 4, "gen": 5}
+        self.assertAlmostEqual(link_bandwidth_mbps("nvme", link), 15753.6, places=1)
+
+    def test_sas_12g(self):
+        link = {"negotiated_gbps": 12.0, "maximum_gbps": 12.0}
+        self.assertAlmostEqual(link_bandwidth_mbps("sas", link), 1200.0, places=1)
+
+    def test_sata_6g(self):
+        link = {"spd_limit_gbps": 6.0, "hw_spd_limit_gbps": 6.0}
+        self.assertAlmostEqual(link_bandwidth_mbps("sata", link), 600.0, places=1)
+
+    def test_no_link_returns_none(self):
+        self.assertIsNone(link_bandwidth_mbps("nvme", None))
+
+    def test_estimate_ceiling_uses_bandwidth_for_nvme(self):
+        link = {"speed_gts": 32.0, "width": 4, "gen": 5}
+        self.assertAlmostEqual(
+            estimate_ceiling_mbps("nvme", link, 0), 15753.6, places=1
+        )
 
 
 if __name__ == "__main__":
