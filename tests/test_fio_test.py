@@ -325,7 +325,7 @@ class MainParallelModeTests(unittest.TestCase):
         disks = [dict(DISK, name="nvme0n1", slot="nvme0"),
                  dict(DISK, name="nvme1n1", slot="nvme1")]
 
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
              mock.patch.object(fio_test.subprocess, "run",
@@ -346,7 +346,7 @@ class MainParallelModeTests(unittest.TestCase):
 
     def test_logging_mode_passes_diag_store_to_runner_and_report(self):
         disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
              mock.patch.object(fio_test.subprocess, "run",
@@ -369,7 +369,7 @@ class MainParallelModeTests(unittest.TestCase):
 
     def test_non_logging_mode_passes_none_diag_store(self):
         disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md") as fake_report, \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
              mock.patch.object(fio_test.subprocess, "run",
@@ -395,7 +395,7 @@ class MainBlockSizeTests(unittest.TestCase):
 
     def _run_main(self, argv):
         disks = [dict(DISK, name="nvme0n1", slot="nvme0")]
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
              mock.patch.object(fio_test.subprocess, "run",
@@ -749,7 +749,7 @@ class MainIncrementalReportTests(unittest.TestCase):
         def record_runner(*args, **kwargs):
             order.append("runner")
 
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)), \
              mock.patch.object(fio_test, "generate_report", side_effect=record_report), \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
              mock.patch.object(fio_test.subprocess, "run",
@@ -969,7 +969,7 @@ class MainDiskSelectionTests(unittest.TestCase):
     """Выбор дисков через -a/-d должен доходить до run_disk_tests."""
 
     def _run_main(self, argv, disks):
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
              mock.patch.object(fio_test.subprocess, "run",
@@ -1024,7 +1024,7 @@ class MainDiskSelectionTests(unittest.TestCase):
     def test_add_empty_prompt_exits_without_running(self):
         disks = self._three_disks()
         runner = mock.MagicMock()
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)), \
              mock.patch.object(fio_test, "console"), \
              mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a"]), \
              mock.patch("builtins.input", return_value=""), \
@@ -1037,7 +1037,7 @@ class MainDiskSelectionTests(unittest.TestCase):
     def test_delete_all_disks_exits_without_running(self):
         disks = self._three_disks()
         runner = mock.MagicMock()
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], disks)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)), \
              mock.patch.object(fio_test, "console"), \
              mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-d", "1", "2", "3"]), \
              mock.patch.object(fio_test, "run_disk_tests", runner):
@@ -1058,7 +1058,7 @@ class TestModeDiskSelectionTests(unittest.TestCase):
         ]
 
     def _run(self, argv, scan):
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], scan)), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], scan)), \
              mock.patch.object(fio_test, "build_results_table", return_value=None) as fake_table, \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
              mock.patch.object(fio_test, "SystemTuner") as fake_tuner_cls, \
@@ -1098,7 +1098,7 @@ class TestModeDiskSelectionTests(unittest.TestCase):
         def fake_print(*args, **kwargs):
             printed.append(args[0] if args else kwargs.get("text", ""))
 
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], [])), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], [])), \
              mock.patch.object(fio_test, "build_results_table", return_value=None), \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
              mock.patch.object(fio_test, "SystemTuner"), \
@@ -1111,7 +1111,7 @@ class TestModeDiskSelectionTests(unittest.TestCase):
         )
 
     def test_add_without_numbers_prompts_interactively(self):
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], self._scan())), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], self._scan())), \
              mock.patch.object(fio_test, "build_results_table", return_value=None) as fake_table, \
              mock.patch.object(fio_test, "generate_report", return_value="rep.md"), \
              mock.patch.object(fio_test, "SystemTuner"), \
@@ -1124,7 +1124,7 @@ class TestModeDiskSelectionTests(unittest.TestCase):
         self.assertEqual([d["name"] for d in disks], ["sda"])
 
     def test_delete_all_exits(self):
-        with mock.patch.object(fio_test, "scan_disks", return_value=([], self._scan())), \
+        with mock.patch.object(fio_test, "scan_disks", return_value=([], [], self._scan())), \
              mock.patch.object(fio_test, "console"), \
              mock.patch.object(fio_test, "SystemTuner"), \
              mock.patch.object(fio_test.sys, "argv",

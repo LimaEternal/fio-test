@@ -10,6 +10,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.scanner import (
     _detect_interface,
+    _is_occupied_device,
     _link_generation,
     _parse_max_payload,
     compute_pass_thresholds,
@@ -171,11 +172,13 @@ class ScanDisksTests(unittest.TestCase):
             "utils.scanner.get_nvme_pcie_info",
             return_value={"gen": 5, "width": 4, "speed_gts": 32.0},
         ):
-            system_disks, target_disks = scan_disks(KNOWN_INTERFACES)
+            system_disks, occupied_disks, target_disks = scan_disks(KNOWN_INTERFACES)
 
         self.assertEqual(len(system_disks), 1)
         self.assertEqual(system_disks[0]["name"], "nvme1n1")
         self.assertEqual(system_disks[0]["root_partition"], "nvme1n1p2")
+
+        self.assertEqual(occupied_disks, [])
 
         self.assertEqual(
             [d["name"] for d in target_disks], ["nvme0n1", "sda", "sdb"]
@@ -201,10 +204,86 @@ class ScanDisksTests(unittest.TestCase):
             "utils.scanner.get_nvme_pcie_info",
             return_value={"gen": None, "width": None, "speed_gts": None},
         ):
-            _, target_disks = scan_disks(KNOWN_INTERFACES)
+            _, _, target_disks = scan_disks(KNOWN_INTERFACES)
 
         self.assertEqual([d["name"] for d in target_disks], ["nvme0n1"])
         self.assertEqual(target_disks[0]["tran"], "nvme")
+
+
+class OccupiedDetectionTests(unittest.TestCase):
+    """Диски с данными (разделы/ФС/монтирование) исключаются из тестов."""
+
+    def _make_lsblk(self, blockdevices):
+        proc = mock.Mock()
+        proc.stdout = json.dumps({"blockdevices": blockdevices})
+        proc.stderr = ""
+        proc.returncode = 0
+        return proc
+
+    def test_partition_table_is_occupied(self):
+        dev = {"name": "nvme0n1", "type": "disk", "children": [
+            {"name": "nvme0n1p1", "type": "part", "fstype": None},
+        ]}
+        self.assertTrue(_is_occupied_device(dev))
+
+    def test_filesystem_is_occupied(self):
+        dev = {"name": "sda", "type": "disk", "children": [
+            {"name": "sda1", "type": "part", "fstype": "ext4"},
+        ]}
+        self.assertTrue(_is_occupied_device(dev))
+
+    def test_mounted_anywhere_is_occupied(self):
+        dev = {"name": "sdb", "type": "disk", "children": [
+            {"name": "sdb1", "type": "part", "mountpoint": "/mnt/data"},
+        ]}
+        self.assertTrue(_is_occupied_device(dev))
+
+    def test_blank_disk_is_not_occupied(self):
+        dev = {"name": "nvme0n1", "type": "disk", "mountpoint": None, "fstype": None}
+        self.assertFalse(_is_occupied_device(dev))
+
+    def test_scan_disks_three_way_split(self):
+        lsblk_output = [
+            {
+                "name": "nvme0n1", "type": "disk", "size": "1.7T",
+                "model": "SAMSUNG", "serial": "SN0", "tran": "nvme",
+                "mountpoint": None, "fstype": None, "phy-sec": 512, "hctl": None,
+                "children": [
+                    {"name": "nvme0n1p1", "type": "part", "fstype": "ext4",
+                     "mountpoint": None},
+                ],
+            },
+            {
+                "name": "nvme1n1", "type": "disk", "size": "1.7T",
+                "model": "SAMSUNG", "serial": "SN1", "tran": "nvme",
+                "mountpoint": None, "fstype": None, "phy-sec": 512, "hctl": None,
+            },
+            {
+                "name": "sda", "type": "disk", "size": "1.8T",
+                "model": "SEAGATE", "serial": "SNS", "tran": "sas",
+                "mountpoint": None, "fstype": None, "phy-sec": 512, "hctl": "0:2:0:0",
+                "children": [
+                    {"name": "sda1", "type": "part", "mountpoint": "/"},
+                ],
+            },
+        ]
+
+        with mock.patch(
+            "utils.scanner.subprocess.run",
+            return_value=self._make_lsblk(lsblk_output),
+        ), mock.patch(
+            "utils.scanner.get_nvme_pcie_info",
+            return_value={"gen": None, "width": None, "speed_gts": None},
+        ), mock.patch(
+            "utils.scanner.collect_hw_profile",
+            return_value={"interface": "nvme", "rotational": 0, "link": None},
+        ):
+            system_disks, occupied_disks, target_disks = scan_disks(KNOWN_INTERFACES)
+
+        self.assertEqual([d["name"] for d in system_disks], ["sda"])
+        self.assertEqual([d["name"] for d in occupied_disks], ["nvme0n1"])
+        self.assertEqual([d["name"] for d in target_disks], ["nvme1n1"])
+        self.assertTrue(occupied_disks[0]["occupied"])
 
 
 class LinkBandwidthTests(unittest.TestCase):

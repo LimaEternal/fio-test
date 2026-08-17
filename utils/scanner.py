@@ -433,6 +433,54 @@ def _is_system_device(device: dict) -> bool:
     return False
 
 
+def _device_has_partitions(device: dict) -> bool:
+    """Рекурсивно ищет таблицу разделов (child с type == 'part')."""
+    for child in device.get("children", []):
+        if child.get("type") == "part":
+            return True
+        if _device_has_partitions(child):
+            return True
+    return False
+
+
+def _device_has_filesystem(device: dict) -> bool:
+    """Рекурсивно ищет файловую систему (fstype задан)."""
+    if device.get("fstype"):
+        return True
+    for child in device.get("children", []):
+        if _device_has_filesystem(child):
+            return True
+    return False
+
+
+def _device_is_mounted_anywhere(device: dict) -> bool:
+    """Рекурсивно проверяет, смонтирован ли диск/потомок в любой путь."""
+    for key in ("mountpoint", "mountpoints"):
+        val = device.get(key)
+        if val:
+            if isinstance(val, list):
+                if any(str(v).strip() for v in val):
+                    return True
+            elif isinstance(val, str) and val.strip():
+                return True
+    for child in device.get("children", []):
+        if _device_is_mounted_anywhere(child):
+            return True
+    return False
+
+
+def _is_occupied_device(device: dict) -> bool:
+    """
+    Диск «занят» (на нём есть данные) — его нельзя трогать по умолчанию:
+    есть таблица разделов, ФС (fstype) или смонтирован в любой путь.
+    """
+    return (
+        _device_has_partitions(device)
+        or _device_has_filesystem(device)
+        or _device_is_mounted_anywhere(device)
+    )
+
+
 def _find_root_mount_name(node: dict) -> Optional[str]:
     """Рекурсивно ищет имя устройства с корневой ФС (/). Возвращает имя или None."""
     mp = node.get("mountpoint")
@@ -601,19 +649,22 @@ def _get_numa_node(disk_name: str) -> Optional[int]:
     return None
 
 
-def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict]]:
+def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict], List[dict]]:
     """
-    Сканирует систему и возвращает два списка: (system_disks, target_disks).
+    Сканирует систему и возвращает три списка: (system_disks, occupied_disks, target_disks).
 
-    Системные диски — те, у которых хотя бы один потомок смонтирован на системный путь.
-    Целевые диски — все остальные несистемные диски.
+    Системные диски   — хотя бы один потомок смонтирован на системный путь (/, /boot …).
+    Занятые диски     — есть таблица разделов, ФС (fstype) или смонтированы в любой путь;
+                        тестированию НЕ подлежат (на них есть данные).
+    Целевые диски     — абсолютно пустые (нет разделов/ФС, не смонтированы);
+                        единственные, которые скрипт реально тестирует.
 
     Возвращает:
-        (system_disks, target_disks)
+        (system_disks, occupied_disks, target_disks)
     """
     cmd = [
         "lsblk", "--json",
-        "-o", "NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,MOUNTPOINT,PHY-SEC,HCTL",
+        "-o", "NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,MOUNTPOINT,FSTYPE,PHY-SEC,HCTL",
     ]
 
     try:
@@ -638,6 +689,7 @@ def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict
         )
 
     system_disks = []
+    occupied_disks = []
     target_disks = []
 
     for d in data:
@@ -679,17 +731,20 @@ def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict
             "profile": profile,
             "root_partition": root_partition,
             "numa_node": _get_numa_node(d["name"]),
+            "occupied": _is_occupied_device(d),
         }
 
         if is_system:
             system_disks.append(disk_info)
+        elif disk_info["occupied"]:
+            occupied_disks.append(disk_info)
         else:
             target_disks.append(disk_info)
 
-    return system_disks, target_disks
+    return system_disks, occupied_disks, target_disks
 
 
 def get_non_system_disks(known_interfaces: Dict[str, list]) -> List[dict]:
-    """Обратная совместимость: возвращает только целевые диски."""
-    _, target_disks = scan_disks(known_interfaces)
+    """Обратная совместимость: возвращает только целевые (пустые) диски."""
+    _, _, target_disks = scan_disks(known_interfaces)
     return target_disks

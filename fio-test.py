@@ -1243,7 +1243,7 @@ def main():
         #    Ничего не применяется и не запускается — только показ "что будет".
         real_disks = []
         try:
-            _, real_disks = scan_disks(INTERFACE_CONFIGS)
+            _, _, real_disks = scan_disks(INTERFACE_CONFIGS)
         except Exception:
             real_disks = []
 
@@ -1340,13 +1340,13 @@ def main():
     console.print("[bold]Сканирование дисков...[/bold]")
 
     try:
-        system_disks, disks = scan_disks(INTERFACE_CONFIGS)
+        system_disks, occupied_disks, target_disks = scan_disks(INTERFACE_CONFIGS)
     except Exception as exc:
         console.print(f"[bold red]Ошибка сканирования:[/bold red] {exc}")
         sys.exit(1)
 
     if system_disks:
-        console.print("\n[bold]Системные диски:[/bold]")
+        console.print("\n[bold]Системные диски (исключены):[/bold]")
         for sd in system_disks:
             root_info = sd.get("root_partition", "")
             name = sd["name"]
@@ -1355,24 +1355,34 @@ def main():
                 + (f" (root: {root_info})" if root_info else "")
             )
 
-    console.print("\n[bold]Целевые диски:[/bold]")
-    for i, d in enumerate(disks, 1):
+    if occupied_disks:
+        console.print("\n[bold red]Диски с данными (пропущены — не пустые):[/bold red]")
+        for od in occupied_disks:
+            name = od["name"]
+            console.print(
+                f"  [red]/dev/{name}[/red] (есть разделы/ФС или смонтирован — тест запрещён)"
+            )
+
+    console.print("\n[bold]Целевые диски (пустые, будут протестированы):[/bold]")
+    for i, d in enumerate(target_disks, 1):
         name = d["name"]
         model = d.get("model", "N/A").strip()
         console.print(f"  [green]{i}. /dev/{name}[/green] {model}")
 
-    if not disks:
-        console.print("[bold yellow]Целевые диски не найдены.[/bold yellow]")
+    if not target_disks:
+        console.print(
+            "[bold yellow]Пустые целевые диски не найдены — нечего тестировать.[/bold yellow]"
+        )
         sys.exit(0)
 
-    # Ручной выбор дисков: -a/--add или -d/--delete.
-    # Если флаг передан без номеров, список уже показан выше — запрашиваем номера.
+    # Ручной выбор дисков: -a/--add или -d/--delete. Номера относятся
+    # только к пустым целевым дискам; занятые диски недоступны для выбора.
     if args.add is not None and not args.add:
         args.add = _input_disk_numbers("Номера дисков для теста (через пробел): ")
     elif args.delete is not None and not args.delete:
         args.delete = _input_disk_numbers("Номера дисков для исключения (через пробел): ")
 
-    disks = apply_disk_selection(disks, args)
+    disks = apply_disk_selection(target_disks, args)
 
     if not disks:
         console.print("[bold yellow]После фильтрации целевые диски не найдены.[/bold yellow]")
