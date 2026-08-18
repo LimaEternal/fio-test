@@ -448,15 +448,44 @@ def compute_pass_thresholds(disk: Dict, target_percent: float = DEFAULT_TARGET_P
     }
 
 
-def _read_mpss(bdf: str) -> Optional[int]:
-    """MaxPayload (байты) устройства из sysfs /sys/bus/pci/devices/<bdf>/mpss."""
-    path = Path(f"/sys/bus/pci/devices/{bdf}/mpss")
-    if not path.exists():
+def _read_mpss_from_config(bdf: str) -> Optional[int]:
+    """MaxPayload (байты) из PCI config space без lspci.
+
+    Работает и под Intel VMD, где sysfs-атрибут mpss отсутствует.
+    Читает /sys/bus/pci/devices/<bdf>/config, ищет PCIe Capability (ID 0x10),
+    из DevCap (bits 2:0) декодирует MaxPayload: 128 << enc.
+    """
+    cfg = Path(f"/sys/bus/pci/devices/{bdf}/config")
+    if not cfg.exists():
         return None
     try:
-        return int(path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+        data = cfg.read_bytes()
+    except OSError:
         return None
+    if len(data) < 0x40:
+        return None
+    cap = data[0x34]  # Capabilities Pointer
+    for _ in range(64):  # защита от петли в списке возможностей
+        if cap < 0x40 or cap + 8 > len(data):
+            break
+        if data[cap] == 0x10:  # PCI Express Capability
+            devcap = int.from_bytes(data[cap + 4:cap + 8], "little")
+            return 128 << (devcap & 0x7)
+        cap = data[cap + 1]  # Next Capability Pointer
+        if cap == 0:
+            break
+    return None
+
+
+def _read_mpss(bdf: str) -> Optional[int]:
+    """MaxPayload (байты) устройства: sysfs mpss, иначе PCI config space."""
+    mpss = Path(f"/sys/bus/pci/devices/{bdf}/mpss")
+    if mpss.exists():
+        try:
+            return int(mpss.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pass
+    return _read_mpss_from_config(bdf)
 
 
 def _read_upstream_max_payload(bdf: str) -> Optional[int]:

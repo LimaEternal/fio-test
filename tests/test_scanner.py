@@ -12,6 +12,7 @@ from utils.hw_profile import (
     _detect_interface,
     _link_generation,
     _read_mpss,
+    _read_mpss_from_config,
     _read_upstream_max_payload,
     compute_pass_thresholds,
     estimate_ceiling_mbps,
@@ -339,8 +340,60 @@ class NvmeMaxPayloadTests(unittest.TestCase):
         fake_path = mock.Mock()
         fake_path.exists.return_value = True
         fake_path.read_text.return_value = "garbage"
+        fake_path.read_bytes.return_value = b""  # config fallback -> слишком короткий -> None
         with mock.patch("utils.hw_profile.Path", return_value=fake_path):
             self.assertIsNone(_read_mpss("0000:01:00.0"))
+
+    @staticmethod
+    def _make_config(encoding: int, cap_ptr: int = 0x40) -> bytes:
+        """Синтетический PCI config space с PCIe Capability (DevCap)."""
+        blob = bytearray(256)
+        blob[0x34] = cap_ptr          # Capabilities Pointer
+        blob[cap_ptr] = 0x10          # PCI Express Capability ID
+        blob[cap_ptr + 1] = 0x00      # Next Capability (none)
+        devcap = encoding             # bits 2:0 = MaxPayload encoding
+        blob[cap_ptr + 4:cap_ptr + 8] = devcap.to_bytes(4, "little")
+        return bytes(blob)
+
+    def test_read_mpss_from_config_encodings(self):
+        for encoding, expected in [(0, 128), (1, 256), (2, 512), (3, 1024)]:
+            cfg = self._make_config(encoding)
+            fake_path = mock.Mock()
+            fake_path.exists.return_value = True
+            fake_path.read_bytes.return_value = cfg
+            with mock.patch("utils.hw_profile.Path", return_value=fake_path):
+                self.assertEqual(_read_mpss_from_config("0000:01:00.0"), expected)
+
+    def test_read_mpss_from_config_no_pcie_cap(self):
+        blob = bytearray(256)
+        blob[0x34] = 0x40
+        blob[0x40] = 0x05  # Vendor-Specific capability, not PCIe
+        blob[0x41] = 0x00
+        fake_path = mock.Mock()
+        fake_path.exists.return_value = True
+        fake_path.read_bytes.return_value = bytes(blob)
+        with mock.patch("utils.hw_profile.Path", return_value=fake_path):
+            self.assertIsNone(_read_mpss_from_config("0000:01:00.0"))
+
+    def test_read_mpss_from_config_missing(self):
+        fake_path = mock.Mock()
+        fake_path.exists.return_value = False
+        with mock.patch("utils.hw_profile.Path", return_value=fake_path):
+            self.assertIsNone(_read_mpss_from_config("0000:01:00.0"))
+
+    def test_read_mpss_config_fallback(self):
+        # mpss отсутствует, config есть -> декодируем из config space
+        mpss_path = mock.Mock()
+        mpss_path.exists.return_value = False
+        cfg_path = mock.Mock()
+        cfg_path.exists.return_value = True
+        cfg_path.read_bytes.return_value = self._make_config(2)  # 512 B
+
+        def _path_side_effect(p):
+            return cfg_path if str(p).endswith("/config") else mpss_path
+
+        with mock.patch("utils.hw_profile.Path", side_effect=_path_side_effect):
+            self.assertEqual(_read_mpss("0000:01:00.0"), 512)
 
     def test_read_device_and_port(self):
         link_dir = Path("/sys/bus/pci/devices/0000:01:00.0")
