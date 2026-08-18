@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.table_renderer import (
     RESULT_HEADERS,
     TITLE,
+    _block_size_line,
     _disk_details,
     build_results_table,
     format_status,
@@ -268,12 +269,14 @@ class DiskDetailsPcieTests(unittest.TestCase):
             "serial": "SN", "slot": "nvme0", "size": "1.7T",
             "profile": {
                 "interface": "nvme",
+                "logical_block_size": 512, "physical_block_size": 4096,
                 "link": {"gen": 5, "width": 4, "speed_gts": 32.0,
                          "max_gen": 5, "source": "sysfs"},
             },
         }
         text = "\n".join(_disk_details(disk))
         self.assertIn("PCIe 5 x4", text)
+        self.assertIn("Блок (лог/физ): 512B / 4096B", text)
         self.assertIn("Пропускная: 15754 МБ/с", text)
         self.assertIn("downgrade: нет", text)
         self.assertNotIn("⚠", text)
@@ -332,15 +335,32 @@ class DiskDetailsPcieTests(unittest.TestCase):
             "serial": "SN", "slot": "0:0:0:0", "size": "1.8T",
             "profile": {
                 "interface": "sas",
+                "logical_block_size": 512, "physical_block_size": 4096,
                 "link": {"negotiated_gbps": 6.0, "maximum_gbps": 12.0,
                          "source": "sas_phy"},
             },
         }
         text = "\n".join(_disk_details(disk))
         self.assertIn("SAS 6 Gbps", text)
+        self.assertIn("Блок (лог/физ): 512B / 4096B", text)
         self.assertIn("Пропускная: 600 МБ/с", text)
         self.assertIn("MaxPayload: HBA Only", text)
         self.assertIn("downgrade: есть (порт 6 Gbps, накопитель 12 Gbps)", text)
+
+    def test_block_size_line(self):
+        # Оба размера есть -> форматируем
+        self.assertEqual(
+            _block_size_line({"logical_block_size": 512, "physical_block_size": 4096}),
+            "Блок (лог/физ): 512B / 4096B",
+        )
+        # Чего-то нет -> строки нет
+        self.assertIsNone(_block_size_line({"logical_block_size": 512}))
+        self.assertIsNone(_block_size_line({}))
+        # 4K-native диск
+        self.assertEqual(
+            _block_size_line({"logical_block_size": 4096, "physical_block_size": 4096}),
+            "Блок (лог/физ): 4096B / 4096B",
+        )
 
     def test_no_profile_keeps_legacy_lines(self):
         disk = {"name": "sda", "model": "QEMU", "tran": "SATA",

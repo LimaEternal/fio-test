@@ -48,6 +48,15 @@ def format_status(status):
     return Text(str(status))
 
 
+def _block_size_line(profile):
+    """Размер блока (логический/физический) из профиля очереди диска."""
+    log = profile.get("logical_block_size")
+    phys = profile.get("physical_block_size")
+    if log and phys:
+        return f"Блок (лог/физ): {log}B / {phys}B"
+    return None
+
+
 def _disk_link_lines(profile):
     """Возвращает строки линка/поколения PCIe для паспорта накопителя.
 
@@ -69,6 +78,9 @@ def _disk_link_lines(profile):
         max_gen = link.get("max_gen")
         if gen:
             lines.append(f"PCIe {gen} x{width}" if width else f"PCIe {gen}")
+        block = _block_size_line(profile)
+        if block:
+            lines.append(block)
         bw = link_bandwidth_mbps("nvme", link)
         if bw is not None:
             lines.append(f"Пропускная: {bw:.0f} МБ/с")
@@ -101,6 +113,9 @@ def _disk_link_lines(profile):
         max_l = link.get("maximum_gbps")
         if neg:
             lines.append(f"SAS {neg:.0f} Gbps")
+        block = _block_size_line(profile)
+        if block:
+            lines.append(block)
         bw = link_bandwidth_mbps("sas", link)
         if bw is not None:
             lines.append(f"Пропускная: {bw:.0f} МБ/с")
@@ -119,6 +134,9 @@ def _disk_link_lines(profile):
         hw = link.get("hw_spd_limit_gbps")
         if spd:
             lines.append(f"SATA {spd:.0f} Gbps")
+        block = _block_size_line(profile)
+        if block:
+            lines.append(block)
         bw = link_bandwidth_mbps("sata", link)
         if bw is not None:
             lines.append(f"Пропускная: {bw:.0f} МБ/с")
