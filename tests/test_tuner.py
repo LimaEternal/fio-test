@@ -314,8 +314,8 @@ class PrintSummaryTests(unittest.TestCase):
     def test_success_and_failure(self):
         tuner = SystemTuner([])
         tuner.applied = [
-            {"param": "governor", "before": "x", "after": "y", "success": True},
-            {"param": "APST", "before": "a", "after": "b", "success": False, "error": "fail"},
+            {"param": "governor", "after": "y", "success": True},
+            {"param": "APST", "after": "b", "success": False, "error": "fail"},
         ]
         with mock.patch("utils.tuner.console"):
             tuner.print_summary()

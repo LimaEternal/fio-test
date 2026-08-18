@@ -319,8 +319,9 @@ def generate_report(
                 else:
                     status = "✓" if item.get("success") else f"✗ {item.get('error', '')}"
                     param = item["param"]
+                before = item.get("before", "")
                 lines.append(
-                    f"| {param} | {item['before']} | {item['after']} | {status} |"
+                    f"| {param} | {before} | {item['after']} | {status} |"
                 )
             lines.append("")
 

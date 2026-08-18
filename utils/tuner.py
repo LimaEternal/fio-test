@@ -90,10 +90,12 @@ class SystemTuner:
 
         console.print("\n[bold]Оптимизация системы...[/bold]")
         for item in self.applied:
+            before = item.get("before")
+            arrow = f"{before} → " if before else ""
             if item["success"]:
                 console.print(
                     f"  [green]✓[/green] {item['param']}: "
-                    f"{item['before']} → {item['after']}"
+                    f"{arrow}{item['after']}"
                 )
             else:
                 console.print(
@@ -188,7 +190,6 @@ class SystemTuner:
 
         self.applied.append({
             "param": "CPU governor",
-            "before": "?",
             "after": "performance",
             "success": True,
         })
@@ -218,7 +219,6 @@ class SystemTuner:
             after = _read_apst(disk["path"]) if success else "enabled"
             self.applied.append({
                 "param": "NVMe APST",
-                "before": "enabled",
                 "after": after,
                 "success": success and after == "disabled",
                 "error": "" if success else "nvme-cli недоступен или ошибка",

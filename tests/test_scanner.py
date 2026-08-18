@@ -11,7 +11,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.hw_profile import (
     _detect_interface,
     _link_generation,
-    _parse_max_payload,
+    _read_mpss,
+    _read_upstream_max_payload,
     compute_pass_thresholds,
     estimate_ceiling_mbps,
     find_nvme_link_dir,
@@ -319,25 +320,37 @@ class LinkBandwidthTests(unittest.TestCase):
 
 
 class NvmeMaxPayloadTests(unittest.TestCase):
-    """Чтение MaxPayload (размер TLP PCIe) NVMe-контроллера."""
+    """Чтение MaxPayload (размер TLP PCIe) NVMe-контроллера из sysfs."""
 
-    def test_parse_max_payload(self):
-        text = (
-            "LnkCap: Port #0, Speed 16GT/s, Width x4\n"
-            "DevCap: MaxPayload 256 bytes, MaxReadReq 512 bytes\n"
-        )
-        self.assertEqual(_parse_max_payload(text), 256)
-        self.assertIsNone(_parse_max_payload("no MaxPayload here"))
+    def test_read_mpss_ok(self):
+        fake_path = mock.Mock()
+        fake_path.exists.return_value = True
+        fake_path.read_text.return_value = "256"
+        with mock.patch("utils.hw_profile.Path", return_value=fake_path):
+            self.assertEqual(_read_mpss("0000:01:00.0"), 256)
+
+    def test_read_mpss_missing(self):
+        fake_path = mock.Mock()
+        fake_path.exists.return_value = False
+        with mock.patch("utils.hw_profile.Path", return_value=fake_path):
+            self.assertIsNone(_read_mpss("0000:01:00.0"))
+
+    def test_read_mpss_bad_value(self):
+        fake_path = mock.Mock()
+        fake_path.exists.return_value = True
+        fake_path.read_text.return_value = "garbage"
+        with mock.patch("utils.hw_profile.Path", return_value=fake_path):
+            self.assertIsNone(_read_mpss("0000:01:00.0"))
 
     def test_read_device_and_port(self):
         link_dir = Path("/sys/bus/pci/devices/0000:01:00.0")
-        dev_out = "DevCap: MaxPayload 256 bytes"
         with mock.patch(
             "utils.hw_profile.find_nvme_link_dir", return_value=link_dir
         ), mock.patch(
+            "utils.hw_profile._read_mpss", return_value=256
+        ), mock.patch(
             "utils.hw_profile._read_upstream_max_payload", return_value=512
-        ), mock.patch("utils.hw_profile.subprocess.run") as run:
-            run.return_value = mock.Mock(stdout=dev_out, returncode=0)
+        ):
             result = read_nvme_max_payload("nvme0n1")
         self.assertEqual(result, {"device": 256, "port": 512})
 
@@ -345,11 +358,11 @@ class NvmeMaxPayloadTests(unittest.TestCase):
         link_dir = Path("/sys/bus/pci/devices/0000:01:00.0")
         with mock.patch(
             "utils.hw_profile.find_nvme_link_dir", return_value=link_dir
-        ), mock.patch("utils.hw_profile.subprocess.run") as run:
-            run.side_effect = [
-                mock.Mock(stdout="DevCap: MaxPayload 128 bytes", returncode=0),
-                mock.Mock(side_effect=OSError("no bridge")),
-            ]
+        ), mock.patch(
+            "utils.hw_profile._read_mpss", return_value=128
+        ), mock.patch(
+            "utils.hw_profile._read_upstream_max_payload", return_value=None
+        ):
             result = read_nvme_max_payload("nvme0n1")
         self.assertEqual(result, {"device": 128, "port": None})
 
@@ -358,6 +371,29 @@ class NvmeMaxPayloadTests(unittest.TestCase):
             "utils.hw_profile.find_nvme_link_dir", return_value=None
         ):
             self.assertIsNone(read_nvme_max_payload("nvme0n1"))
+
+    def test_read_upstream_mpss(self):
+        fake_dev = mock.Mock()
+        fake_dev.exists.return_value = True
+        fake_bridge = mock.Mock()
+        fake_bridge.name = "0000:00:01.0"
+        fake_dev.resolve.return_value.parent = fake_bridge
+        with mock.patch(
+            "utils.hw_profile.Path", return_value=fake_dev
+        ), mock.patch(
+            "utils.hw_profile._read_mpss", return_value=512
+        ):
+            result = _read_upstream_max_payload("0000:01:00.0")
+        self.assertEqual(result, 512)
+
+    def test_read_upstream_no_parent(self):
+        fake_dev = mock.Mock()
+        fake_dev.exists.return_value = True
+        fake_dev.name = "0000:01:00.0"
+        fake_dev.resolve.return_value.parent = fake_dev
+        with mock.patch("utils.hw_profile.Path", return_value=fake_dev):
+            result = _read_upstream_max_payload("0000:01:00.0")
+        self.assertIsNone(result)
 
 
 class ComputePassThresholdsTests(unittest.TestCase):

@@ -8,7 +8,6 @@
 
 import json
 import re
-import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -449,14 +448,19 @@ def compute_pass_thresholds(disk: Dict, target_percent: float = DEFAULT_TARGET_P
     }
 
 
-def _parse_max_payload(text: str) -> Optional[int]:
-    """Извлекает MaxPayload (байты) из вывода 'lspci -vvv' (поле DevCap)."""
-    m = re.search(r"MaxPayload\s+(\d+)\s*bytes", text, re.IGNORECASE)
-    return int(m.group(1)) if m else None
+def _read_mpss(bdf: str) -> Optional[int]:
+    """MaxPayload (байты) устройства из sysfs /sys/bus/pci/devices/<bdf>/mpss."""
+    path = Path(f"/sys/bus/pci/devices/{bdf}/mpss")
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
 
 
 def _read_upstream_max_payload(bdf: str) -> Optional[int]:
-    """Best-effort: читает MaxPayload upstream PCIe-моста (порта) по BDF.
+    """Best-effort: MaxPayload upstream PCIe-моста (порта) из sysfs.
 
     Позволяет сравнить MaxPayload устройства с лимитом порта. При
     любой ошибке возвращает None (признак «не удалось проверить»).
@@ -468,12 +472,8 @@ def _read_upstream_max_payload(bdf: str) -> Optional[int]:
         bridge = dev_path.resolve().parent
         if bridge.name == bdf:
             return None
-        out = subprocess.run(
-            ["lspci", "-vvv", "-s", bridge.name],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
-        return _parse_max_payload(out)
-    except (OSError, subprocess.SubprocessError, ValueError):
+        return _read_mpss(bridge.name)
+    except (OSError, ValueError):
         return None
 
 
@@ -484,21 +484,13 @@ def read_nvme_max_payload(disk_name: str) -> Optional[Dict[str, Optional[int]]]:
     MaxPayload — PCIe-уровень, относится к самому контроллеру диска
     (не к кабелю/протоколу SATA/SAS). Возвращает
     {'device': int_байты, 'port': int_байты|None}. При отсутствии
-    данных или lspci — None.
+    данных в sysfs — None.
     """
     link_dir = find_nvme_link_dir(disk_name)
     if not link_dir:
         return None
     bdf = link_dir.name
-    try:
-        out = subprocess.run(
-            ["lspci", "-vvv", "-s", bdf],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-
-    device = _parse_max_payload(out)
+    device = _read_mpss(bdf)
     if device is None:
         return None
     return {"device": device, "port": _read_upstream_max_payload(bdf)}
