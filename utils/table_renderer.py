@@ -35,7 +35,7 @@ def _result_headers():
     """Колонки вложенной таблицы с учётом текущего режима отображения."""
     headers = list(BASE_RESULT_HEADERS)
     if SHOW_LAT_P99:
-        headers.insert(-2, ("Lat p99 (мс)", "center", 10))
+        headers.insert(-3, ("Lat p99 (мс)", "center", 10))
     return headers
 
 

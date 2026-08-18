@@ -1,18 +1,14 @@
 """
-Модуль безопасной настройки системы для максимальной производительности NVMe.
+Модуль настройки системы для максимальной производительности накопителей.
 
-Применяет ТОЛЬКО безопасные, не требующие перезагрузки настройки и ТОЛЬКО
-к целевым (несистемным) дискам:
-- CPU governor → performance (с контролем температуры);
-- readahead → 2048 KB для целевых NVMe;
-- NVMe APST → отключён для целевых NVMe;
-- NUMA-привязка fio (--cpus_allowed) для целевых дисков.
+Применяет:
+- CPU governor → performance (write + verify, критическая ошибка при неудаче);
+- NVMe APST → отключён для целевых NVMe (best-effort).
 
-Ничего, что влияет на системные диски или требует перезагрузки
-(глобальный NVMe power-saving, CPU turbo, PCIe ASPM, kernel cmdline,
-Intel VMD), не применяется и даже не выводится в предупреждения.
+NUMA-привязка fio (--cpus_allowed) — через get_numa_cpus(), не через apply().
 """
 
+import sys
 from pathlib import Path
 import re
 import subprocess
@@ -22,87 +18,69 @@ from rich.console import Console
 
 console = Console(color_system=None, highlight=False)
 
-# Без этого порога governor не применяется (защита от перегрева).
-MAX_TEMP_BEFORE_TUNE_C = 75
-READAHEAD_KB = 2048
 VALID_CPULIST_RE = re.compile(r"^[\d,\-\s]+$")
 
 
 class SystemTuner:
-    """Безопасная настройка системы для тестирования накопителей."""
+    """Настройка системы для тестирования накопителей."""
 
     def __init__(self, target_disks: List[dict], system_disks: Optional[List[dict]] = None):
-        """
-        Параметры:
-            target_disks — целевые (несистемные) диски из scanner.py.
-            system_disks — системные диски (для справки, настройки их НЕ касаются).
-        """
         self.target_disks = target_disks
         self.system_disks = system_disks or []
         self._target_nvme = [
             d for d in target_disks if d.get("tran", "").lower() == "nvme"
         ]
-        self.issues: List[Dict] = []
         self.applied: List[Dict] = []
 
     # ------------------------------------------------------------------
     # Публичный API
     # ------------------------------------------------------------------
 
-    def detect(self) -> None:
-        """Read-only: собирает, какие оптимизации будут/могут быть применены."""
-        self.issues = []
-        self._detect_cpu_governor()
-        self._detect_readahead()
-        self._detect_nvme_apst()
+    def apply(self) -> None:
+        """Применяет оптимизации: governor → performance, APST → off.
+
+        Governor — критическая ошибка при неудаче (sys.exit).
+        APST — best-effort (nvme-cli может отсутствовать).
+        """
+        self.applied = []
+        self._apply_cpu_governor()
+        self._apply_nvme_apst()
 
     def preview(self) -> List[Dict]:
-        """
-        Возвращает список того, что БЫЛО БЫ применено (без применения).
-        Каждый элемент: {"param", "before", "after", "target_disks"}.
-        """
-        self.detect()
+        """Dry-run для режима -t: что БЫЛО бы применено (read-only)."""
         rows = []
-        for issue in self.issues:
+
+        governor_path = _governor_path()
+        if governor_path is None:
             rows.append({
-                "param": issue["param"],
-                "before": issue["current"],
-                "after": issue["target"],
-                "target_disks": issue.get("disks", ""),
-                "skipped_reason": issue.get("skipped_reason"),
+                "param": "CPU governor",
+                "before": "cpufreq недоступен",
+                "after": "performance",
+                "skipped_reason": "scaling_governor не найден",
             })
-        return rows
-
-    def apply(self) -> None:
-        """Применяет безопасные оптимизации (только к целевым дискам)."""
-        self.applied = []
-        self.detect()
-
-        for issue in self.issues:
-            if "skipped_reason" in issue:
-                self.applied.append({
-                    "param": issue["param"],
-                    "before": issue["current"],
-                    "after": issue["target"],
-                    "success": False,
-                    "error": issue["skipped_reason"],
-                })
-                continue
+        else:
             try:
-                result = issue["apply_func"]()
-            except Exception as exc:
-                result = False
-                err = str(exc)
-            else:
-                err = ""
+                current = governor_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                current = "?"
+            if current != "performance":
+                rows.append({
+                    "param": "CPU governor",
+                    "before": current,
+                    "after": "performance",
+                })
 
-            self.applied.append({
-                "param": issue["param"],
-                "before": issue["current"],
-                "after": issue["target"],
-                "success": bool(result),
-                "error": err,
-            })
+        for disk in self._target_nvme:
+            apst = _read_apst(disk["path"])
+            if apst == "enabled":
+                rows.append({
+                    "param": "NVMe APST",
+                    "before": "enabled",
+                    "after": "disabled",
+                    "target_disks": disk["name"],
+                })
+
+        return rows
 
     def print_summary(self) -> None:
         """Выводит в консоль, что было применено."""
@@ -120,7 +98,7 @@ class SystemTuner:
             else:
                 console.print(
                     f"  [yellow]—[/yellow] {item['param']}: пропущено"
-                    + (f" ({item['error']})" if item["error"] else "")
+                    + (f" ({item['error']})" if item.get("error") else "")
                 )
         console.print()
 
@@ -129,11 +107,7 @@ class SystemTuner:
         return self.applied
 
     def get_numa_cpus(self, disk_name: str) -> Optional[str]:
-        """
-        CPU-маска NUMA-узла, на котором находится диск, или None.
-
-        Возвращается только проверенная маска вида "0-11,24-35".
-        """
+        """CPU-маска NUMA-узла диска или None."""
         for disk in self.target_disks:
             if disk["name"] != disk_name:
                 continue
@@ -152,16 +126,8 @@ class SystemTuner:
             return None
         return None
 
-    # ------------------------------------------------------------------
-    # Температура NVMe
-    # ------------------------------------------------------------------
-
     def get_nvme_temps(self) -> Dict[str, Optional[float]]:
-        """
-        Текущие температуры NVMe в °C: {имя_контроллера: temp}.
-
-        Имя — nvme0, nvme1 и т.д. (sysfs-имена hwmon).
-        """
+        """Текущие температуры NVMe в °C: {имя_контроллера: temp}."""
         temps: Dict[str, Optional[float]] = {}
         try:
             for ctrl in Path("/sys/class/nvme").glob("nvme*"):
@@ -180,126 +146,62 @@ class SystemTuner:
         return temps
 
     # ------------------------------------------------------------------
-    # CPU governor
+    # CPU governor: write → verify → die
     # ------------------------------------------------------------------
 
-    def _detect_cpu_governor(self) -> None:
-        governor_path = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
-        if not governor_path.exists():
-            return
-        try:
-            current = governor_path.read_text().strip()
-        except Exception:
-            return
-        if current == "performance":
-            return
+    def _apply_cpu_governor(self) -> None:
+        governor_paths = _all_governor_paths()
+        if not governor_paths:
+            console.print(
+                "[bold red]ОШИБКА:[/bold red] cpufreq недоступен "
+                "(scaling_governor не найден ни на одном CPU)"
+            )
+            sys.exit(1)
 
-        issue = {
+        # Записываем performance во все ядра
+        for p in governor_paths:
+            try:
+                p.write_text("performance\n")
+            except OSError as exc:
+                console.print(
+                    f"[bold red]ОШИБКА:[/bold red] не удалось записать "
+                    f"governor в {p}: {exc}"
+                )
+                sys.exit(1)
+
+        # Верифицируем
+        failed = []
+        for p in governor_paths:
+            try:
+                current = p.read_text(encoding="utf-8").strip()
+            except Exception:
+                current = "?"
+            if current != "performance":
+                failed.append(p.parent.parent.name)
+
+        if failed:
+            console.print(
+                f"[bold red]ОШИБКА:[/bold red] governor не применился "
+                f"на CPU: {', '.join(failed)}"
+            )
+            sys.exit(1)
+
+        self.applied.append({
             "param": "CPU governor",
-            "current": current,
-            "target": "performance",
-            "disks": "все CPU",
-            "apply_func": self._apply_cpu_governor,
-        }
-        # Проверка температуры заранее (read-only): при перегреве не применяем.
-        temps = self.get_nvme_temps()
-        hot = [
-            (name, t)
-            for name, t in temps.items()
-            if t is not None and t > MAX_TEMP_BEFORE_TUNE_C
-        ]
-        if hot:
-            names = ", ".join(f"{n} ({t:.0f}°C)" for n, t in hot)
-            issue["skipped_reason"] = f"перегрев NVMe: {names}"
-        self.issues.append(issue)
-
-    def _apply_cpu_governor(self) -> bool:
-        applied_any = False
-        try:
-            for governor_path in Path("/sys/devices/system/cpu").glob(
-                "cpu*/cpufreq/scaling_governor"
-            ):
-                try:
-                    governor_path.write_text("performance\n")
-                    applied_any = True
-                except Exception:
-                    pass
-        except Exception:
-            return applied_any
-        return applied_any
-
-    # ------------------------------------------------------------------
-    # Readahead (только целевые NVMe)
-    # ------------------------------------------------------------------
-
-    def _detect_readahead(self) -> None:
-        low = [
-            disk["name"]
-            for disk in self._target_nvme
-            if self._readahead_kb(disk["name"]) not in (None, READAHEAD_KB)
-        ]
-        if not low:
-            return
-        current = self._readahead_kb(low[0])
-        self.issues.append({
-            "param": "Readahead (NVMe)",
-            "current": f"{current} KB" if current is not None else "?",
-            "target": f"{READAHEAD_KB} KB",
-            "disks": ", ".join(low),
-            "apply_func": self._apply_readahead,
+            "before": "?",
+            "after": "performance",
+            "success": True,
         })
 
-    def _readahead_kb(self, disk_name: str) -> Optional[int]:
-        try:
-            ra_path = Path(f"/sys/block/{disk_name}/queue/read_ahead_kb")
-            if ra_path.exists():
-                return int(ra_path.read_text().strip())
-        except Exception:
-            pass
-        return None
-
-    def _apply_readahead(self) -> bool:
-        ok = False
-        for disk in self._target_nvme:
-            try:
-                ra_path = Path(f"/sys/block/{disk['name']}/queue/read_ahead_kb")
-                ra_path.write_text(f"{READAHEAD_KB}\n")
-                ok = True
-            except Exception:
-                pass
-        return ok
-
     # ------------------------------------------------------------------
-    # NVMe APST (только целевые NVMe, per-device)
+    # NVMe APST: disable (best-effort)
     # ------------------------------------------------------------------
 
-    def _detect_nvme_apst(self) -> None:
-        if not self._target_nvme:
-            return
-        try:
-            result = subprocess.run(
-                ["nvme", "get-feature", self._target_nvme[0]["path"], "-f", "0x0c"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except Exception:
-            return
-        if result.returncode != 0:
-            return
-        if "APST" in result.stdout and "Enabled" in result.stdout:
-            disks = ", ".join(d["name"] for d in self._target_nvme)
-            self.issues.append({
-                "param": "NVMe APST",
-                "current": "enabled",
-                "target": "disabled",
-                "disks": disks,
-                "apply_func": self._apply_nvme_apst,
-            })
-
-    def _apply_nvme_apst(self) -> bool:
-        ok = False
+    def _apply_nvme_apst(self) -> None:
         for disk in self._target_nvme:
+            current = _read_apst(disk["path"])
+            if current != "enabled":
+                continue
             try:
                 result = subprocess.run(
                     ["nvme", "set-feature", disk["path"], "-f", "0x0c", "-v", "0"],
@@ -307,8 +209,52 @@ class SystemTuner:
                     text=True,
                     timeout=5,
                 )
-                if result.returncode == 0:
-                    ok = True
+                success = result.returncode == 0
+            except (FileNotFoundError, subprocess.SubprocessError):
+                success = False
             except Exception:
-                pass
-        return ok
+                success = False
+
+            after = _read_apst(disk["path"]) if success else "enabled"
+            self.applied.append({
+                "param": "NVMe APST",
+                "before": "enabled",
+                "after": after,
+                "success": success and after == "disabled",
+                "error": "" if success else "nvme-cli недоступен или ошибка",
+            })
+
+
+# ------------------------------------------------------------------
+# Утилиты (stateless)
+# ------------------------------------------------------------------
+
+def _governor_path() -> Optional[Path]:
+    """Путь к scaling_governor для cpu0 или None."""
+    p = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    return p if p.exists() else None
+
+
+def _all_governor_paths() -> List[Path]:
+    """Все scaling_governor файлы."""
+    return sorted(
+        Path("/sys/devices/system/cpu").glob("cpu*/cpufreq/scaling_governor")
+    )
+
+
+def _read_apst(disk_path: str) -> Optional[str]:
+    """Читает состояние APST для NVMe-диска. Возвращает 'enabled'/'disabled'/None."""
+    try:
+        result = subprocess.run(
+            ["nvme", "get-feature", disk_path, "-f", "0x0c"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        if "APST" in result.stdout and "Enabled" in result.stdout:
+            return "enabled"
+        return "disabled"
+    except (FileNotFoundError, subprocess.SubprocessError, Exception):
+        return None

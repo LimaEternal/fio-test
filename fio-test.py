@@ -1402,7 +1402,6 @@ def main():
     tuner = None
     if not args.no_tune:
         tuner = SystemTuner(disks, system_disks)
-        tuner.detect()
         tuner.apply()
         tuner.print_summary()
 
