@@ -54,6 +54,7 @@ from utils.hw_profile import (
 )
 from utils.table_renderer import build_results_table
 from utils.tuner import SystemTuner
+from utils.exit_code import decide_exit_code
 
 console = Console(color_system=None, highlight=False)
 
@@ -1556,6 +1557,18 @@ def main():
 
     if report_path is not None:
         console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
+
+    # Итоговый код завершения по колонке Статус всех (диск × тест):
+    #   0 — все PASS; 1 — все FAIL; 2 — есть FAIL, но не все.
+    exit_code = decide_exit_code(results)
+    if exit_code != 0:
+        style = "bold red" if exit_code == 1 else "bold yellow"
+        label = {
+            1: "все тесты FAIL",
+            2: "часть тестов FAIL",
+        }.get(exit_code, "")
+        console.print(f"[{style}]Итог: {label} (код завершения {exit_code})[/{style}]")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
