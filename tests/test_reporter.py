@@ -200,6 +200,18 @@ class GenerateReportDiagStoreTests(unittest.TestCase):
         self.assertNotIn("| NUMA |", text)
         self.assertIn("## Результаты тестирования", text)
 
+    def test_report_without_diag_store_shows_block_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_report(
+                [DISK], make_results(include_diag=False), TEST_NAMES,
+                output_path=Path(tmp) / "report.md",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("Блок (физ/лог)", text)
+        self.assertIn("4096/4096", text)
+        self.assertNotIn("| NUMA |", text)
+
     def test_report_survives_wall_s_float_in_results(self):
         results = [
             {

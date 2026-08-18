@@ -250,8 +250,8 @@ def build_results_table(disks, results, test_names, show_lat_p99=False):
     for index, disk in enumerate(disks, 1):
         disk_results = results[index - 1] if index - 1 < len(results) else {}
         table.add_row(
-            Text(f"\n{index}"),
-            Text("\n" + "\n".join(_disk_details(disk))),
+            Text(str(index)),
+            Text("\n".join(_disk_details(disk))),
             _results_cell(disk_results, test_names),
         )
         table.add_section()
