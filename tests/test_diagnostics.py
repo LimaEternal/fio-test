@@ -129,6 +129,7 @@ class DiagnosticSamplerTests(unittest.TestCase):
         self.assertEqual(summary["link_gts_min"], 32.0)
         self.assertEqual(summary["link_width_min"], 4)
         self.assertEqual(summary["temp_max_c"], 41.0)
+        self.assertEqual(summary["temp_avg_c"], 41.0)
         self.assertIsNone(summary["read_mbs_avg"])
         self.assertEqual(summary["sources"]["link"], True)
         self.assertEqual(summary["sources"]["temp"], True)

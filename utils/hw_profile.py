@@ -1,17 +1,16 @@
 """
-Модуль определения несистемных дисков.
+Профилирование аппаратной части диска из sysfs.
 
-Парсит вывод lsblk в JSON-формате, рекурсивно обходит дерево блочных
-устройств, фильтрует системные накопители (с точкой монтирования /
-и другими системными путями на любой глубине вложенности) и классифицирует
-оставшиеся по типу интерфейса.
+Собирает физику линка (PCIe/SAS/SATA), параметры очереди блочного
+устройства, MaxPayload PCIe и NUMA-узел; вычисляет теоретические
+потолки шины и динамические пороги PASS/FAIL (Zero-Config) по ТЗ.
 """
 
 import json
 import re
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 
 def _read_queue_file(path: Path, default: int) -> int:
@@ -34,6 +33,61 @@ def _read_queue_info(disk_name: str) -> Dict[str, int]:
         "max_sectors_kb": _read_queue_file(queue_dir / "max_sectors_kb", 4096),
         "rotational": _read_queue_file(queue_dir / "rotational", 0),
     }
+
+
+def _find_link_files(start_dir: Path):
+    """Ищет current_link_speed/current_link_width, поднимаясь от start_dir вверх.
+
+    Возвращает (speed_file, width_file) или None. Лимит в 8 уровней
+    защищает от бесконечного подъёма к корню ФС.
+    """
+    current_dir = start_dir
+    for _ in range(8):
+        speed_file = current_dir / "current_link_speed"
+        width_file = current_dir / "current_link_width"
+        if speed_file.exists() and width_file.exists():
+            return speed_file, width_file
+        parent = current_dir.parent
+        if parent == current_dir:
+            break
+        current_dir = parent
+    return None
+
+
+def find_nvme_link_dir(disk_name: str) -> Optional[Path]:
+    """
+    Находит каталог с current_link_speed/current_link_width для NVMe диска.
+
+    Под Intel VMD /sys/block/<name>/device ведёт в виртуальный каталог
+    nvme-subsystem без линк-файлов, поэтому первым пробуется реальная
+    PCI-функция /sys/class/nvme/<nvmeN>/device.
+
+    Возвращает Path к каталогу с линк-файлами или None.
+    """
+    nvme_match = re.match(r"(nvme\d+)", disk_name)
+    nvme_dev = nvme_match.group(1) if nvme_match else None
+
+    start_dirs = []
+    if nvme_dev:
+        start_dirs.append(Path(f"/sys/class/nvme/{nvme_dev}/device"))
+    start_dirs.append(Path(f"/sys/block/{disk_name}/device"))
+    start_dirs.append(Path(f"/sys/class/block/{disk_name}/device"))
+
+    for start in start_dirs:
+        if not start.exists():
+            continue
+        try:
+            real_path = start.resolve()
+        except Exception:
+            continue
+        try:
+            found = _find_link_files(real_path)
+        except Exception:
+            continue
+        if found:
+            speed_file, _ = found
+            return speed_file.parent
+    return None
 
 
 def _read_nvme_link(disk_name: str) -> Optional[Dict]:
@@ -256,6 +310,15 @@ _ENC_128B130B = 0.9846
 _ENC_8B10B = 0.8
 
 
+def nvme_line_rate_mbps(gts: float, width: int) -> float:
+    """Базовая линейная скорость NVMe без учёта кодирования/TLP (МБ/с).
+
+    (GT/s × 1000/8) × width — общая основа для link_bandwidth_mbps
+    и compute_pass_thresholds; вынесена, чтобы не дублировать формулу.
+    """
+    return gts * width * 1000.0 / 8.0
+
+
 def link_bandwidth_mbps(interface: str, link: Optional[Dict]) -> Optional[float]:
     """
     Теоретическая пропускная способность шины в МБ/с (без поправок на диск).
@@ -271,7 +334,7 @@ def link_bandwidth_mbps(interface: str, link: Optional[Dict]) -> Optional[float]
         width = link.get("width")
         if gts and width:
             enc = _ENC_128B130B if gts >= 8.0 else _ENC_8B10B
-            return gts * width * 1000 / 8 * enc
+            return nvme_line_rate_mbps(gts, width) * enc
 
     if interface == "sas" and link:
         neg_gbps = link.get("negotiated_gbps")
@@ -363,7 +426,7 @@ def compute_pass_thresholds(disk: Dict, target_percent: float = DEFAULT_TARGET_P
         gts = float(link["speed_gts"])
         width = int(link["width"])
         tlp = _NVME_TLP_EFF_GEN4PLUS if gts >= 16.0 else _NVME_TLP_EFF_GEN3
-        bw_bus = (gts * 1000.0 / 8.0) * (128.0 / 130.0) * tlp * width
+        bw_bus = nvme_line_rate_mbps(gts, width) * (128.0 / 130.0) * tlp
         return {
             "seq_read": {"min_bw_mb": round(bw_bus * target_percent, 1)},
             "seq_write": {"min_bw_mb": round(bw_bus * _NVME_WRITE_FACTOR * target_percent, 1)},
@@ -384,197 +447,6 @@ def compute_pass_thresholds(disk: Dict, target_percent: float = DEFAULT_TARGET_P
         "seq_read": {"min_bw_mb": round(bus * target_percent, 1)},
         "seq_write": {"min_bw_mb": round(bus * _SATA_SAS_WRITE_FACTOR * target_percent, 1)},
     }
-
-
-def _is_system_mount(mp: str) -> bool:
-    """
-    Проверяет, является ли точка монтирования системной (критической для работы ОС).
-    """
-    if not mp:
-        return False
-
-    system_dirs = {
-        "/", "/boot", "/boot/efi", "/usr", "/var", "/etc",
-        "/home", "/opt", "/srv", "/root",
-    }
-
-    mp_clean = mp.strip()
-    if mp_clean in system_dirs:
-        return True
-
-    for s_dir in system_dirs:
-        if s_dir != "/" and mp_clean.startswith(s_dir + "/"):
-            return True
-
-    return False
-
-
-def _is_system_device(device: dict) -> bool:
-    """
-    Рекурсивно проверяет, является ли устройство или любой из его потомков системным.
-    Проверяет как поле 'mountpoint', так и 'mountpoints' (для разных версий lsblk).
-    """
-    for key in ("mountpoint", "mountpoints"):
-        val = device.get(key)
-        if val:
-            if isinstance(val, list):
-                for mp in val:
-                    if mp and _is_system_mount(str(mp)):
-                        return True
-            elif isinstance(val, str):
-                if _is_system_mount(val):
-                    return True
-
-    if "children" in device:
-        for child in device["children"]:
-            if _is_system_device(child):
-                return True
-
-    return False
-
-
-def _device_has_partitions(device: dict) -> bool:
-    """Рекурсивно ищет таблицу разделов (child с type == 'part')."""
-    for child in device.get("children", []):
-        if child.get("type") == "part":
-            return True
-        if _device_has_partitions(child):
-            return True
-    return False
-
-
-def _device_has_filesystem(device: dict) -> bool:
-    """Рекурсивно ищет файловую систему (fstype задан)."""
-    if device.get("fstype"):
-        return True
-    for child in device.get("children", []):
-        if _device_has_filesystem(child):
-            return True
-    return False
-
-
-def _device_is_mounted_anywhere(device: dict) -> bool:
-    """Рекурсивно проверяет, смонтирован ли диск/потомок в любой путь."""
-    for key in ("mountpoint", "mountpoints"):
-        val = device.get(key)
-        if val:
-            if isinstance(val, list):
-                if any(str(v).strip() for v in val):
-                    return True
-            elif isinstance(val, str) and val.strip():
-                return True
-    for child in device.get("children", []):
-        if _device_is_mounted_anywhere(child):
-            return True
-    return False
-
-
-def _is_occupied_device(device: dict) -> bool:
-    """
-    Диск «занят» (на нём есть данные) — его нельзя трогать по умолчанию:
-    есть таблица разделов, ФС (fstype) или смонтирован в любой путь.
-    """
-    return (
-        _device_has_partitions(device)
-        or _device_has_filesystem(device)
-        or _device_is_mounted_anywhere(device)
-    )
-
-
-def _find_root_mount_name(node: dict) -> Optional[str]:
-    """Рекурсивно ищет имя устройства с корневой ФС (/). Возвращает имя или None."""
-    mp = node.get("mountpoint")
-    if mp == "/":
-        return node.get("name", "?")
-    for child in node.get("children", []):
-        result = _find_root_mount_name(child)
-        if result:
-            return result
-    return None
-
-
-def _find_link_files(start_dir: Path):
-    """Ищет current_link_speed/current_link_width, поднимаясь от start_dir вверх.
-
-    Возвращает (speed_file, width_file) или None. Лимит в 8 уровней
-    защищает от бесконечного подъёма к корню ФС.
-    """
-    current_dir = start_dir
-    for _ in range(8):
-        speed_file = current_dir / "current_link_speed"
-        width_file = current_dir / "current_link_width"
-        if speed_file.exists() and width_file.exists():
-            return speed_file, width_file
-        parent = current_dir.parent
-        if parent == current_dir:
-            break
-        current_dir = parent
-    return None
-
-
-def find_nvme_link_dir(disk_name: str) -> Optional[Path]:
-    """
-    Находит каталог с current_link_speed/current_link_width для NVMe диска.
-
-    Под Intel VMD /sys/block/<name>/device ведёт в виртуальный каталог
-    nvme-subsystem без линк-файлов, поэтому первым пробуется реальная
-    PCI-функция /sys/class/nvme/<nvmeN>/device.
-
-    Возвращает Path к каталогу с линк-файлами или None.
-    """
-    nvme_match = re.match(r"(nvme\d+)", disk_name)
-    nvme_dev = nvme_match.group(1) if nvme_match else None
-
-    start_dirs = []
-    if nvme_dev:
-        start_dirs.append(Path(f"/sys/class/nvme/{nvme_dev}/device"))
-    start_dirs.append(Path(f"/sys/block/{disk_name}/device"))
-    start_dirs.append(Path(f"/sys/class/block/{disk_name}/device"))
-
-    for start in start_dirs:
-        if not start.exists():
-            continue
-        try:
-            real_path = start.resolve()
-        except Exception:
-            continue
-        try:
-            found = _find_link_files(real_path)
-        except Exception:
-            continue
-        if found:
-            speed_file, _ = found
-            return speed_file.parent
-    return None
-
-
-def get_nvme_pcie_info(disk_name: str) -> dict:
-    """
-    Определяет поколение PCIe и ширину шины (width) для NVMe диска на Linux.
-    Возвращает словарь: {'gen': int|None, 'width': int|None, 'speed_gts': float|None}
-    """
-    info = {"gen": None, "width": None, "speed_gts": None}
-
-    link_dir = find_nvme_link_dir(disk_name)
-    if not link_dir:
-        return info
-
-    try:
-        speed_str = (link_dir / "current_link_speed").read_text(encoding="utf-8").strip()
-        width_str = (link_dir / "current_link_width").read_text(encoding="utf-8").strip()
-
-        speed_match = re.search(r"(\d+(?:\.\d+)?)\s*GT/s", speed_str)
-        if speed_match:
-            speed_gts = float(speed_match.group(1))
-            info["speed_gts"] = speed_gts
-            info["gen"] = _link_generation(speed_gts)
-
-        if width_str.isdigit():
-            info["width"] = int(width_str)
-    except Exception:
-        pass
-
-    return info
 
 
 def _parse_max_payload(text: str) -> Optional[int]:
@@ -647,104 +519,3 @@ def _get_numa_node(disk_name: str) -> Optional[int]:
     except Exception:
         pass
     return None
-
-
-def scan_disks(known_interfaces: Dict[str, list]) -> Tuple[List[dict], List[dict], List[dict]]:
-    """
-    Сканирует систему и возвращает три списка: (system_disks, occupied_disks, target_disks).
-
-    Системные диски   — хотя бы один потомок смонтирован на системный путь (/, /boot …).
-    Занятые диски     — есть таблица разделов, ФС (fstype) или смонтированы в любой путь;
-                        тестированию НЕ подлежат (на них есть данные).
-    Целевые диски     — абсолютно пустые (нет разделов/ФС, не смонтированы);
-                        единственные, которые скрипт реально тестирует.
-
-    Возвращает:
-        (system_disks, occupied_disks, target_disks)
-    """
-    cmd = [
-        "lsblk", "--json",
-        "-o", "NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,MOUNTPOINT,FSTYPE,PHY-SEC,HCTL",
-    ]
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except FileNotFoundError:
-        raise RuntimeError(
-            "Не удалось запустить утилиту 'lsblk'. Убедитесь, "
-            "что пакет 'util-linux' установлен в вашей системе."
-        )
-    except subprocess.CalledProcessError as e:
-        stderr_msg = e.stderr.strip() if e.stderr else str(e)
-        raise RuntimeError(
-            f"Ошибка при выполнении команды 'lsblk' (код возврата {e.returncode}):\n{stderr_msg}"
-        )
-
-    try:
-        data = json.loads(result.stdout).get("blockdevices", [])
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"Не удалось распарсить вывод 'lsblk' как JSON. "
-            f"Ошибка синтаксиса: {e}"
-        )
-
-    system_disks = []
-    occupied_disks = []
-    target_disks = []
-
-    for d in data:
-        if d.get("type") != "disk":
-            continue
-
-        if d.get("size") in ("0B", "0"):
-            continue
-
-        is_system = _is_system_device(d)
-        root_partition = _find_root_mount_name(d) if is_system else None
-
-        tran = _detect_interface(d["name"], d.get("tran"))
-        if tran not in known_interfaces:
-            tran = "sata"
-
-        slot = d.get("hctl") or ""
-        if not slot and "nvme" in d["name"]:
-            m = re.match(r"(nvme\d+)", d["name"])
-            if m:
-                slot = m.group(1)
-
-        pcie_info = {"gen": None, "width": None, "speed_gts": None}
-        if tran == "nvme":
-            pcie_info = get_nvme_pcie_info(d["name"])
-
-        profile = collect_hw_profile(d["name"], tran)
-
-        disk_info = {
-            "name": d["name"],
-            "path": f"/dev/{d['name']}",
-            "model": d.get("model") or "Unknown Model",
-            "serial": d.get("serial") or "Unknown SN",
-            "tran": tran,
-            "size": d.get("size"),
-            "phy_sec": int(d.get("phy-sec") or 512),
-            "slot": slot,
-            "pcie_info": pcie_info,
-            "profile": profile,
-            "root_partition": root_partition,
-            "numa_node": _get_numa_node(d["name"]),
-            "occupied": _is_occupied_device(d),
-        }
-
-        if is_system:
-            system_disks.append(disk_info)
-        elif disk_info["occupied"]:
-            occupied_disks.append(disk_info)
-        else:
-            target_disks.append(disk_info)
-
-    return system_disks, occupied_disks, target_disks
-
-
-def get_non_system_disks(known_interfaces: Dict[str, list]) -> List[dict]:
-    """Обратная совместимость: возвращает только целевые (пустые) диски."""
-    _, _, target_disks = scan_disks(known_interfaces)
-    return target_disks

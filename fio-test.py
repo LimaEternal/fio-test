@@ -46,11 +46,11 @@ from utils.fio_config import parse_fio_jobfile
 from utils.prefill import prefill_disks
 from utils.process import kill_process_tree, run_process
 from utils.reporter import generate_report
-from utils.scanner import (
+from utils.disk_filter import scan_disks
+from utils.hw_profile import (
     DEFAULT_TARGET_PERCENT,
     compute_pass_thresholds,
     estimate_ceiling_mbps,
-    scan_disks,
 )
 from utils.table_renderer import build_results_table
 from utils.tuner import SystemTuner
@@ -514,7 +514,7 @@ def build_disk_plans(disks: list, thresholds: dict, args) -> tuple:
 
 
 def _fake_profile(tran: str, rotational: int = 0, **link) -> dict:
-    """Профиль железа в формате utils.scanner.collect_hw_profile()."""
+    """Профиль железа в формате utils.hw_profile.collect_hw_profile()."""
     nvme = tran.lower() == "nvme"
     return {
         "interface": tran.lower(),
@@ -536,8 +536,7 @@ def build_fake_disks() -> list:
         {
             "name": "nvme0n1", "path": "/dev/nvme0n1",
             "model": "SAMSUNG MZWLO1T9HCJR-00A07", "serial": "S795NC0Y101175",
-            "tran": "NVME", "size": "1.7T", "phy_sec": 512, "slot": "nvme0",
-            "pcie_info": {"gen": 5, "width": 4, "speed_gts": 32.0}, "root_partition": None,
+            "tran": "NVME", "size": "1.7T", "phy_sec": 512,             "slot": "nvme0", "root_partition": None,
             "profile": _fake_profile("nvme", gen=5, width=4, speed_gts=32.0,
                                      max_gen=5, max_width=4, max_speed_gts=32.0,
                                      max_payload={"device": 256, "port": 512},
@@ -546,8 +545,7 @@ def build_fake_disks() -> list:
         {
             "name": "nvme1n1", "path": "/dev/nvme1n1",
             "model": "SAMSUNG MZWLO1T9HCJR-00A07", "serial": "S795NC0Y101184",
-            "tran": "NVME", "size": "1.7T", "phy_sec": 512, "slot": "nvme1",
-            "pcie_info": {"gen": 4, "width": 4, "speed_gts": 16.0}, "root_partition": None,
+            "tran": "NVME", "size": "1.7T", "phy_sec": 512,             "slot": "nvme1", "root_partition": None,
             "profile": _fake_profile("nvme", gen=4, width=4, speed_gts=16.0,
                                      max_gen=5, max_width=4, max_speed_gts=32.0,
                                      max_payload={"device": 128, "port": 512},
@@ -556,24 +554,21 @@ def build_fake_disks() -> list:
         {
             "name": "sda", "path": "/dev/sda",
             "model": "SEAGATE ST1800MM0129", "serial": "ABC12345",
-            "tran": "SAS", "size": "1.8T", "phy_sec": 512, "slot": "0:2:0:0",
-            "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+            "tran": "SAS", "size": "1.8T", "phy_sec": 512,             "slot": "0:2:0:0", "root_partition": None,
             "profile": _fake_profile("sas", negotiated_gbps=12.0,
                                      maximum_gbps=12.0, source="sas_phy"),
         },
         {
             "name": "sdb", "path": "/dev/sdb",
             "model": "SAMSUNG PM883 960GB", "serial": "S3Z7NB0T0000001",
-            "tran": "SATA", "size": "960G", "phy_sec": 512, "slot": "1:0:0:0",
-            "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+            "tran": "SATA", "size": "960G", "phy_sec": 512,             "slot": "1:0:0:0", "root_partition": None,
             "profile": _fake_profile("sata", spd_limit_gbps=6.0,
                                      hw_spd_limit_gbps=6.0, source="ata_link"),
         },
         {
             "name": "sdc", "path": "/dev/sdc",
             "model": "WDC WD4004FZWX", "serial": "WD-WCC4E0TST01",
-            "tran": "SATA", "size": "4T", "phy_sec": 4096, "slot": "1:0:0:1",
-            "pcie_info": {"gen": None, "width": None, "speed_gts": None}, "root_partition": None,
+            "tran": "SATA", "size": "4T", "phy_sec": 4096,             "slot": "1:0:0:1", "root_partition": None,
             "profile": _fake_profile("sata", rotational=1, spd_limit_gbps=3.0,
                                      hw_spd_limit_gbps=3.0, source="ata_link"),
         },

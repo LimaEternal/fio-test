@@ -8,18 +8,17 @@ from unittest import mock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.scanner import (
+from utils.hw_profile import (
     _detect_interface,
-    _is_occupied_device,
     _link_generation,
     _parse_max_payload,
     compute_pass_thresholds,
     estimate_ceiling_mbps,
-    get_nvme_pcie_info,
+    find_nvme_link_dir,
     link_bandwidth_mbps,
     read_nvme_max_payload,
-    scan_disks,
 )
+from utils.disk_filter import _is_occupied_device, scan_disks
 
 
 KNOWN_INTERFACES = {"nvme": [], "sas": [], "sata": []}
@@ -35,7 +34,7 @@ class LinkGenerationTests(unittest.TestCase):
         self.assertEqual(_link_generation(2.5), 1)
 
 
-class GetNvmePcieInfoTests(unittest.TestCase):
+class FindNvmeLinkDirTests(unittest.TestCase):
     """Тесты поиска линк-файлов в sysfs (включая сценарий Intel VMD)."""
 
     def _patch_sys_root(self, sys_dir):
@@ -48,7 +47,7 @@ class GetNvmePcieInfoTests(unittest.TestCase):
                 return Path(root) / p[len("/sys"):].lstrip("/")
             return Path(p)
 
-        return mock.patch("utils.scanner.Path", side_effect=_mapped)
+        return mock.patch("utils.hw_profile.Path", side_effect=_mapped)
 
     def test_found_via_class_nvme_when_block_device_path_is_dead_end(self):
         """VMD: /sys/block/<name>/device ведёт в тупик без линк-файлов,
@@ -63,9 +62,10 @@ class GetNvmePcieInfoTests(unittest.TestCase):
         (tmp / "sys" / "block" / "nvme1n1" / "device").mkdir(parents=True)
 
         with self._patch_sys_root(tmp / "sys"):
-            info = get_nvme_pcie_info("nvme1n1")
+            link_dir = find_nvme_link_dir("nvme1n1")
 
-        self.assertEqual(info, {"gen": 5, "width": 4, "speed_gts": 32.0})
+        self.assertIsNotNone(link_dir)
+        self.assertTrue((link_dir / "current_link_speed").exists())
 
     def test_walk_up_finds_link_files_in_parent(self):
         """Линк-файлы лежат уровнем выше каталога, в который ведёт device."""
@@ -76,23 +76,20 @@ class GetNvmePcieInfoTests(unittest.TestCase):
         (pci_dir.parent / "current_link_width").write_text("4", encoding="utf-8")
 
         with self._patch_sys_root(tmp / "sys"):
-            info = get_nvme_pcie_info("nvme2n1")
+            link_dir = find_nvme_link_dir("nvme2n1")
 
-        self.assertEqual(info, {"gen": 5, "width": 4, "speed_gts": 32.0})
+        self.assertIsNotNone(link_dir)
+        self.assertTrue((link_dir / "current_link_speed").exists())
 
-    def test_no_link_files_returns_empty_info(self):
+    def test_no_link_files_returns_none(self):
         tmp = Path(tempfile.mkdtemp())
         (tmp / "sys" / "class" / "nvme" / "nvme3" / "device").mkdir(parents=True)
         (tmp / "sys" / "block" / "nvme3n1" / "device").mkdir(parents=True)
 
         with self._patch_sys_root(tmp / "sys"):
-            info = get_nvme_pcie_info("nvme3n1")
+            link_dir = find_nvme_link_dir("nvme3n1")
 
-        self.assertEqual(info, {"gen": None, "width": None, "speed_gts": None})
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertIsNone(link_dir)
 
 
 class DetectInterfaceTests(unittest.TestCase):
@@ -130,6 +127,18 @@ class ScanDisksTests(unittest.TestCase):
         proc.returncode = 0
         return proc
 
+    def _fake_profile(self, disk_name, tran):
+        link = None
+        if tran == "nvme":
+            link = {"gen": 5, "width": 4, "speed_gts": 32.0,
+                    "max_gen": 5, "max_width": 4, "max_speed_gts": 32.0,
+                    "source": "sysfs", "max_payload": None}
+        elif tran == "sas":
+            link = {"negotiated_gbps": 12.0, "maximum_gbps": 12.0, "source": "sas_phy"}
+        elif tran == "sata":
+            link = {"spd_limit_gbps": 6.0, "hw_spd_limit_gbps": 6.0, "source": "ata_link"}
+        return {"interface": tran, "rotational": 0, "link": link, "ceiling_mbps": 0}
+
     def test_system_disk_excluded_and_interfaces_classified(self):
         lsblk_output = [
             {
@@ -166,11 +175,11 @@ class ScanDisksTests(unittest.TestCase):
         ]
 
         with mock.patch(
-            "utils.scanner.subprocess.run",
+            "utils.disk_filter.subprocess.run",
             return_value=self._make_lsblk(lsblk_output),
         ), mock.patch(
-            "utils.scanner.get_nvme_pcie_info",
-            return_value={"gen": 5, "width": 4, "speed_gts": 32.0},
+            "utils.disk_filter.collect_hw_profile",
+            side_effect=self._fake_profile,
         ):
             system_disks, occupied_disks, target_disks = scan_disks(KNOWN_INTERFACES)
 
@@ -186,7 +195,7 @@ class ScanDisksTests(unittest.TestCase):
         self.assertEqual(
             [d["tran"] for d in target_disks], ["nvme", "sas", "sata"]
         )
-        self.assertEqual(target_disks[0]["pcie_info"]["gen"], 5)
+        self.assertEqual(target_disks[0]["profile"]["link"]["gen"], 5)
 
     def test_missing_transport_field_does_not_break_detection(self):
         lsblk_output = [
@@ -198,11 +207,8 @@ class ScanDisksTests(unittest.TestCase):
         ]
 
         with mock.patch(
-            "utils.scanner.subprocess.run",
+            "utils.disk_filter.subprocess.run",
             return_value=self._make_lsblk(lsblk_output),
-        ), mock.patch(
-            "utils.scanner.get_nvme_pcie_info",
-            return_value={"gen": None, "width": None, "speed_gts": None},
         ):
             _, _, target_disks = scan_disks(KNOWN_INTERFACES)
 
@@ -269,13 +275,10 @@ class OccupiedDetectionTests(unittest.TestCase):
         ]
 
         with mock.patch(
-            "utils.scanner.subprocess.run",
+            "utils.disk_filter.subprocess.run",
             return_value=self._make_lsblk(lsblk_output),
         ), mock.patch(
-            "utils.scanner.get_nvme_pcie_info",
-            return_value={"gen": None, "width": None, "speed_gts": None},
-        ), mock.patch(
-            "utils.scanner.collect_hw_profile",
+            "utils.disk_filter.collect_hw_profile",
             return_value={"interface": "nvme", "rotational": 0, "link": None},
         ):
             system_disks, occupied_disks, target_disks = scan_disks(KNOWN_INTERFACES)
@@ -330,10 +333,10 @@ class NvmeMaxPayloadTests(unittest.TestCase):
         link_dir = Path("/sys/bus/pci/devices/0000:01:00.0")
         dev_out = "DevCap: MaxPayload 256 bytes"
         with mock.patch(
-            "utils.scanner.find_nvme_link_dir", return_value=link_dir
+            "utils.hw_profile.find_nvme_link_dir", return_value=link_dir
         ), mock.patch(
-            "utils.scanner._read_upstream_max_payload", return_value=512
-        ), mock.patch("utils.scanner.subprocess.run") as run:
+            "utils.hw_profile._read_upstream_max_payload", return_value=512
+        ), mock.patch("utils.hw_profile.subprocess.run") as run:
             run.return_value = mock.Mock(stdout=dev_out, returncode=0)
             result = read_nvme_max_payload("nvme0n1")
         self.assertEqual(result, {"device": 256, "port": 512})
@@ -341,8 +344,8 @@ class NvmeMaxPayloadTests(unittest.TestCase):
     def test_read_device_only_when_port_unavailable(self):
         link_dir = Path("/sys/bus/pci/devices/0000:01:00.0")
         with mock.patch(
-            "utils.scanner.find_nvme_link_dir", return_value=link_dir
-        ), mock.patch("utils.scanner.subprocess.run") as run:
+            "utils.hw_profile.find_nvme_link_dir", return_value=link_dir
+        ), mock.patch("utils.hw_profile.subprocess.run") as run:
             run.side_effect = [
                 mock.Mock(stdout="DevCap: MaxPayload 128 bytes", returncode=0),
                 mock.Mock(side_effect=OSError("no bridge")),
@@ -352,7 +355,7 @@ class NvmeMaxPayloadTests(unittest.TestCase):
 
     def test_no_link_dir_returns_none(self):
         with mock.patch(
-            "utils.scanner.find_nvme_link_dir", return_value=None
+            "utils.hw_profile.find_nvme_link_dir", return_value=None
         ):
             self.assertIsNone(read_nvme_max_payload("nvme0n1"))
 

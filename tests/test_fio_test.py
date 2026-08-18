@@ -22,8 +22,7 @@ _spec.loader.exec_module(fio_test)
 DISK = {
     "name": "nvme0n1", "path": "/dev/nvme0n1", "model": "KIOXIA KCMY1VUG3T20",
     "serial": "SN", "tran": "NVME", "size": "3.2T", "phy_sec": 4096,
-    "slot": "nvme0", "pcie_info": {"gen": 5, "width": 4, "speed_gts": 32.0},
-    "root_partition": None,
+    "slot": "nvme0", "root_partition": None,
 }
 
 NVME_TEST_IDS = ["seq_read", "seq_write", "rand_read", "rand_write"]
@@ -1362,7 +1361,7 @@ class BuildTestPlanTests(unittest.TestCase):
         self.assertIn("--bs=256k", args)
         self.assertIn("--numjobs=6", args)
 
-    def test_no_pcie_info_returns_unchanged(self):
+    def test_no_link_info_returns_unchanged(self):
         args = self._plan_args(self._disk(), "seq_read")
         self.assertEqual(args, self.BASE_TESTS["seq_read"])
 

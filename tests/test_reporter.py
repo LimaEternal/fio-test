@@ -11,7 +11,13 @@ from utils.reporter import _render_sampler_tables, _render_source_notes, generat
 DISK = {
     "name": "nvme1n1", "path": "/dev/nvme1n1", "model": "KIOXIA KCMY1VUG3T20",
     "serial": "SN", "tran": "NVME", "size": "3.2T", "phy_sec": 4096,
-    "pcie_info": {"gen": 5, "width": 4, "speed_gts": 32.0},
+    "profile": {
+        "interface": "nvme", "physical_block_size": 4096, "logical_block_size": 4096,
+        "rotational": 0, "ceiling_mbps": 15753.6,
+        "link": {"gen": 5, "width": 4, "speed_gts": 32.0,
+                 "max_gen": 5, "max_width": 4, "max_speed_gts": 32.0,
+                 "source": "sysfs"},
+    },
 }
 
 TEST_NAMES = {
@@ -51,7 +57,7 @@ def make_results(include_diag=True):
     }
     seq_read = dict(res)
     if include_diag:
-        seq_read["diag"] = {"temp_max_c": 41.0}
+        seq_read["diag"] = {"temp_max_c": 41.0, "temp_avg_c": 39.5}
     return [
         {"_thresholds": {}, "seq_read": seq_read},
     ]
@@ -453,7 +459,9 @@ class GenerateReportShowTmaxTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
 
         self.assertIn("Tmax (°C)", text)
+        self.assertIn("Tavg (°C)", text)
         self.assertIn("| 41.0 |", text)
+        self.assertIn("| 39.5 |", text)
         self.assertNotIn("**Мониторинг —", text)
         self.assertNotIn("| NUMA |", text)
 
@@ -467,6 +475,7 @@ class GenerateReportShowTmaxTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
 
         self.assertIn("Tmax (°C)", text)
+        self.assertIn("Tavg (°C)", text)
         self.assertNotIn("**Мониторинг —", text)
 
     def test_plain_report_without_tmax_flag_has_no_tmax_column(self):
@@ -478,6 +487,7 @@ class GenerateReportShowTmaxTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
 
         self.assertNotIn("Tmax (°C)", text)
+        self.assertNotIn("Tavg (°C)", text)
         self.assertNotIn("**Мониторинг —", text)
 
 

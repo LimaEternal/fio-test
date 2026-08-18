@@ -369,8 +369,8 @@ def generate_report(
             ceiling_str = f"{ceiling:.0f}" if ceiling else "—"
 
             pcie_str = ""
-            if d.get("pcie_info") and d["pcie_info"].get("gen"):
-                pcie_str = f" (PCIe Gen{d['pcie_info']['gen']} x{d['pcie_info'].get('width', '?')})"
+            if interface == "nvme" and link and link.get("gen"):
+                pcie_str = f" (PCIe Gen{link['gen']} x{link.get('width', '?')})"
 
             if has_diag:
                 static = d.get("diag_static") or {}
@@ -409,10 +409,10 @@ def generate_report(
                 )
             elif show_tmax:
                 lines.append(
-                    "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Tmax (°C) | Статус |"
+                    "| Профиль теста | Блок | IOPS | Скорость (МБ/с) | Lat Avg (мс) | Tmax (°C) | Tavg (°C) | Статус |"
                 )
                 lines.append(
-                    "|---------------|------|------|-----------------|--------------|-----------|--------|"
+                    "|---------------|------|------|-----------------|--------------|-----------|-----------|--------|"
                 )
             else:
                 lines.append(
@@ -427,7 +427,10 @@ def generate_report(
 
                 if "error" in res:
                     cells = [test_name, res.get("bs", "—"), "—", "—", "—"]
-                    if show_lat_p99 or show_tmax:
+                    if show_lat_p99:
+                        cells.append("—")
+                    elif show_tmax:
+                        cells.append("—")
                         cells.append("—")
                     cells.append("FAIL")
                 else:
@@ -449,6 +452,10 @@ def generate_report(
                             cells.append(_fmt(diag["temp_max_c"], ".1f"))
                         else:
                             cells.append("—")
+                        if diag.get("temp_avg_c") is not None:
+                            cells.append(_fmt(diag["temp_avg_c"], ".1f"))
+                        else:
+                            cells.append("—")
                     cells.append(res.get("status", "FAIL"))
                 lines.append("| " + " | ".join(cells) + " |")
 
@@ -458,11 +465,11 @@ def generate_report(
                 lines.append(f"**Мониторинг — {disk['name']}**")
                 lines.append("")
                 lines.append(
-                    "| Тест | CPU user/sys (%) | Линк min | Tmax (°C) | "
+                    "| Тест | CPU user/sys (%) | Линк min | Tmax (°C) | Tavg (°C) | "
                     "clat p99/p99.9 (мс) | slat (мс) | iodepth | Объём (ГБ) |"
                 )
                 lines.append(
-                    "|------|------------------|----------|-----------|"
+                    "|------|------------------|----------|-----------|-----------|"
                     "--------------------|-----------|---------|-------------|"
                 )
                 for test_id, test_name in test_names.items():
@@ -479,6 +486,7 @@ def generate_report(
                         link = f"{diag['link_gts_min']:g} GT/s x{width}"
 
                     tmax = _fmt(diag["temp_max_c"], ".1f") if diag.get("temp_max_c") is not None else "—"
+                    tavg = _fmt(diag["temp_avg_c"], ".1f") if diag.get("temp_avg_c") is not None else "—"
 
                     if res.get("lat_p99_unreliable"):
                         clat = "—"
@@ -492,7 +500,7 @@ def generate_report(
                     gb = _fmt(io_kb / 1e6, ".1f") if io_kb else "—"
 
                     lines.append(
-                        f"| {test_name} | {cpu} | {link} | {tmax} | "
+                        f"| {test_name} | {cpu} | {link} | {tmax} | {tavg} | "
                         f"{clat} | {res.get('slat_avg_ms', '—')} | {iod} | {gb} |"
                     )
                 lines.append("")

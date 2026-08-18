@@ -11,19 +11,20 @@ from rich import box
 from rich.table import Table
 from rich.text import Text
 
-from utils.scanner import link_bandwidth_mbps
+from utils.hw_profile import link_bandwidth_mbps
 
 
 TITLE = "Результаты тестирования накопителей (FIO)"
 
 SHOW_LAT_P99 = False
 
-# Базовая раскладка: колонка Tmax (°C) показывается всегда, Lat p99 — только
-# в подробном режиме (-l), где добавляется динамически (см. _result_headers).
+# Базовая раскладка: колонки Tmax/Tavg (°C) показываются всегда,
+# Lat p99 — только в подробном режиме (-l), где добавляется динамически
+# (см. _result_headers).
 BASE_RESULT_HEADERS = tuple(
     [("Профиль теста", "left", 9), ("Блок", "center", 5), ("IOPS", "center", 7),
      ("Скорость (МБ/с)", "center", 8), ("Lat Avg (мс)", "center", 11)]
-    + [("Tmax (°C)", "center", 8)]
+    + [("Tmax (°C)", "center", 8), ("Tavg (°C)", "center", 8)]
     + [("Статус", "center", 6)]
 )
 
@@ -185,6 +186,7 @@ def _test_rows(disk_results, test_names):
                     row.append(_fmt(result.get("lat_p99", 0), ".2f"))
             diag = result.get("diag") or {}
             row.append(_fmt(diag.get("temp_max_c"), ".1f") if diag.get("temp_max_c") is not None else "—")
+            row.append(_fmt(diag.get("temp_avg_c"), ".1f") if diag.get("temp_avg_c") is not None else "—")
             row.append(result.get("status", "FAIL"))
         rows.append(tuple(row))
     return rows

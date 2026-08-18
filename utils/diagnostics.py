@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from utils.scanner import find_nvme_link_dir
+from utils.hw_profile import find_nvme_link_dir
 
 # Как часто перечитывать температуру: nvme smart-log дёргает subprocess,
 # поэтому результат кэшируется (не чаще раза в TEMP_CACHE_SEC секунд).
@@ -355,6 +355,7 @@ class DiagnosticSampler:
             "link_gts_min": min(gts_vals) if gts_vals else None,
             "link_width_min": min(width_vals) if width_vals else None,
             "temp_max_c": round(max(temps), 1) if temps else None,
+            "temp_avg_c": round(sum(temps) / len(temps), 1) if temps else None,
             "read_mbs_avg": round(sum(reads) / len(reads), 1) if reads else None,
             "write_mbs_avg": round(sum(writes) / len(writes), 1) if writes else None,
             "iops_avg": round(sum(iops_vals) / len(iops_vals)) if iops_vals else None,
