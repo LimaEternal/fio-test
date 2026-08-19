@@ -4,18 +4,12 @@
 Создаёт Markdown-файл с таблицами, удобный для чтения и публикации.
 """
 
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Union
 
 from utils.format import format_duration
 from utils.table_renderer import _fmt
-
-
-def _strip_rich(text: str) -> str:
-    """Удаляет rich-разметку [tag]...[/tag] из строки."""
-    return re.sub(r"\[.*?\]", "", text)
 
 
 TEST_NAMES = {

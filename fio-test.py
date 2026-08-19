@@ -30,7 +30,6 @@ import json
 import math
 from pathlib import Path
 import queue
-import re
 import subprocess
 import sys
 import threading
@@ -44,11 +43,12 @@ from utils.diagnostics import DiagnosticSampler, collect_static_info
 from utils.format import format_duration
 from utils.fio_config import parse_fio_jobfile
 from utils.prefill import prefill_disks
-from utils.process import kill_process_tree, run_process
+from utils.process import run_process
 from utils.reporter import generate_report
 from utils.disk_filter import scan_disks
 from utils.hw_profile import (
     DEFAULT_TARGET_PERCENT,
+    _detect_interface,
     compute_pass_thresholds,
     estimate_ceiling_mbps,
 )
@@ -247,10 +247,18 @@ def parse_args():
         args.add = [n for tok in args.add for n in tok]
     if args.delete is not None:
         args.delete = [n for tok in args.delete for n in tok]
+    if args.runtime is not None and args.runtime <= 0:
+        parser.error("--runtime должен быть положительным числом секунд")
     if args.target_iops <= 0:
         parser.error("--target-iops должен быть больше нуля")
     if not (0.0 < args.target_percent <= 1.0):
         parser.error("--target-percent должен быть в диапазоне (0, 1]")
+    if args.output is not None:
+        out = Path(args.output)
+        if out.is_dir():
+            parser.error(f"--output указывает на каталог, а не файл: {args.output}")
+        if out.parent.exists() and not out.parent.is_dir():
+            parser.error(f"--output: родительский путь не является каталогом: {out.parent}")
     return args
 
 
@@ -312,6 +320,14 @@ def _input_disk_numbers(prompt: str) -> list:
             console.print(
                 "[bold red]ОШИБКА:[/bold red] неверный формат. Пример: '1 3-5'"
             )
+
+
+def _resolve_interactive_selection(args) -> None:
+    """Если флаг выбора дисков задан без номеров — запрашивает их интерактивно."""
+    if args.add is not None and not args.add:
+        args.add = _input_disk_numbers("Номера дисков для теста (через пробел): ")
+    elif args.delete is not None and not args.delete:
+        args.delete = _input_disk_numbers("Номера дисков для исключения (через пробел): ")
 
 
 def apply_disk_selection(disks: list, args) -> list:
@@ -388,12 +404,7 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
 
 def _disk_interface(disk: dict) -> str:
     """Возвращает ключ интерфейса (nvme/sas/sata) для диска."""
-    tran = disk.get("tran", "").lower()
-    if "nvme" in tran:
-        return "nvme"
-    if "sas" in tran:
-        return "sas"
-    return "sata"
+    return _detect_interface(disk.get("name", ""), disk.get("tran"))
 
 
 def _resolve_thresholds(base: dict, disk: dict, target_percent: float) -> tuple:
@@ -844,10 +855,7 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     sampler_thread.start()
     if diag_store is not None and live_store is not None:
         live_entry = {"test_id": test_id, "samples": sampler.samples}
-        if state_lock is not None:
-            with state_lock:
-                live_store[disk_info["name"]] = live_entry
-        else:
+        with state_lock or threading.Lock():
             live_store[disk_info["name"]] = live_entry
 
     res = None
@@ -883,10 +891,7 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
         if sampler_thread:
             sampler_thread.join(timeout=5)
         if live_store is not None:
-            if state_lock is not None:
-                with state_lock:
-                    live_store.pop(disk_info["name"], None)
-            else:
+            with state_lock or threading.Lock():
                 live_store.pop(disk_info["name"], None)
 
     if res is not None:
@@ -910,10 +915,7 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
             )
         if diag_store is not None:
             entry = {"samples": sampler.samples, "summary": summary}
-            if state_lock is not None:
-                with state_lock:
-                    diag_store.setdefault(disk_info["name"], {})[test_id] = entry
-            else:
+            with state_lock or threading.Lock():
                 diag_store.setdefault(disk_info["name"], {})[test_id] = entry
 
     return res
@@ -1070,28 +1072,19 @@ def process_task_result(results, idx, disk, t, fio_args, res, state_lock=None):
 
     if "error" in res:
         error_entry = {"error": res["error"], "status": "FAIL", "bs": bs}
-        if state_lock is not None:
-            with state_lock:
-                results[idx][t] = error_entry
-        else:
+        with state_lock or threading.Lock():
             results[idx][t] = error_entry
         console.print(
             f"  [bold red]ОШИБКА[/bold red] {disk['name']}/{t}: {res['error']}"
         )
         return
 
-    if state_lock is not None:
-        with state_lock:
-            thresholds = results[idx].get("_thresholds", {})
-    else:
+    with state_lock or threading.Lock():
         thresholds = results[idx].get("_thresholds", {})
     status = check_threshold(t, res, thresholds)
     res["status"] = status
     res["bs"] = bs
-    if state_lock is not None:
-        with state_lock:
-            results[idx][t] = res
-    else:
+    with state_lock or threading.Lock():
         results[idx][t] = res
 
 
@@ -1130,10 +1123,7 @@ def run_disk_tests(disk_idx, disk, plan, results, cancel_event=None, diag_store=
         if report_queue is not None:
             report_queue.put(disk_idx)
     duration = time.monotonic() - start
-    if state_lock is not None:
-        with state_lock:
-            results[disk_idx]["_wall_s"] = duration
-    else:
+    with state_lock or threading.Lock():
         results[disk_idx]["_wall_s"] = duration
     console.print(
         f"  Диск /dev/{disk['name']}: тесты заняли {format_duration(duration)}"
@@ -1298,16 +1288,13 @@ def main():
 
         # Ручной выбор дисков: -a/--add или -d/--delete.
         # Если флаг передан без номеров — запрашиваем номера интерактивно.
-        if args.add is not None and not args.add:
-            args.add = _input_disk_numbers("Номера дисков для теста (через пробел): ")
-        elif args.delete is not None and not args.delete:
-            args.delete = _input_disk_numbers("Номера дисков для исключения (через пробел): ")
+        _resolve_interactive_selection(args)
 
         if args.add is not None or args.delete is not None:
             disks = apply_disk_selection(disks, args)
             if not disks:
                 console.print("[bold yellow]После фильтрации целевые диски не найдены.[/bold yellow]")
-                sys.exit(0)
+                return 0
         results = build_fake_results(disks)
         console.print("[bold]Тестовый режим: пробные данные, fio не запускается[/bold]")
         console.print()
@@ -1322,7 +1309,7 @@ def main():
             show_tmax=not args.logging,
         )
         console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
-        return
+        return decide_exit_code(results)
 
     # Настройка пороговых значений с возможностью переопределения
     # Базовые пороги из configs/thresholds.json (fallback для seq при отсутствии
@@ -1339,7 +1326,7 @@ def main():
         system_disks, occupied_disks, target_disks = scan_disks(INTERFACE_CONFIGS)
     except Exception as exc:
         console.print(f"[bold red]Ошибка сканирования:[/bold red] {exc}")
-        sys.exit(1)
+        return 1
 
     if system_disks:
         console.print("\n[bold]Системные диски (исключены):[/bold]")
@@ -1369,20 +1356,17 @@ def main():
         console.print(
             "[bold yellow]Пустые целевые диски не найдены — нечего тестировать.[/bold yellow]"
         )
-        sys.exit(0)
+        return 0
 
     # Ручной выбор дисков: -a/--add или -d/--delete. Номера относятся
     # только к пустым целевым дискам; занятые диски недоступны для выбора.
-    if args.add is not None and not args.add:
-        args.add = _input_disk_numbers("Номера дисков для теста (через пробел): ")
-    elif args.delete is not None and not args.delete:
-        args.delete = _input_disk_numbers("Номера дисков для исключения (через пробел): ")
+    _resolve_interactive_selection(args)
 
     disks = apply_disk_selection(target_disks, args)
 
     if not disks:
         console.print("[bold yellow]После фильтрации целевые диски не найдены.[/bold yellow]")
-        sys.exit(0)
+        return 0
 
     if args.logging:
         for d in disks:
@@ -1395,10 +1379,10 @@ def main():
         console.print("[bold red]ОШИБКА:[/bold red] Утилита fio не найдена. Установите fio:")
         console.print("  apt install fio  (Debian/Ubuntu)")
         console.print("  yum install fio  (RHEL/CentOS)")
-        sys.exit(1)
+        return 1
     except subprocess.CalledProcessError as e:
         console.print(f"[bold red]ОШИБКА:[/bold red] fio вернул ошибку: {e}")
-        sys.exit(1)
+        return 1
 
     tuner = None
     if not args.no_tune:
@@ -1416,10 +1400,10 @@ def main():
             answer = input("Начать тестирование? [y/N]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[bold yellow]Отменено.[/bold yellow]")
-            sys.exit(0)
+            return 0
         if answer not in ("y", "yes", "д", "да"):
             console.print("[bold yellow]Отменено пользователем.[/bold yellow]")
-            sys.exit(0)
+            return 0
 
     cancel_event = threading.Event()
 
@@ -1503,7 +1487,7 @@ def main():
             except KeyboardInterrupt:
                 cancel_event.set()
                 console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
-                sys.exit(130)
+                return 130
         else:
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
             try:
@@ -1522,7 +1506,7 @@ def main():
             except KeyboardInterrupt:
                 cancel_event.set()
                 console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
-                sys.exit(130)
+                return 130
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
@@ -1568,15 +1552,16 @@ def main():
             2: "часть тестов FAIL",
         }.get(exit_code, "")
         console.print(f"[{style}]Итог: {label} (код завершения {exit_code})[/{style}]")
-    sys.exit(exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
     try:
-        main()
+        code = main()
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Прервано пользователем.[/bold yellow]")
-        sys.exit(130)
+        code = 130
     except Exception as exc:
         console.print(f"\n[bold red]Фатальная ошибка:[/bold red] {exc}")
-        sys.exit(1)
+        code = 1
+    sys.exit(code)

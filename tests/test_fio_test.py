@@ -1028,9 +1028,8 @@ class MainDiskSelectionTests(unittest.TestCase):
              mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-a"]), \
              mock.patch("builtins.input", return_value=""), \
              mock.patch.object(fio_test, "run_disk_tests", runner):
-            with self.assertRaises(SystemExit) as cm:
-                fio_test.main()
-        self.assertEqual(cm.exception.code, 0)
+            code = fio_test.main()
+        self.assertEqual(code, 0)
         runner.assert_not_called()
 
     def test_delete_all_disks_exits_without_running(self):
@@ -1040,9 +1039,8 @@ class MainDiskSelectionTests(unittest.TestCase):
              mock.patch.object(fio_test, "console"), \
              mock.patch.object(fio_test.sys, "argv", ["fio-test.py", "-d", "1", "2", "3"]), \
              mock.patch.object(fio_test, "run_disk_tests", runner):
-            with self.assertRaises(SystemExit) as cm:
-                fio_test.main()
-        self.assertEqual(cm.exception.code, 0)
+            code = fio_test.main()
+        self.assertEqual(code, 0)
         runner.assert_not_called()
 
 
@@ -1128,9 +1126,8 @@ class TestModeDiskSelectionTests(unittest.TestCase):
              mock.patch.object(fio_test, "SystemTuner"), \
              mock.patch.object(fio_test.sys, "argv",
                                ["fio-test.py", "-t", "-d", "1", "2", "3"]):
-            with self.assertRaises(SystemExit) as cm:
-                fio_test.main()
-        self.assertEqual(cm.exception.code, 0)
+            code = fio_test.main()
+        self.assertEqual(code, 0)
 
     def test_bad_target_percent_exits(self):
         with mock.patch.object(fio_test.sys, "argv",

@@ -28,9 +28,6 @@ BASE_RESULT_HEADERS = tuple(
     + [("Статус", "center", 6)]
 )
 
-RESULT_HEADERS = BASE_RESULT_HEADERS
-
-
 def _result_headers():
     """Колонки вложенной таблицы с учётом текущего режима отображения."""
     headers = list(BASE_RESULT_HEADERS)

@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.table_renderer import (
-    RESULT_HEADERS,
+    BASE_RESULT_HEADERS,
     TITLE,
     _block_size_line,
     _disk_details,
@@ -103,7 +103,7 @@ class TableRendererTests(unittest.TestCase):
             self.assertIn("┼", separator)
 
     def test_numeric_result_columns_are_centered_under_headers(self):
-        columns = {header: justify for header, justify, _ in RESULT_HEADERS}
+        columns = {header: justify for header, justify, _ in BASE_RESULT_HEADERS}
 
         for header in ("IOPS", "Скорость (МБ/с)", "Lat Avg (мс)"):
             self.assertEqual(columns[header], "center")
