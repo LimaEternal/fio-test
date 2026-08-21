@@ -34,10 +34,6 @@ class SystemTuner:
         self.applied: List[Dict] = []
         self.governor_failed = False
 
-    # ------------------------------------------------------------------
-    # Публичный API
-    # ------------------------------------------------------------------
-
     def apply(self) -> None:
         """Применяет оптимизации: governor → performance, APST → off.
 
@@ -186,11 +182,8 @@ class SystemTuner:
 
     def _apply_nvme_apst(self) -> None:
         for disk in self._target_nvme:
-            # Сначала проверяем, реализует ли контроллер APST вообще
-            # (бит apsta из nvme id-ctrl). На enterprise-дисках (U.2/U.3/E3.S)
-            # он равен 0 — тогда лишние get/set-feature только шумят
-            # INVALID_FIELD; просто фиксируем «не поддерживается» и идём дальше.
             supported = _apst_supported(disk["path"])
+
             if supported is False:
                 self.applied.append({
                     "param": "NVMe APST",
@@ -200,9 +193,19 @@ class SystemTuner:
                 })
                 continue
 
-            # Всегда пытаемся выключить APST, затем сверяем фактическое
-            # состояние (аналогично governor: write → verify → record).
-            # Ошибка APST не критична: тесты продолжаются, в отчёте — причина.
+            if supported is None:
+                # nvme-cli отсутствует или id-ctrl упал — set-feature тоже упадёт,
+                # нет смысла дёргать его и спамить одной и той же ошибкой.
+                self.applied.append({
+                    "param": "NVMe APST",
+                    "after": "недоступно",
+                    "success": False,
+                    "target_disks": disk["name"],
+                    "error": "nvme-cli недоступен или id-ctrl завершился с ошибкой",
+                })
+                continue
+
+            # supported is True — реально пытаемся выключить
             try:
                 result = subprocess.run(
                     ["nvme", "set-feature", disk["path"], "-f", "0x0c", "-v", "0"],
@@ -236,7 +239,7 @@ class SystemTuner:
                 "success": success,
                 "target_disks": disk["name"],
                 "error": error,
-            })
+        })
 
 
 # ------------------------------------------------------------------
