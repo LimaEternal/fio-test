@@ -7,7 +7,7 @@ from unittest import mock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.tuner import SystemTuner, _governor_path, _all_governor_paths, _read_apst
+from utils.tuner import SystemTuner, _governor_path, _all_governor_paths, _read_apst, _apst_supported
 
 TARGET_NVME = [
     {"name": "nvme0n1", "path": "/dev/nvme0n1", "tran": "NVME"},
@@ -100,6 +100,32 @@ class ReadApstTests(unittest.TestCase):
             self.assertEqual(_read_apst("/dev/nvme0n1"), "disabled")
 
 
+class ApstSupportedTests(unittest.TestCase):
+    def test_apsta_bit_set(self):
+        with mock.patch("utils.tuner.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout="apsta   : 0x1\n")
+            self.assertTrue(_apst_supported("/dev/nvme0n1"))
+
+    def test_apsta_bit_clear(self):
+        with mock.patch("utils.tuner.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout="apsta   : 0x0\n")
+            self.assertFalse(_apst_supported("/dev/nvme0n1"))
+
+    def test_id_ctrl_nonzero_returncode(self):
+        with mock.patch("utils.tuner.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=1, stdout="")
+            self.assertIsNone(_apst_supported("/dev/nvme0n1"))
+
+    def test_id_ctrl_cli_missing(self):
+        with mock.patch("utils.tuner.subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(_apst_supported("/dev/nvme0n1"))
+
+    def test_no_apsta_field(self):
+        with mock.patch("utils.tuner.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout="vid     : 0x1e95\n")
+            self.assertIsNone(_apst_supported("/dev/nvme0n1"))
+
+
 class ApplyGovernorTests(unittest.TestCase):
     def _tuner(self, disks=None):
         return SystemTuner(disks or TARGET_NVME)
@@ -161,6 +187,19 @@ class ApplyGovernorTests(unittest.TestCase):
 class ApplyApstTests(unittest.TestCase):
     def _tuner(self, disks=None):
         return SystemTuner(disks or TARGET_NVME)
+
+    def test_apst_not_supported_skipped_neutral(self):
+        tuner = self._tuner()
+        with mock.patch("utils.tuner._apst_supported", return_value=False), \
+             mock.patch("utils.tuner.subprocess.run") as mock_run:
+            tuner._apply_nvme_apst()
+        mock_run.assert_not_called()
+        self.assertEqual(len(tuner.applied), 1)
+        entry = tuner.applied[0]
+        self.assertEqual(entry["target_disks"], "nvme0n1")
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["after"], "не поддерживается")
+        self.assertNotIn("error", entry)
 
     def test_nvme_cli_missing_recorded(self):
         tuner = self._tuner()

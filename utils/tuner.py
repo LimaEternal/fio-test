@@ -186,6 +186,20 @@ class SystemTuner:
 
     def _apply_nvme_apst(self) -> None:
         for disk in self._target_nvme:
+            # Сначала проверяем, реализует ли контроллер APST вообще
+            # (бит apsta из nvme id-ctrl). На enterprise-дисках (U.2/U.3/E3.S)
+            # он равен 0 — тогда лишние get/set-feature только шумят
+            # INVALID_FIELD; просто фиксируем «не поддерживается» и идём дальше.
+            supported = _apst_supported(disk["path"])
+            if supported is False:
+                self.applied.append({
+                    "param": "NVMe APST",
+                    "after": "не поддерживается",
+                    "success": True,
+                    "target_disks": disk["name"],
+                })
+                continue
+
             # Всегда пытаемся выключить APST, затем сверяем фактическое
             # состояние (аналогично governor: write → verify → record).
             # Ошибка APST не критична: тесты продолжаются, в отчёте — причина.
@@ -240,6 +254,41 @@ def _all_governor_paths() -> List[Path]:
     return sorted(
         Path("/sys/devices/system/cpu").glob("cpu*/cpufreq/scaling_governor")
     )
+
+
+def _apst_supported(disk_path: str) -> Optional[bool]:
+    """Поддерживает ли контроллер APST (фича 0x0c).
+
+    Читает бит ``apsta`` из ``nvme id-ctrl``. Возвращает:
+        True  — APST реализован (можно пытаться выключить);
+        False — не реализован (enterprise-диски: U.2/U.3/E3.S);
+        None  — не удалось определить (nvme-cli нет / id-ctrl упал) —
+                в этом случае вызывающий всё равно попытается set-feature.
+
+    `nvme id-ctrl` — обязательная команда, она не даёт INVALID_FIELD,
+    в отличие от get/set-feature на контроллерах без APST.
+    """
+    try:
+        result = subprocess.run(
+            ["nvme", "id-ctrl", disk_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, Exception):
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout
+    if not isinstance(out, str):
+        out = ""
+    m = re.search(r"apsta.*?:\s*0x?([0-9a-fA-F]+)", out, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return bool(int(m.group(1), 16))
+    except ValueError:
+        return None
 
 
 def _read_apst(disk_path: str) -> Optional[str]:
