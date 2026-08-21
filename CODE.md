@@ -2038,32 +2038,6 @@ _без docstring_
 
 _без docstring_
 
-#### `class PreviewTests(unittest.TestCase)`
-
-##### ### `def _tuner(self, disks)`
-
-_без docstring_
-
-##### ### `def test_governor_not_performance(self)`
-
-_без docstring_
-
-##### ### `def test_governor_already_performance(self)`
-
-_без docstring_
-
-##### ### `def test_governor_path_missing(self)`
-
-_без docstring_
-
-##### ### `def test_apst_enabled_in_preview(self)`
-
-_без docstring_
-
-##### ### `def test_apst_disabled_not_in_preview(self)`
-
-_без docstring_
-
 #### `class NumaCpusTests(unittest.TestCase)`
 
 ##### ### `def test_valid_cpulist(self)`
@@ -2683,11 +2657,7 @@ _без docstring_
 
 ##### ### `def apply(self)`
 
-Применяет оптимизации: governor → performance, APST → off.  Governor — критическая ошибка при неудаче (sys.exit). APST — best-effort (nvme-cli может отсутствовать).
-
-##### ### `def preview(self)`
-
-Dry-run для режима -t: что БЫЛО бы применено (read-only).
+Применяет оптимизации: governor → performance, APST → off.  Governor — не критичная ошибка (тесты продолжаются, код завершения повышается до 2, см. tuner.governor_failed). APST — best-effort (ошибка только в отчёте).
 
 ##### ### `def print_summary(self)`
 

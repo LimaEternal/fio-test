@@ -218,65 +218,6 @@ class ApplyApstTests(unittest.TestCase):
         self.assertEqual(len(tuner.applied), 0)
 
 
-class PreviewTests(unittest.TestCase):
-    def _tuner(self, disks=None):
-        return SystemTuner(disks or TARGET_NVME)
-
-    def test_governor_not_performance(self):
-        tuner = self._tuner()
-        fake_p = mock.Mock()
-        fake_p.exists.return_value = True
-        fake_p.read_text.return_value = "powersave"
-        with mock.patch("utils.tuner._governor_path", return_value=fake_p), \
-             mock.patch("utils.tuner._read_apst", return_value="disabled"):
-            rows = tuner.preview()
-        params = [r["param"] for r in rows]
-        self.assertIn("CPU governor", params)
-
-    def test_governor_already_performance(self):
-        tuner = self._tuner()
-        fake_p = mock.Mock()
-        fake_p.exists.return_value = True
-        fake_p.read_text.return_value = "performance"
-        with mock.patch("utils.tuner._governor_path", return_value=fake_p), \
-             mock.patch("utils.tuner._read_apst", return_value="disabled"):
-            rows = tuner.preview()
-        params = [r["param"] for r in rows]
-        self.assertNotIn("CPU governor", params)
-
-    def test_governor_path_missing(self):
-        tuner = self._tuner()
-        with mock.patch("utils.tuner._governor_path", return_value=None), \
-             mock.patch("utils.tuner._read_apst", return_value="disabled"):
-            rows = tuner.preview()
-        params = [r["param"] for r in rows]
-        self.assertIn("CPU governor", params)
-        gov_row = [r for r in rows if r["param"] == "CPU governor"][0]
-        self.assertIn("skipped_reason", gov_row)
-
-    def test_apst_enabled_in_preview(self):
-        tuner = self._tuner()
-        fake_p = mock.Mock()
-        fake_p.exists.return_value = True
-        fake_p.read_text.return_value = "performance"
-        with mock.patch("utils.tuner._governor_path", return_value=fake_p), \
-             mock.patch("utils.tuner._read_apst", return_value="enabled"):
-            rows = tuner.preview()
-        params = [r["param"] for r in rows]
-        self.assertIn("NVMe APST", params)
-
-    def test_apst_disabled_not_in_preview(self):
-        tuner = self._tuner()
-        fake_p = mock.Mock()
-        fake_p.exists.return_value = True
-        fake_p.read_text.return_value = "performance"
-        with mock.patch("utils.tuner._governor_path", return_value=fake_p), \
-             mock.patch("utils.tuner._read_apst", return_value="disabled"):
-            rows = tuner.preview()
-        params = [r["param"] for r in rows]
-        self.assertNotIn("NVMe APST", params)
-
-
 class NumaCpusTests(unittest.TestCase):
     def test_valid_cpulist(self):
         disk = [{"name": "nvme0n1", "tran": "NVME", "numa_node": 1}]

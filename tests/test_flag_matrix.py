@@ -36,8 +36,8 @@ def cli(argv):
     """Подменяет всё, что main() трогает снаружи, и выставляет sys.argv."""
     disks = [dict(DISK)]
     tuner = mock.MagicMock()
-    tuner.return_value.preview.return_value = []
     tuner.return_value.get_nvme_temps.return_value = {}
+    tuner.return_value.governor_failed = False
     patches = [
         mock.patch.object(fio_test, "scan_disks", return_value=([], [], disks)),
         mock.patch.object(fio_test, "generate_report", return_value="rep.md"),

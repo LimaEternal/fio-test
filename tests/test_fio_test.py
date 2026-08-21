@@ -1061,8 +1061,8 @@ class TestModeDiskSelectionTests(unittest.TestCase):
              mock.patch.object(fio_test, "SystemTuner") as fake_tuner_cls, \
              mock.patch.object(fio_test.sys, "argv", argv):
             fake_tuner = fake_tuner_cls.return_value
-            fake_tuner.preview.return_value = []
             fake_tuner.get_nvme_temps.return_value = {}
+            fake_tuner.governor_failed = False
             fio_test.main()
         disks, _, _ = fake_table.call_args.args
         return [d["name"] for d in disks]

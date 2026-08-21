@@ -1220,37 +1220,21 @@ def main():
     validate_configs()
 
     if args.test:
-        # 1. Реальное сканирование (read-only) для предпросмотра оптимизаций.
-        #    Ничего не применяется и не запускается — только показ "что будет".
+        # 1. Реальное сканирование; системные оптимизации РЕАЛЬНО
+        #    применяются и проверяются (как в обычном режиме), fio не
+        #    запускается — только пробная таблица для проверки вёрстки.
         real_disks = []
+        system_disks = []
         try:
-            _, _, real_disks = scan_disks(INTERFACE_CONFIGS)
+            system_disks, _, real_disks = scan_disks(INTERFACE_CONFIGS)
         except Exception:
             real_disks = []
 
-        preview_rows = []
+        tuner = None
         if real_disks:
-            tuner = SystemTuner(real_disks)
-            preview_rows = tuner.preview()
-            console.print(
-                "[bold]Тестовый режим: предпросмотр оптимизаций "
-                "(dry-run, система не меняется)[/bold]"
-            )
-            if preview_rows:
-                for p in preview_rows:
-                    if p.get("skipped_reason"):
-                        console.print(
-                            f"  [yellow]—[/yellow] {p['param']}: "
-                            f"пропущено ({p['skipped_reason']})"
-                        )
-                    else:
-                        console.print(
-                            f"  [green]✓[/green] {p['param']}: "
-                            f"{p['before']} → {p['after']}"
-                        )
-                    if p.get("target_disks"):
-                        console.print(f"      диски: {p['target_disks']}")
-
+            tuner = SystemTuner(real_disks, system_disks)
+            tuner.apply()
+            tuner.print_summary()
             temps = tuner.get_nvme_temps()
             if temps:
                 temp_str = ", ".join(
@@ -1295,14 +1279,17 @@ def main():
         console.print(table)
         report_path = generate_report(
             disks, results, TEST_NAMES, output_path=args.output,
-            tuner_report=preview_rows or None,
+            tuner_report=tuner.report() if tuner else None,
             run_info=_build_run_info(args, test_mode=True),
             test_plans=collect_plan_info(disks, target_iops=args.target_iops),
             show_lat_p99=args.logging,
             show_tmax=not args.logging,
         )
         console.print(f"[bold green]Отчёт сохранён: {report_path}[/bold green]")
-        return decide_exit_code(results)
+        exit_code = decide_exit_code(results)
+        if tuner is not None and tuner.governor_failed:
+            exit_code = max(exit_code, 2)
+        return exit_code
 
     # Настройка пороговых значений с возможностью переопределения
     # Базовые пороги из configs/thresholds.json (fallback для seq при отсутствии

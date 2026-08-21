@@ -50,42 +50,6 @@ class SystemTuner:
         self._apply_cpu_governor()
         self._apply_nvme_apst()
 
-    def preview(self) -> List[Dict]:
-        """Dry-run для режима -t: что БЫЛО бы применено (read-only)."""
-        rows = []
-
-        governor_path = _governor_path()
-        if governor_path is None:
-            rows.append({
-                "param": "CPU governor",
-                "before": "cpufreq недоступен",
-                "after": "performance",
-                "skipped_reason": "scaling_governor не найден",
-            })
-        else:
-            try:
-                current = governor_path.read_text(encoding="utf-8").strip()
-            except Exception:
-                current = "?"
-            if current != "performance":
-                rows.append({
-                    "param": "CPU governor",
-                    "before": current,
-                    "after": "performance",
-                })
-
-        for disk in self._target_nvme:
-            apst = _read_apst(disk["path"])
-            if apst == "enabled":
-                rows.append({
-                    "param": "NVMe APST",
-                    "before": "enabled",
-                    "after": "disabled",
-                    "target_disks": disk["name"],
-                })
-
-        return rows
-
     def print_summary(self) -> None:
         """Выводит в консоль, что было применено."""
         console.print("\n[bold]Оптимизация системы...[/bold]")
