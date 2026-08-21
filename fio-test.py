@@ -189,10 +189,6 @@ def parse_args():
              "нагрузки в MD-отчёт (+ колонка Lat P99)",
     )
     parser.add_argument(
-        "-n", "--no-tune", action="store_true",
-        help="Отключить автоматическую настройку системы для производительности",
-    )
-    parser.add_argument(
         "-t", "--test", action="store_true",
         help="Тестовый режим: заполнить таблицу пробными значениями без запуска fio",
     )
@@ -374,7 +370,6 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
     flags = [
         ("Режим", mode),
         ("Подробные логи", "включены" if args.logging else "выключены"),
-        ("Автонастройка системы", "выключена" if args.no_tune else "включена"),
     ]
     if not test_mode:
         flags.insert(1, ("Предварительное заполнение", "выключено" if args.fast else "включено"))
@@ -1234,7 +1229,7 @@ def main():
             real_disks = []
 
         preview_rows = []
-        if real_disks and not args.no_tune:
+        if real_disks:
             tuner = SystemTuner(real_disks)
             preview_rows = tuner.preview()
             console.print(
@@ -1255,8 +1250,6 @@ def main():
                         )
                     if p.get("target_disks"):
                         console.print(f"      диски: {p['target_disks']}")
-            else:
-                console.print("  [dim]Оптимизации не требуются[/dim]")
 
             temps = tuner.get_nvme_temps()
             if temps:
@@ -1384,11 +1377,9 @@ def main():
         console.print(f"[bold red]ОШИБКА:[/bold red] fio вернул ошибку: {e}")
         return 1
 
-    tuner = None
-    if not args.no_tune:
-        tuner = SystemTuner(disks, system_disks)
-        tuner.apply()
-        tuner.print_summary()
+    tuner = SystemTuner(disks, system_disks)
+    tuner.apply()
+    tuner.print_summary()
 
     mode = "sequential" if args.sequential else "parallel"
     console.print(f"\n[bold]Режим: {mode}[/bold]")
@@ -1545,7 +1536,14 @@ def main():
     # Итоговый код завершения по колонке Статус всех (диск × тест):
     #   0 — все PASS; 1 — все FAIL; 2 — есть FAIL, но не все.
     exit_code = decide_exit_code(results)
-    if exit_code != 0:
+    if tuner is not None and tuner.governor_failed:
+        if exit_code == 0:
+            console.print(
+                "[bold yellow]Итог: CPU governor не применился — система могла "
+                "работать не в режиме performance (код завершения 2)[/bold yellow]"
+            )
+        exit_code = max(exit_code, 2)
+    elif exit_code != 0:
         style = "bold red" if exit_code == 1 else "bold yellow"
         label = {
             1: "все тесты FAIL",

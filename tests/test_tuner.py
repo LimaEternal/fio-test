@@ -81,16 +81,36 @@ class ReadApstTests(unittest.TestCase):
             result = _read_apst("/dev/nvme0n1")
             self.assertIsNone(result)
 
+    def test_parses_current_value_enabled(self):
+        with mock.patch("utils.tuner.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(
+                returncode=0,
+                stdout="get-feature:0x0c (Autonomous Power State Transition), "
+                       "current value: 0x1\n",
+            )
+            self.assertEqual(_read_apst("/dev/nvme0n1"), "enabled")
+
+    def test_parses_current_value_disabled(self):
+        with mock.patch("utils.tuner.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(
+                returncode=0,
+                stdout="get-feature:0x0c (Autonomous Power State Transition), "
+                       "current value: 0x0\n",
+            )
+            self.assertEqual(_read_apst("/dev/nvme0n1"), "disabled")
+
 
 class ApplyGovernorTests(unittest.TestCase):
     def _tuner(self, disks=None):
         return SystemTuner(disks or TARGET_NVME)
 
-    def test_no_governor_paths_exits(self):
+    def test_no_governor_paths_not_critical(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner._all_governor_paths", return_value=[]), \
-             self.assertRaises(SystemExit):
+        with mock.patch("utils.tuner._all_governor_paths", return_value=[]):
             tuner._apply_cpu_governor()
+        self.assertTrue(tuner.governor_failed)
+        self.assertEqual(len(tuner.applied), 1)
+        self.assertFalse(tuner.applied[0]["success"])
 
     def test_write_and_verify_ok(self):
         tuner = self._tuner()
@@ -99,26 +119,31 @@ class ApplyGovernorTests(unittest.TestCase):
         with mock.patch("utils.tuner._all_governor_paths", return_value=[fake_p]), \
              mock.patch.object(Path, "write_text"):
             tuner._apply_cpu_governor()
+        self.assertFalse(tuner.governor_failed)
         self.assertEqual(len(tuner.applied), 1)
         self.assertTrue(tuner.applied[0]["success"])
 
-    def test_verify_fails_exits(self):
+    def test_verify_fails_not_critical(self):
         tuner = self._tuner()
         fake_p = mock.Mock()
         fake_p.parent.parent.name = "cpu0"
         fake_p.read_text.return_value = "powersave"
         with mock.patch("utils.tuner._all_governor_paths", return_value=[fake_p]), \
-             mock.patch.object(Path, "write_text"), \
-             self.assertRaises(SystemExit):
+             mock.patch.object(Path, "write_text"):
             tuner._apply_cpu_governor()
+        self.assertTrue(tuner.governor_failed)
+        self.assertEqual(len(tuner.applied), 1)
+        self.assertFalse(tuner.applied[0]["success"])
 
-    def test_write_oserror_exits(self):
+    def test_write_oserror_not_critical(self):
         tuner = self._tuner()
         fake_p = mock.Mock()
         fake_p.write_text.side_effect = OSError("permission denied")
-        with mock.patch("utils.tuner._all_governor_paths", return_value=[fake_p]), \
-             self.assertRaises(SystemExit):
+        with mock.patch("utils.tuner._all_governor_paths", return_value=[fake_p]):
             tuner._apply_cpu_governor()
+        self.assertTrue(tuner.governor_failed)
+        self.assertEqual(len(tuner.applied), 1)
+        self.assertFalse(tuner.applied[0]["success"])
 
     def test_multiple_cpus_all_verified(self):
         tuner = self._tuner()
@@ -146,7 +171,7 @@ class ApplyApstTests(unittest.TestCase):
         self.assertEqual(entry["param"], "NVMe APST")
         self.assertEqual(entry["target_disks"], "nvme0n1")
         self.assertFalse(entry["success"])
-        self.assertTrue(entry["error"])
+        self.assertEqual(entry["error"], "nvme-cli не найден в PATH")
 
     def test_apst_already_disabled_recorded(self):
         tuner = self._tuner()
@@ -166,13 +191,26 @@ class ApplyApstTests(unittest.TestCase):
         self.assertEqual(len(tuner.applied), 1)
         self.assertTrue(tuner.applied[0]["success"])
 
-    def test_apst_disable_fails(self):
+    def test_apst_set_feature_fails_reports_stderr(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner._read_apst", side_effect=["enabled", "enabled"]), \
-             mock.patch("utils.tuner.subprocess.run", return_value=mock.Mock(returncode=1)):
+        bad = mock.Mock(returncode=1, stderr="NVMe status: ... feature not changeable")
+        with mock.patch("utils.tuner._read_apst", return_value="enabled"), \
+             mock.patch("utils.tuner.subprocess.run", return_value=bad):
             tuner._apply_nvme_apst()
         self.assertEqual(len(tuner.applied), 1)
-        self.assertFalse(tuner.applied[0]["success"])
+        entry = tuner.applied[0]
+        self.assertFalse(entry["success"])
+        self.assertIn("feature not changeable", entry["error"])
+
+    def test_apst_set_feature_ok_but_still_enabled(self):
+        tuner = self._tuner()
+        with mock.patch("utils.tuner._read_apst", return_value="enabled"), \
+             mock.patch("utils.tuner.subprocess.run", return_value=mock.Mock(returncode=0)):
+            tuner._apply_nvme_apst()
+        self.assertEqual(len(tuner.applied), 1)
+        entry = tuner.applied[0]
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["error"], "APST не отключился (проверка по чтению)")
 
     def test_no_nvme_disks(self):
         tuner = self._tuner(disks=TARGET_SATA)

@@ -30,7 +30,6 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -d 4 6-8         — протестировать все несистемные диски,
                                            кроме 4 и 6..8
     python fio-test.py -o my.md         — свой путь отчёта
-    python fio-test.py -n               — не применять оптимизации системы (--no-tune)
     python fio-test.py --target-iops 50 — целевая нагрузка IOPS на поток для расчёта
                                            bs/numjobs/iodepth последовательных тестов
     python fio-test.py --target-percent 0.8 — масштабировать динамические пороги

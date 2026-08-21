@@ -1175,7 +1175,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.sequential = False
         args.fast = False
         args.logging = False
-        args.no_tune = False
         args.runtime = 60
         args.block = 100
         args.add = None
@@ -1194,7 +1193,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.sequential = False
         args.fast = True
         args.logging = False
-        args.no_tune = True
         args.runtime = None
         args.block = 100
         args.add = None
@@ -1212,7 +1210,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.sequential = True
         args.fast = True
         args.logging = True
-        args.no_tune = False
         args.runtime = 60
         args.block = 100
         args.add = [1]
@@ -1234,7 +1231,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.sequential = True
         args.fast = False
         args.logging = False
-        args.no_tune = False
         args.runtime = 60
         args.block = 100
         args.add = None
@@ -1254,7 +1250,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.sequential = False
         args.fast = False
         args.logging = False
-        args.no_tune = False
         args.runtime = None
         args.block = 0
         args.add = None

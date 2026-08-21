@@ -73,9 +73,9 @@ def _run(argv):
 
 
 class FlagMatrixTests(unittest.TestCase):
-    """Перебор всех булевых флагов {-s,-c,-f,-l,-n,-t}."""
+    """Перебор всех булевых флагов {-s,-c,-f,-l,-t}."""
 
-    FLAGS = ["-s", "-c", "-f", "-l", "-n", "-t"]
+    FLAGS = ["-s", "-c", "-f", "-l", "-t"]
 
     def test_boolean_matrix(self):
         for combo in itertools.product([False, True], repeat=len(self.FLAGS)):
@@ -100,7 +100,7 @@ class FlagMatrixTests(unittest.TestCase):
             ["-s", "-r", "30", "-b", "200"],
             ["-l", "-o", "custom.md", "-a", "1"],
             ["-f", "-r", "30"],
-            ["-n", "-l", "--target-iops", "2000"],
+            ["-l", "--target-iops", "2000"],
         ]
         for argv in combos:
             with self.subTest(argv=" ".join(argv)):

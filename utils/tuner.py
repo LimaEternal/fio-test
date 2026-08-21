@@ -2,8 +2,9 @@
 Модуль настройки системы для максимальной производительности накопителей.
 
 Применяет:
-- CPU governor → performance (write + verify, критическая ошибка при неудаче);
-- NVMe APST → отключён для целевых NVMe (best-effort).
+- CPU governor → performance (write + verify; неудача не критична — тесты
+  продолжаются, код завершения повышается до 2);
+- NVMe APST → отключён для целевых NVMe (best-effort, ошибка только в отчёте).
 
 NUMA-привязка fio (--cpus_allowed) — через get_numa_cpus(), не через apply().
 """
@@ -31,6 +32,7 @@ class SystemTuner:
             d for d in target_disks if d.get("tran", "").lower() == "nvme"
         ]
         self.applied: List[Dict] = []
+        self.governor_failed = False
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -39,10 +41,12 @@ class SystemTuner:
     def apply(self) -> None:
         """Применяет оптимизации: governor → performance, APST → off.
 
-        Governor — критическая ошибка при неудаче (sys.exit).
-        APST — best-effort (nvme-cli может отсутствовать).
+        Governor — не критичная ошибка: тесты продолжаются, в конце
+        работы код завершения повышается до 2 (tuner.governor_failed).
+        APST — best-effort (ошибка только в отчёте, на выходной код не влияет).
         """
         self.applied = []
+        self.governor_failed = False
         self._apply_cpu_governor()
         self._apply_nvme_apst()
 
@@ -84,10 +88,6 @@ class SystemTuner:
 
     def print_summary(self) -> None:
         """Выводит в консоль, что было применено."""
-        if not self.applied:
-            console.print("\n[bold]Оптимизация системы:[/bold] ничего не требуется")
-            return
-
         console.print("\n[bold]Оптимизация системы...[/bold]")
         for item in self.applied:
             label = item["param"]
@@ -154,6 +154,16 @@ class SystemTuner:
     # CPU governor: write → verify → die
     # ------------------------------------------------------------------
 
+    def _record_governor_failure(self, error: str) -> None:
+        """Фиксирует неудачу governor (не критично — тесты продолжаются)."""
+        self.governor_failed = True
+        self.applied.append({
+            "param": "CPU governor",
+            "after": "performance",
+            "success": False,
+            "error": error,
+        })
+
     def _apply_cpu_governor(self) -> None:
         governor_paths = _all_governor_paths()
         if not governor_paths:
@@ -161,7 +171,10 @@ class SystemTuner:
                 "[bold red]ОШИБКА:[/bold red] cpufreq недоступен "
                 "(scaling_governor не найден ни на одном CPU)"
             )
-            sys.exit(1)
+            self._record_governor_failure(
+                "cpufreq недоступен (scaling_governor не найден)"
+            )
+            return
 
         # Записываем performance во все ядра
         for p in governor_paths:
@@ -172,7 +185,10 @@ class SystemTuner:
                     f"[bold red]ОШИБКА:[/bold red] не удалось записать "
                     f"governor в {p}: {exc}"
                 )
-                sys.exit(1)
+                self._record_governor_failure(
+                    f"не удалось записать governor в {p}: {exc}"
+                )
+                return
 
         # Верифицируем
         failed = []
@@ -189,7 +205,10 @@ class SystemTuner:
                 f"[bold red]ОШИБКА:[/bold red] governor не применился "
                 f"на CPU: {', '.join(failed)}"
             )
-            sys.exit(1)
+            self._record_governor_failure(
+                f"governor не применился на CPU: {', '.join(failed)}"
+            )
+            return
 
         self.applied.append({
             "param": "CPU governor",
@@ -205,6 +224,7 @@ class SystemTuner:
         for disk in self._target_nvme:
             # Всегда пытаемся выключить APST, затем сверяем фактическое
             # состояние (аналогично governor: write → verify → record).
+            # Ошибка APST не критична: тесты продолжаются, в отчёте — причина.
             try:
                 result = subprocess.run(
                     ["nvme", "set-feature", disk["path"], "-f", "0x0c", "-v", "0"],
@@ -213,20 +233,31 @@ class SystemTuner:
                     timeout=5,
                 )
                 set_ok = result.returncode == 0
-            except (FileNotFoundError, subprocess.SubprocessError):
+                set_stderr = (result.stderr or "").strip()
+            except FileNotFoundError:
                 set_ok = False
-            except Exception:
+                set_stderr = "nvme-cli не найден в PATH"
+            except (subprocess.SubprocessError, Exception):
                 set_ok = False
+                set_stderr = "ошибка запуска nvme-cli"
 
             after = _read_apst(disk["path"]) if set_ok else None
             actually_disabled = after == "disabled"
             success = set_ok and actually_disabled
+
+            if success:
+                error = ""
+            elif not set_ok:
+                error = set_stderr or "nvme-cli недоступен или ошибка set-feature"
+            else:
+                error = "APST не отключился (проверка по чтению)"
+
             self.applied.append({
                 "param": "NVMe APST",
                 "after": after if after else "недоступно",
                 "success": success,
                 "target_disks": disk["name"],
-                "error": "" if success else "nvme-cli недоступен или APST не отключился",
+                "error": error,
             })
 
 
@@ -248,7 +279,12 @@ def _all_governor_paths() -> List[Path]:
 
 
 def _read_apst(disk_path: str) -> Optional[str]:
-    """Читает состояние APST для NVMe-диска. Возвращает 'enabled'/'disabled'/None."""
+    """Читает состояние APST для NVMe-диска. Возвращает 'enabled'/'disabled'/None.
+
+    `nvme get-feature -f 0x0c` выводит состояние в виде
+    ``... current value: 0xN`` (бит 0 — признак APST), либо, при -H,
+    текстом ``APST: Enabled/Disabled``. Обрабатываем оба варианта.
+    """
     try:
         result = subprocess.run(
             ["nvme", "get-feature", disk_path, "-f", "0x0c"],
@@ -258,8 +294,15 @@ def _read_apst(disk_path: str) -> Optional[str]:
         )
         if result.returncode != 0:
             return None
-        if "APST" in result.stdout and "Enabled" in result.stdout:
-            return "enabled"
+        out = result.stdout or ""
+        if "APST" in out:
+            if "Disabled" in out:
+                return "disabled"
+            if "Enabled" in out:
+                return "enabled"
+        m = re.search(r"current value:\s*0x([0-9a-fA-F]+)", out)
+        if m:
+            return "enabled" if int(m.group(1), 16) & 0x1 else "disabled"
         return "disabled"
     except (FileNotFoundError, subprocess.SubprocessError, Exception):
         return None
