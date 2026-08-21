@@ -90,16 +90,19 @@ class SystemTuner:
 
         console.print("\n[bold]Оптимизация системы...[/bold]")
         for item in self.applied:
+            label = item["param"]
+            if item.get("target_disks"):
+                label += f" ({item['target_disks']})"
             before = item.get("before")
             arrow = f"{before} → " if before else ""
             if item["success"]:
                 console.print(
-                    f"  [green]✓[/green] {item['param']}: "
+                    f"  [green]✓[/green] {label}: "
                     f"{arrow}{item['after']}"
                 )
             else:
                 console.print(
-                    f"  [yellow]—[/yellow] {item['param']}: пропущено"
+                    f"  [yellow]—[/yellow] {label}: пропущено"
                     + (f" ({item['error']})" if item.get("error") else "")
                 )
         console.print()
@@ -200,9 +203,8 @@ class SystemTuner:
 
     def _apply_nvme_apst(self) -> None:
         for disk in self._target_nvme:
-            current = _read_apst(disk["path"])
-            if current != "enabled":
-                continue
+            # Всегда пытаемся выключить APST, затем сверяем фактическое
+            # состояние (аналогично governor: write → verify → record).
             try:
                 result = subprocess.run(
                     ["nvme", "set-feature", disk["path"], "-f", "0x0c", "-v", "0"],
@@ -210,18 +212,21 @@ class SystemTuner:
                     text=True,
                     timeout=5,
                 )
-                success = result.returncode == 0
+                set_ok = result.returncode == 0
             except (FileNotFoundError, subprocess.SubprocessError):
-                success = False
+                set_ok = False
             except Exception:
-                success = False
+                set_ok = False
 
-            after = _read_apst(disk["path"]) if success else "enabled"
+            after = _read_apst(disk["path"]) if set_ok else None
+            actually_disabled = after == "disabled"
+            success = set_ok and actually_disabled
             self.applied.append({
                 "param": "NVMe APST",
-                "after": after,
-                "success": success and after == "disabled",
-                "error": "" if success else "nvme-cli недоступен или ошибка",
+                "after": after if after else "недоступно",
+                "success": success,
+                "target_disks": disk["name"],
+                "error": "" if success else "nvme-cli недоступен или APST не отключился",
             })
 
 

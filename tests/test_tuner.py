@@ -137,21 +137,30 @@ class ApplyApstTests(unittest.TestCase):
     def _tuner(self, disks=None):
         return SystemTuner(disks or TARGET_NVME)
 
-    def test_nvme_cli_missing_skipped(self):
+    def test_nvme_cli_missing_recorded(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner._read_apst", side_effect=[None, None]):
+        with mock.patch("utils.tuner.subprocess.run", side_effect=FileNotFoundError):
             tuner._apply_nvme_apst()
-        self.assertEqual(len(tuner.applied), 0)
+        self.assertEqual(len(tuner.applied), 1)
+        entry = tuner.applied[0]
+        self.assertEqual(entry["param"], "NVMe APST")
+        self.assertEqual(entry["target_disks"], "nvme0n1")
+        self.assertFalse(entry["success"])
+        self.assertTrue(entry["error"])
 
-    def test_apst_already_disabled_skipped(self):
+    def test_apst_already_disabled_recorded(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner._read_apst", return_value="disabled"):
+        with mock.patch("utils.tuner.subprocess.run", return_value=mock.Mock(returncode=0)), \
+             mock.patch("utils.tuner._read_apst", return_value="disabled"):
             tuner._apply_nvme_apst()
-        self.assertEqual(len(tuner.applied), 0)
+        self.assertEqual(len(tuner.applied), 1)
+        entry = tuner.applied[0]
+        self.assertEqual(entry["target_disks"], "nvme0n1")
+        self.assertTrue(entry["success"])
 
     def test_apst_disable_ok(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner._read_apst", side_effect=["enabled", "disabled"]), \
+        with mock.patch("utils.tuner._read_apst", return_value="disabled"), \
              mock.patch("utils.tuner.subprocess.run", return_value=mock.Mock(returncode=0)):
             tuner._apply_nvme_apst()
         self.assertEqual(len(tuner.applied), 1)
