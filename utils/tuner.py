@@ -11,15 +11,21 @@ NUMA-привязка fio (--cpus_allowed) — через get_numa_cpus(), не 
 
 import sys
 from pathlib import Path
+import errno
 import re
-import subprocess
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from rich.console import Console
+
+from utils import nvme_admin
 
 console = Console(color_system=None, highlight=False)
 
 VALID_CPULIST_RE = re.compile(r"^[\d,\-\s]+$")
+
+# Байт 265 структуры Identify Controller — APSTA (Autonomous Power State
+# Transition Attributes), бит 0 — контроллер поддерживает APST.
+_APSTA_OFFSET = 265
 
 
 class SystemTuner:
@@ -199,30 +205,16 @@ class SystemTuner:
                     "after": "недоступно",
                     "success": False,
                     "target_disks": disk["name"],
-                    "error": "nvme-cli недоступен или id-ctrl завершился с ошибкой",
+                    "error": "контроллер недоступен или ошибка Identify Controller",
                 })
                 continue
 
             # supported is True — пытаемся выключить
-            try:
-                result = subprocess.run(
-                    ["nvme", "set-feature", disk["path"], "-f", "0x0c", "-v", "0"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                set_ok = result.returncode == 0
-                set_stderr = (result.stderr or "").strip()
-            except FileNotFoundError:
-                set_ok = False
-                set_stderr = "nvme-cli не найден в PATH"
-            except (subprocess.SubprocessError, Exception):
-                set_ok = False
-                set_stderr = "ошибка запуска nvme-cli"
+            set_ok, invalid_field, set_err = _set_apst(disk["path"], value=0)
 
             # Страховка: если контроллер сам ответил INVALID_FIELD —
-            # значит APST не реализован, даже если id-ctrl этого не показал.
-            if not set_ok and "INVALID_FIELD" in set_stderr.upper():
+            # значит APST не реализован, даже если Identify этого не показал.
+            if not set_ok and invalid_field:
                 self.applied.append({
                     "param": "NVMe APST",
                     "after": "не поддерживается",
@@ -238,7 +230,7 @@ class SystemTuner:
             if success:
                 error = ""
             elif not set_ok:
-                error = set_stderr or "nvme-cli недоступен или ошибка set-feature"
+                error = set_err or "ошибка Set Features"
             else:
                 error = "APST не отключился (проверка по чтению)"
 
@@ -270,60 +262,56 @@ def _all_governor_paths() -> List[Path]:
 
 def _apst_supported(disk_path: str) -> Optional[bool]:
     """Поддерживает ли контроллер APST (фича 0x0c).
+
+    Identify Controller через ioctl, байт 265 — APSTA, бит 0.
     Возвращает:
         True  — APST реализован;
-        False — не реализован (enterprise-диски: поле apsta отсутствует
-                или равно 0);
-        None  — nvme-cli отсутствует или id-ctrl упал (нельзя определить).
+        False — не реализован (apsta == 0; типично для enterprise U.2/U.3/E3.S);
+        None  — контроллер недоступен или ioctl завершился с ошибкой.
     """
-    try:
-        result = subprocess.run(
-            ["nvme", "id-ctrl", disk_path],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError, Exception):
+    buf = bytearray(nvme_admin.IDENTIFY_DATA_LEN)
+    res = nvme_admin.admin_cmd(
+        disk_path,
+        nvme_admin.OPC_IDENTIFY,
+        cdw10=1,  # CNS=1 — Identify Controller
+        out_buf=buf,
+    )
+    if not res.ok:
         return None
-    if result.returncode != 0:
-        return None
-    out = result.stdout or ""
-    m = re.search(r"apsta.*?:\s*0x?([0-9a-fA-F]+)", out, re.IGNORECASE)
-    if not m:
-        # id-ctrl отработал, но поля apsta в выводе нет —
-        # контроллер не экспонирует APST (enterprise U.2/U.3/E3.S).
-        return False
-    try:
-        return bool(int(m.group(1), 16))
-    except ValueError:
-        return False
+    return bool(buf[_APSTA_OFFSET] & 0x1)
+
+
+def _set_apst(disk_path: str, value: int = 0) -> Tuple[bool, bool, str]:
+    """Устанавливает APST (Set Features 0x0c). value=0 — выключить.
+
+    Возвращает (ok, invalid_field, error):
+        ok            — команда принята контроллером;
+        invalid_field — контроллер ответил INVALID_FIELD (errno EINVAL):
+                        фича не реализована;
+        error         — человекочитаемый текст ошибки при неудаче.
+    """
+    res = nvme_admin.admin_cmd(
+        disk_path,
+        nvme_admin.OPC_SET_FEATURES,
+        cdw10=nvme_admin.FID_APST,
+        cdw11=value & 0xFFFFFFFF,
+    )
+    if res.ok:
+        return True, False, ""
+    return False, res.errno == errno.EINVAL, res.error
 
 
 def _read_apst(disk_path: str) -> Optional[str]:
-    """Читает состояние APST для NVMe-диска. Возвращает 'enabled'/'disabled'/None.
+    """Читает состояние APST для NVMe-диска.
 
-    `nvme get-feature -f 0x0c` выводит состояние в виде
-    ``... current value: 0xN`` (бит 0 — признак APST), либо, при -H,
-    текстом ``APST: Enabled/Disabled``. Обрабатываем оба варианта.
+    Get Features 0x0c через ioctl: бит 0 значения фичи — признак
+    включённого APST. Возвращает 'enabled'/'disabled'/None.
     """
-    try:
-        result = subprocess.run(
-            ["nvme", "get-feature", disk_path, "-f", "0x0c"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return None
-        out = result.stdout or ""
-        if "APST" in out:
-            if "Disabled" in out:
-                return "disabled"
-            if "Enabled" in out:
-                return "enabled"
-        m = re.search(r"current value:\s*0x([0-9a-fA-F]+)", out)
-        if m:
-            return "enabled" if int(m.group(1), 16) & 0x1 else "disabled"
-        return "disabled"
-    except (FileNotFoundError, subprocess.SubprocessError, Exception):
+    res = nvme_admin.admin_cmd(
+        disk_path,
+        nvme_admin.OPC_GET_FEATURES,
+        cdw10=nvme_admin.FID_APST,
+    )
+    if not res.ok:
         return None
+    return "enabled" if res.result & 0x1 else "disabled"

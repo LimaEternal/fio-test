@@ -1,3 +1,4 @@
+import errno
 import sys
 import tempfile
 import unittest
@@ -7,7 +8,15 @@ from unittest import mock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.tuner import SystemTuner, _governor_path, _all_governor_paths, _read_apst, _apst_supported
+from utils import nvme_admin
+from utils.tuner import (
+    SystemTuner,
+    _governor_path,
+    _all_governor_paths,
+    _read_apst,
+    _apst_supported,
+    _APSTA_OFFSET,
+)
 
 TARGET_NVME = [
     {"name": "nvme0n1", "path": "/dev/nvme0n1", "tran": "NVME"},
@@ -15,6 +24,16 @@ TARGET_NVME = [
 TARGET_SATA = [
     {"name": "sda", "path": "/dev/sda", "tran": "SATA"},
 ]
+
+
+def _identify_ctrl_result(apsta_byte):
+    """Фейковый nvme_admin.admin_cmd: заполняет буфер Identify Controller."""
+    def _fake(disk_path, opcode, cdw10=0, cdw11=0, nsid=0,
+              out_buf=None, timeout_ms=5000):
+        if out_buf is not None:
+            out_buf[_APSTA_OFFSET] = apsta_byte
+        return nvme_admin.AdminResult(True, 0, None, "")
+    return _fake
 
 
 class GovernorPathTests(unittest.TestCase):
@@ -53,76 +72,62 @@ class AllGovernorPathsTests(unittest.TestCase):
 
 class ReadApstTests(unittest.TestCase):
     def test_enabled(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(
-                returncode=0,
-                stdout="NVMe APST: Enabled\n",
-            )
+        res = nvme_admin.AdminResult(True, 0x1, None, "")
+        with mock.patch("utils.tuner.nvme_admin.admin_cmd", return_value=res) as m:
             result = _read_apst("/dev/nvme0n1")
             self.assertEqual(result, "enabled")
+            args, kwargs = m.call_args
+            self.assertEqual(args[0], "/dev/nvme0n1")
+            self.assertEqual(args[1], nvme_admin.OPC_GET_FEATURES)
+            self.assertEqual(kwargs.get("cdw10"), nvme_admin.FID_APST)
 
     def test_disabled(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(
-                returncode=0,
-                stdout="NVMe APST: Disabled\n",
-            )
+        res = nvme_admin.AdminResult(True, 0x0, None, "")
+        with mock.patch("utils.tuner.nvme_admin.admin_cmd", return_value=res):
             result = _read_apst("/dev/nvme0n1")
             self.assertEqual(result, "disabled")
 
-    def test_nonzero_returncode(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(returncode=1, stdout="")
-            result = _read_apst("/dev/nvme0n1")
-            self.assertIsNone(result)
-
-    def test_nvme_cli_missing(self):
-        with mock.patch("utils.tuner.subprocess.run", side_effect=FileNotFoundError):
-            result = _read_apst("/dev/nvme0n1")
-            self.assertIsNone(result)
-
-    def test_parses_current_value_enabled(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(
-                returncode=0,
-                stdout="get-feature:0x0c (Autonomous Power State Transition), "
-                       "current value: 0x1\n",
-            )
-            self.assertEqual(_read_apst("/dev/nvme0n1"), "enabled")
-
-    def test_parses_current_value_disabled(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(
-                returncode=0,
-                stdout="get-feature:0x0c (Autonomous Power State Transition), "
-                       "current value: 0x0\n",
-            )
+    def test_result_high_bit_only_is_disabled(self):
+        res = nvme_admin.AdminResult(True, 0xFFFFFFFE, None, "")
+        with mock.patch("utils.tuner.nvme_admin.admin_cmd", return_value=res):
             self.assertEqual(_read_apst("/dev/nvme0n1"), "disabled")
+
+    def test_command_failure_returns_none(self):
+        res = nvme_admin.AdminResult(False, 0, errno.EIO,
+                                     "/dev/nvme0: Input/output error")
+        with mock.patch("utils.tuner.nvme_admin.admin_cmd", return_value=res):
+            self.assertIsNone(_read_apst("/dev/nvme0n1"))
+
+    def test_device_open_failure_returns_none(self):
+        res = nvme_admin.AdminResult(False, 0, errno.ENOENT,
+                                     "/dev/nvme0: No such file or directory")
+        with mock.patch("utils.tuner.nvme_admin.admin_cmd", return_value=res):
+            self.assertIsNone(_read_apst("/dev/nvme0n1"))
 
 
 class ApstSupportedTests(unittest.TestCase):
     def test_apsta_bit_set(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(returncode=0, stdout="apsta   : 0x1\n")
+        with mock.patch("utils.tuner.nvme_admin.admin_cmd",
+                        side_effect=_identify_ctrl_result(0x01)) as m:
             self.assertTrue(_apst_supported("/dev/nvme0n1"))
+            args, kwargs = m.call_args
+            self.assertEqual(args[1], nvme_admin.OPC_IDENTIFY)
+            self.assertEqual(kwargs.get("cdw10"), 1)
 
     def test_apsta_bit_clear(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(returncode=0, stdout="apsta   : 0x0\n")
+        with mock.patch("utils.tuner.nvme_admin.admin_cmd",
+                        side_effect=_identify_ctrl_result(0x00)):
             self.assertFalse(_apst_supported("/dev/nvme0n1"))
 
-    def test_id_ctrl_nonzero_returncode(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(returncode=1, stdout="")
-            self.assertIsNone(_apst_supported("/dev/nvme0n1"))
+    def test_identify_failure_returns_none(self):
+        res = nvme_admin.AdminResult(False, 0, errno.EIO,
+                                     "/dev/nvme0: Input/output error")
 
-    def test_id_ctrl_cli_missing(self):
-        with mock.patch("utils.tuner.subprocess.run", side_effect=FileNotFoundError):
-            self.assertIsNone(_apst_supported("/dev/nvme0n1"))
+        def _fake(disk_path, opcode, cdw10=0, cdw11=0, nsid=0,
+                  out_buf=None, timeout_ms=5000):
+            return res
 
-    def test_no_apsta_field(self):
-        with mock.patch("utils.tuner.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(returncode=0, stdout="vid     : 0x1e95\n")
+        with mock.patch("utils.tuner.nvme_admin.admin_cmd", side_effect=_fake):
             self.assertIsNone(_apst_supported("/dev/nvme0n1"))
 
 
@@ -191,9 +196,9 @@ class ApplyApstTests(unittest.TestCase):
     def test_apst_not_supported_skipped_neutral(self):
         tuner = self._tuner()
         with mock.patch("utils.tuner._apst_supported", return_value=False), \
-             mock.patch("utils.tuner.subprocess.run") as mock_run:
+             mock.patch("utils.tuner._set_apst") as mock_set:
             tuner._apply_nvme_apst()
-        mock_run.assert_not_called()
+        mock_set.assert_not_called()
         self.assertEqual(len(tuner.applied), 1)
         entry = tuner.applied[0]
         self.assertEqual(entry["target_disks"], "nvme0n1")
@@ -201,20 +206,36 @@ class ApplyApstTests(unittest.TestCase):
         self.assertEqual(entry["after"], "не поддерживается")
         self.assertNotIn("error", entry)
 
-    def test_nvme_cli_missing_recorded(self):
+    def test_ctrl_unavailable_recorded_as_failure(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner.subprocess.run", side_effect=FileNotFoundError):
+        with mock.patch("utils.tuner._apst_supported", return_value=None), \
+             mock.patch("utils.tuner._set_apst") as mock_set:
             tuner._apply_nvme_apst()
+        mock_set.assert_not_called()
         self.assertEqual(len(tuner.applied), 1)
         entry = tuner.applied[0]
         self.assertEqual(entry["param"], "NVMe APST")
         self.assertEqual(entry["target_disks"], "nvme0n1")
         self.assertFalse(entry["success"])
-        self.assertEqual(entry["error"], "nvme-cli не найден в PATH")
+        self.assertIn("контроллер недоступен", entry["error"])
+
+    def test_apst_invalid_field_treated_as_unsupported(self):
+        tuner = self._tuner()
+        with mock.patch("utils.tuner._apst_supported", return_value=True), \
+             mock.patch("utils.tuner._set_apst",
+                        return_value=(False, True, "/dev/nvme0: Invalid argument")), \
+             mock.patch("utils.tuner._read_apst") as mock_read:
+            tuner._apply_nvme_apst()
+        mock_read.assert_not_called()
+        self.assertEqual(len(tuner.applied), 1)
+        entry = tuner.applied[0]
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["after"], "не поддерживается")
 
     def test_apst_already_disabled_recorded(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner.subprocess.run", return_value=mock.Mock(returncode=0)), \
+        with mock.patch("utils.tuner._apst_supported", return_value=True), \
+             mock.patch("utils.tuner._set_apst", return_value=(True, False, "")), \
              mock.patch("utils.tuner._read_apst", return_value="disabled"):
             tuner._apply_nvme_apst()
         self.assertEqual(len(tuner.applied), 1)
@@ -224,17 +245,20 @@ class ApplyApstTests(unittest.TestCase):
 
     def test_apst_disable_ok(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner._read_apst", return_value="disabled"), \
-             mock.patch("utils.tuner.subprocess.run", return_value=mock.Mock(returncode=0)):
+        with mock.patch("utils.tuner._apst_supported", return_value=True), \
+             mock.patch("utils.tuner._set_apst", return_value=(True, False, "")), \
+             mock.patch("utils.tuner._read_apst", return_value="disabled"):
             tuner._apply_nvme_apst()
         self.assertEqual(len(tuner.applied), 1)
         self.assertTrue(tuner.applied[0]["success"])
 
-    def test_apst_set_feature_fails_reports_stderr(self):
+    def test_apst_set_feature_fails_reports_error(self):
         tuner = self._tuner()
-        bad = mock.Mock(returncode=1, stderr="NVMe status: ... feature not changeable")
-        with mock.patch("utils.tuner._read_apst", return_value="enabled"), \
-             mock.patch("utils.tuner.subprocess.run", return_value=bad):
+        with mock.patch("utils.tuner._apst_supported", return_value=True), \
+             mock.patch("utils.tuner._set_apst",
+                        return_value=(False, False,
+                                      "/dev/nvme0: feature not changeable")), \
+             mock.patch("utils.tuner._read_apst", return_value="enabled"):
             tuner._apply_nvme_apst()
         self.assertEqual(len(tuner.applied), 1)
         entry = tuner.applied[0]
@@ -243,8 +267,9 @@ class ApplyApstTests(unittest.TestCase):
 
     def test_apst_set_feature_ok_but_still_enabled(self):
         tuner = self._tuner()
-        with mock.patch("utils.tuner._read_apst", return_value="enabled"), \
-             mock.patch("utils.tuner.subprocess.run", return_value=mock.Mock(returncode=0)):
+        with mock.patch("utils.tuner._apst_supported", return_value=True), \
+             mock.patch("utils.tuner._set_apst", return_value=(True, False, "")), \
+             mock.patch("utils.tuner._read_apst", return_value="enabled"):
             tuner._apply_nvme_apst()
         self.assertEqual(len(tuner.applied), 1)
         entry = tuner.applied[0]

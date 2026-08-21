@@ -1978,11 +1978,29 @@ _без docstring_
 
 _без docstring_
 
-##### ### `def test_nonzero_returncode(self)`
+##### ### `def test_result_high_bit_only_is_disabled(self)`
 
 _без docstring_
 
-##### ### `def test_nvme_cli_missing(self)`
+##### ### `def test_command_failure_returns_none(self)`
+
+_без docstring_
+
+##### ### `def test_device_open_failure_returns_none(self)`
+
+_без docstring_
+
+#### `class ApstSupportedTests(unittest.TestCase)`
+
+##### ### `def test_apsta_bit_set(self)`
+
+_без docstring_
+
+##### ### `def test_apsta_bit_clear(self)`
+
+_без docstring_
+
+##### ### `def test_identify_failure_returns_none(self)`
 
 _без docstring_
 
@@ -2018,11 +2036,19 @@ _без docstring_
 
 _без docstring_
 
-##### ### `def test_nvme_cli_missing_skipped(self)`
+##### ### `def test_apst_not_supported_skipped_neutral(self)`
 
 _без docstring_
 
-##### ### `def test_apst_already_disabled_skipped(self)`
+##### ### `def test_ctrl_unavailable_recorded_as_failure(self)`
+
+_без docstring_
+
+##### ### `def test_apst_invalid_field_treated_as_unsupported(self)`
+
+_без docstring_
+
+##### ### `def test_apst_already_disabled_recorded(self)`
 
 _без docstring_
 
@@ -2030,7 +2056,11 @@ _без docstring_
 
 _без docstring_
 
-##### ### `def test_apst_disable_fails(self)`
+##### ### `def test_apst_set_feature_fails_reports_error(self)`
+
+_без docstring_
+
+##### ### `def test_apst_set_feature_ok_but_still_enabled(self)`
 
 _без docstring_
 
@@ -2429,6 +2459,56 @@ Best-effort: MaxPayload upstream PCIe-моста (порта) из sysfs.  По�
 - `_SAS_BUS_MBPS_PER_GBPS`
 
 
+## utils/nvme_admin.py
+
+Прямые NVMe admin-команды через ioctl ядра (без nvme-cli).
+
+Ядро принимает admin-команды из userspace через ioctl NVME_IOCTL_ADMIN_CMD
+на символьном устройстве контроллера (/dev/nvme0) — структура
+nvme_passthru_cmd из include/uapi/linux/nvme_ioctl.h. Требуется root
+(CAP_SYS_ADMIN). Статусы ошибок NVMe ядро маппит в errno
+(INVALID_FIELD -> EINVAL и т.п.).
+
+Сейчас слой используется в tuner.py для отключения NVMe APST; позже тем же
+механизмом можно заменить `nvme smart-log` в diagnostics.py (Get Log Page).
+На Windows fcntl отсутствует — модуль импортируется, но admin_cmd()
+возвращает ошибку платформы; тесты идут через мок _ioctl().
+
+### Функции модуля
+
+### `def ctrl_device(name_or_path)`
+
+Путь к символьному устройству контроллера для диска.  '/dev/nvme0n1' и 'nvme0c0n1' -> '/dev/nvme0'; для не-NVMe имён None.
+
+### `def _ioctl(fd, request, cmd)`
+
+Обёртка над fcntl.ioctl (точка мока в тестах).
+
+### `def admin_cmd(disk_path, opcode, cdw10, cdw11, nsid, out_buf, timeout_ms)`
+
+Выполняет NVMe admin-команду на контроллере целевого диска.  out_buf — буфер data phase (identify, get-log-page); ядро пишет ответ прямо в него. Возвращает AdminResult(ok, result, errno, error).
+
+### Классы
+
+#### `class _PassthruCmd(ctypes.Structure)`
+
+struct nvme_passthru_cmd из include/uapi/linux/nvme_ioctl.h (72 байта, размер проверяется assert при импорте).
+
+#### `class AdminResult`
+
+Итог выполнения admin-команды: ok / result (dword из CQE) / errno / error.
+
+### Константы/переменные модуля
+
+- `OPC_IDENTIFY = 0x06`, `OPC_GET_FEATURES = 0x0A`, `OPC_SET_FEATURES = 0x09`
+
+- `FID_APST = 0x0C` (фича Autonomous Power State Transition)
+
+- `IDENTIFY_DATA_LEN = 4096`
+
+- `NVME_IOCTL_ADMIN_CMD` — вычисляется по формуле `_IOWR('N', 0x41, sizeof(nvme_passthru_cmd))` (x86_64/aarch64: 0xC0484E41)
+
+
 ## utils/prefill.py
 
 Предварительное заполнение дисков (-f).
@@ -2629,6 +2709,9 @@ _без docstring_
 - CPU governor → performance (write + verify, критическая ошибка при неудаче);
 - NVMe APST → отключён для целевых NVMe (best-effort).
 
+APST управляется напрямую через ioctl ядра (utils/nvme_admin.py), без
+зависимости от nvme-cli.
+
 NUMA-привязка fio (--cpus_allowed) — через get_numa_cpus(), не через apply().
 
 ### Функции модуля
@@ -2641,9 +2724,24 @@ NUMA-привязка fio (--cpus_allowed) — через get_numa_cpus(), не 
 
 Все scaling_governor файлы.
 
+### `def _apst_supported(disk_path)`
+
+Поддерживает ли контроллер APST (фича 0x0c).  Identify Controller через ioctl, байт 265 — APSTA, бит 0.  Возвращает:
+    True  — APST реализован;
+    False — не реализован (apsta == 0; типично для enterprise U.2/U.3/E3.S);
+    None  — контроллер недоступен или ioctl завершился с ошибкой.
+
+### `def _set_apst(disk_path, value)`
+
+Устанавливает APST (Set Features 0x0c). value=0 — выключить.  Возвращает (ok, invalid_field, error):
+        ok            — команда принята контроллером;
+        invalid_field — контроллер ответил INVALID_FIELD (errno EINVAL):
+                        фича не реализована;
+        error         — человекочитаемый текст ошибки при неудаче.
+
 ### `def _read_apst(disk_path)`
 
-Читает состояние APST для NVMe-диска. Возвращает 'enabled'/'disabled'/None.
+Читает состояние APST для NVMe-диска.  Get Features 0x0c через ioctl: бит 0 значения фичи — признак включённого APST. Возвращает 'enabled'/'disabled'/None.
 
 ### Классы
 
@@ -2681,13 +2779,18 @@ _без docstring_
 
 ##### ### `def _apply_nvme_apst(self)`
 
-_без docstring_
+Для каждого целевого NVMe: `_apst_supported` → при поддержке `_set_apst(0)`,
+затем верификация чтением через `_read_apst`. INVALID_FIELD от контроллера
+трактуется как «не поддерживается». Результат — записи в `self.applied`
+(ключи param/after/success/target_disks/error).
 
 ### Константы/переменные модуля
 
 - `console`
 
 - `VALID_CPULIST_RE`
+
+- `_APSTA_OFFSET` — байт 265 структуры Identify Controller: APSTA (Autonomous Power State Transition Attributes), бит 0 — контроллер поддерживает APST.
 
 
 
