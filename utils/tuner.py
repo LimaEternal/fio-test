@@ -194,8 +194,6 @@ class SystemTuner:
                 continue
 
             if supported is None:
-                # nvme-cli отсутствует или id-ctrl упал — set-feature тоже упадёт,
-                # нет смысла дёргать его и спамить одной и той же ошибкой.
                 self.applied.append({
                     "param": "NVMe APST",
                     "after": "недоступно",
@@ -205,7 +203,7 @@ class SystemTuner:
                 })
                 continue
 
-            # supported is True — реально пытаемся выключить
+            # supported is True — пытаемся выключить
             try:
                 result = subprocess.run(
                     ["nvme", "set-feature", disk["path"], "-f", "0x0c", "-v", "0"],
@@ -221,6 +219,17 @@ class SystemTuner:
             except (subprocess.SubprocessError, Exception):
                 set_ok = False
                 set_stderr = "ошибка запуска nvme-cli"
+
+            # Страховка: если контроллер сам ответил INVALID_FIELD —
+            # значит APST не реализован, даже если id-ctrl этого не показал.
+            if not set_ok and "INVALID_FIELD" in set_stderr.upper():
+                self.applied.append({
+                    "param": "NVMe APST",
+                    "after": "не поддерживается",
+                    "success": True,
+                    "target_disks": disk["name"],
+                })
+                continue
 
             after = _read_apst(disk["path"]) if set_ok else None
             actually_disabled = after == "disabled"
@@ -261,15 +270,11 @@ def _all_governor_paths() -> List[Path]:
 
 def _apst_supported(disk_path: str) -> Optional[bool]:
     """Поддерживает ли контроллер APST (фича 0x0c).
-
-    Читает бит ``apsta`` из ``nvme id-ctrl``. Возвращает:
-        True  — APST реализован (можно пытаться выключить);
-        False — не реализован (enterprise-диски: U.2/U.3/E3.S);
-        None  — не удалось определить (nvme-cli нет / id-ctrl упал) —
-                в этом случае вызывающий всё равно попытается set-feature.
-
-    `nvme id-ctrl` — обязательная команда, она не даёт INVALID_FIELD,
-    в отличие от get/set-feature на контроллерах без APST.
+    Возвращает:
+        True  — APST реализован;
+        False — не реализован (enterprise-диски: поле apsta отсутствует
+                или равно 0);
+        None  — nvme-cli отсутствует или id-ctrl упал (нельзя определить).
     """
     try:
         result = subprocess.run(
@@ -282,16 +287,16 @@ def _apst_supported(disk_path: str) -> Optional[bool]:
         return None
     if result.returncode != 0:
         return None
-    out = result.stdout
-    if not isinstance(out, str):
-        out = ""
+    out = result.stdout or ""
     m = re.search(r"apsta.*?:\s*0x?([0-9a-fA-F]+)", out, re.IGNORECASE)
     if not m:
-        return None
+        # id-ctrl отработал, но поля apsta в выводе нет —
+        # контроллер не экспонирует APST (enterprise U.2/U.3/E3.S).
+        return False
     try:
         return bool(int(m.group(1), 16))
     except ValueError:
-        return None
+        return False
 
 
 def _read_apst(disk_path: str) -> Optional[str]:
