@@ -36,7 +36,7 @@ def _render_source_notes(disk_results: dict, test_names: dict) -> List[str]:
         if res.get("lat_p99_unreliable"):
             note = (f"перцентили задержек по {test_names.get(test_id, test_id)} "
                     "недостоверны (clat p99 на порядки выше среднего — мусор от fio), "
-                    "в таблицах показано '—'; сырой JSON в reports/raw/")
+                    "в таблицах показано '—'")
             if note not in seen:
                 seen.add(note)
                 out.append(f"> {note}")

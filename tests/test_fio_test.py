@@ -474,43 +474,6 @@ class RunFioTestDiagStoreTests(unittest.TestCase):
             diag_store["nvme0n1"]["seq_read"]["summary"]["temp_max_c"], 41.0
         )
 
-    def test_raw_fio_json_saved_in_diag_mode(self):
-        raw_text = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})
-        fake = (mock.Mock(returncode=0), raw_text.encode(), b"")
-        with tempfile.TemporaryDirectory() as tmp:
-            real_path = Path(tmp)
-
-            def fake_path(p):
-                return real_path / p
-
-            with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
-                 mock.patch.object(fio_test, "DiagnosticSampler") as fake_sampler_cls, \
-                 mock.patch.object(fio_test, "Path", side_effect=fake_path):
-                fake_sampler = fake_sampler_cls.return_value
-                fake_sampler.samples = []
-                fake_sampler.summary.return_value = {
-                    "samples": 0, "sources": {"link": True, "temp": True},
-                    "load_source": None,
-                }
-                fio_test.run_fio_test(
-                    DISK, "seq_read", ["--rw=read"], diag_store={}
-                )
-
-            files = list((real_path / "reports" / "raw").glob("fio-*.json"))
-            self.assertEqual(len(files), 1)
-            self.assertIn("nvme0n1", files[0].name)
-            self.assertIn("seq_read", files[0].name)
-            self.assertEqual(files[0].read_text(encoding="utf-8"), raw_text)
-
-    def test_raw_fio_json_not_saved_without_diag_store(self):
-        raw_text = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})
-        fake = (mock.Mock(returncode=0), raw_text.encode(), b"")
-        with mock.patch.object(fio_test, "_run_io_process", return_value=fake), \
-             mock.patch.object(fio_test, "_save_raw_fio_output") as saver, \
-             mock.patch.object(fio_test, "DiagnosticSampler"):
-            fio_test.run_fio_test(DISK, "seq_read", ["--rw=read"])
-        saver.assert_not_called()
-
     def test_sampler_runs_and_diag_present_without_diag_store(self):
         raw = json.dumps({"jobs": [{"read": {"bw_bytes": 1000, "iops": 1}}]})
         fake = (mock.Mock(returncode=0), raw.encode(), b"")

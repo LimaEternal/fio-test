@@ -639,22 +639,6 @@ def _run_io_process(cmd, cancel_event):
     return run_process(cmd, cancel_event)
 
 
-def _save_raw_fio_output(disk_name: str, test_id: str, stdout: str) -> None:
-    """Сохраняет сырой stdout fio в reports/raw/ для диагностики метрик.
-
-    Нужно для расследования аномальных значений (например, недостоверных
-    перцентилей clat): по сохранённому JSON можно увидеть, что именно отдал
-    fio, не перезапуская тесты.
-    """
-    try:
-        raw_dir = Path("reports") / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        path = raw_dir / f"fio-{disk_name}-{test_id}-{int(time.time())}.json"
-        path.write_text(stdout, encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _max_iodepth(iodepth_level: dict):
     """Возвращает максимальную достигнутую глубину очереди из гистограммы fio.
 
@@ -768,7 +752,7 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
     Параллельно с тестом всегда сэмплирует линк и температуру; сводка
     (максимальная температура за тест и т.п.) попадает в res["diag"] — из неё
     берётся колонка Tmax в консольной таблице. В диагностическом режиме
-    (diag_store) дополнительно пишутся посекундные логи нагрузки, raw JSON
+    (diag_store) дополнительно пишутся посекундные логи нагрузки
     и посекундные сэмплы в diag_store/live_store для единого файла отчёта.
 
     state_lock защищает запись в общие diag_store/live_store от гонок
@@ -806,8 +790,8 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
 
     stop_event = threading.Event()
     # Сэмплер линка/температуры запускается всегда: максимальная температура
-    # за тест нужна в обычном режиме (колонка Tmax). Посекундные логи нагрузки,
-    # raw JSON и живой отчёт остаются фичей диагностического режима (-l).
+    # за тест нужна в обычном режиме (колонка Tmax). Посекундные логи нагрузки
+    # и живой отчёт остаются фичей диагностического режима (-l).
     sampler = DiagnosticSampler(disk_info)
     sampler_thread = threading.Thread(
         target=sampler.run, args=(stop_event,), daemon=True
@@ -834,10 +818,6 @@ def run_fio_test(disk_info, test_id, base_args, cancel_event=None, diag_store=No
                 proc, stdout, stderr = result
                 stdout = stdout.decode() if stdout else ""
                 stderr = stderr.decode() if stderr else ""
-                # Сырой JSON сохраняем в диагностическом режиме (-l): по нему
-                # можно разобрать аномальные метрики без повторного прогона.
-                if diag_store is not None and stdout.strip():
-                    _save_raw_fio_output(disk_info["name"], test_id, stdout)
                 if proc.returncode != 0:
                     hint = stderr.strip()[:500] if stderr else "нет вывода stderr"
                     res = {"error": f"fio завершился с кодом {proc.returncode}: {hint}"}

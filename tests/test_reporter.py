@@ -160,7 +160,7 @@ class RenderSourceNotesTests(unittest.TestCase):
         lines = _render_source_notes(disk_results, TEST_NAMES)
         text = "\n".join(lines)
         self.assertIn("недостоверны", text)
-        self.assertIn("reports/raw", text)
+        self.assertIn("показано '—'", text)
 
     def test_no_note_when_p99_reliable(self):
         disk_results = {
