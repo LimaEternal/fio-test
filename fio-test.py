@@ -13,6 +13,7 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -f           — быстрый режим без предварительного заполнения
                                       (по умолчанию префилл выполняется перед тестами)
     python fio-test.py -r 60            — 60 сек на тест
+    python fio-test.py -w 30            — 30 сек разогрева перед каждым тестом
     python fio-test.py -l               — подробное логирование: отчёт обновляется
                                           по мере завершения тестов (мониторинг в отчёте)
     python fio-test.py -t               — тестовый режим (пробные данные без fio)
@@ -207,6 +208,11 @@ def parse_args():
         help="Длительность каждого теста в секундах (по умолчанию — из конфига .fio)",
     )
     parser.add_argument(
+        "-w", "--warmup", type=int, default=None,
+        help="Разогрев перед каждым тестом в секундах (ramp_time). "
+             "Без флага — из конфига .fio (15). 0 — без разогрева",
+    )
+    parser.add_argument(
         "-b", "--block", type=_block_gb_type, default=100,
         help="Размер тестовой области в гигабайтах на диск (по умолчанию 100). "
              "0 — весь диск",
@@ -245,6 +251,8 @@ def parse_args():
         args.delete = [n for tok in args.delete for n in tok]
     if args.runtime is not None and args.runtime <= 0:
         parser.error("--runtime должен быть положительным числом секунд")
+    if args.warmup is not None and args.warmup < 0:
+        parser.error("--warmup должен быть неотрицательным числом секунд")
     if args.target_iops <= 0:
         parser.error("--target-iops должен быть больше нуля")
     if args.output is not None:
@@ -376,6 +384,10 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
             f"{args.runtime} сек" if args.runtime is not None else "по конфигу (.fio)",
         ))
         flags.append((
+            "Разогрев",
+            f"{args.warmup} сек" if args.warmup is not None else "по конфигу (.fio)",
+        ))
+        flags.append((
             "Размер тестовой области",
             f"{args.block} ГБ" if args.block else "весь диск",
         ))
@@ -484,6 +496,21 @@ def build_disk_plans(disks: list, args) -> tuple:
                 ])
                 for t, fio_args in plan
             ]
+
+        # Разогрев: заменяем ramp_time из конфига, а если его там нет
+        # (старые конфиги) — добавляем. -w 0 отключает разогрев.
+        if args.warmup is not None:
+            new_plan = []
+            for t, fio_args in plan:
+                has_ramp = any(a.startswith("--ramp_time=") for a in fio_args)
+                new_args = [
+                    f"--ramp_time={args.warmup}" if a.startswith("--ramp_time=") else a
+                    for a in fio_args
+                ]
+                if not has_ramp:
+                    new_args.append(f"--ramp_time={args.warmup}")
+                new_plan.append((t, new_args))
+            plan = new_plan
 
         if args.block:
             plan = [
@@ -1383,6 +1410,9 @@ def main():
 
     if args.runtime is not None:
         console.print(f"\n[bold]Длительность теста: {args.runtime} сек[/bold]")
+    if args.warmup is not None:
+        warmup_txt = f"{args.warmup} сек" if args.warmup else "отключён"
+        console.print(f"[bold]Разогрев: {warmup_txt}[/bold]")
 
     # Запуск тестов
     if args.logging:

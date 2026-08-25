@@ -78,10 +78,19 @@ def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_name
             continue
 
         # Когда нагрузка приходит из fio-логов, строки без неё — это ramp-период
-        # (fio ещё не пишет лог) и секунды до старта теста. Их пропускаем, чтобы
-        # таблица начиналась с реальной нагрузки. Если логов нет вовсе
-        # (load_source не "fio"), показываем все строки: там только линк/температура.
+        # (fio ещё не пишет лог) и секунды до старта теста. Их пропускаем, а
+        # секунды считаем от первой строки с реальной нагрузкой: иначе в начале
+        # таблицы висит «фантомный» хвост (спавн процесса + ramp + первое окно
+        # усреднения), и нумерация сбивает с толку. Если логов нет вовсе
+        # (load_source не "fio"), показываем все строки с абсолютной нумерацией:
+        # там только линк/температура.
         load_from_fio = (entry.get("summary") or {}).get("load_source") == "fio"
+        first_loaded = 0
+        if load_from_fio:
+            for idx, s in enumerate(samples):
+                if s.get("read_mbs") is not None or s.get("write_mbs") is not None:
+                    first_loaded = idx
+                    break
 
         lines.append(f"**Сэмплы линка/температуры/нагрузки — {test_name}**")
         lines.append("")
@@ -90,6 +99,7 @@ def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_name
         for i, s in enumerate(samples, 1):
             if load_from_fio and s.get("read_mbs") is None and s.get("write_mbs") is None:
                 continue
+            sec = i - first_loaded if load_from_fio else i
             link = "—"
             if s.get("gts") is not None:
                 link = f"{s['gts']:g} GT/s x{s.get('width') or '?'}"
@@ -98,7 +108,7 @@ def _render_sampler_tables(diag_store: Optional[dict], disk_name: str, test_name
             write_mbs = _fmt(s.get("write_mbs"), ".1f") if s.get("write_mbs") is not None else "—"
             iops = _fmt(s.get("iops"), ",.0f") if s.get("iops") is not None else "—"
             lines.append(
-                f"| {i} | {link} | {temp} | {read_mbs} | {write_mbs} | {iops} |"
+                f"| {sec} | {link} | {temp} | {read_mbs} | {write_mbs} | {iops} |"
             )
         lines.append("")
 

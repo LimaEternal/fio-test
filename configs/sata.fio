@@ -12,6 +12,7 @@
 [global]
 ioengine=libaio
 direct=1
+ramp_time=15
 runtime=30
 time_based=1
 group_reporting=1

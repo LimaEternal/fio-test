@@ -1118,6 +1118,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.fast = False
         args.logging = False
         args.runtime = 60
+        args.warmup = 30
         args.block = 100
         args.add = None
         args.delete = None
@@ -1128,6 +1129,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         flags = dict(info["flags"])
         self.assertEqual(flags["Время предзаполнения"], "2 мин 05 с")
         self.assertEqual(flags["Время тестов"], "1 ч 02 мин")
+        self.assertEqual(flags["Разогрев"], "30 сек")
 
     def test_no_durations_no_extra_flags(self):
         args = mock.Mock()
@@ -1135,15 +1137,18 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.fast = True
         args.logging = False
         args.runtime = None
+        args.warmup = None
         args.block = 100
         args.add = None
         args.delete = None
         args.output = None
         info = fio_test._build_run_info(args)
+        flags = dict(info["flags"])
         self.assertEqual(
             dict(info["flags"]).get("Время предзаполнения"), None
         )
         self.assertEqual(dict(info["flags"]).get("Время тестов"), None)
+        self.assertEqual(flags["Разогрев"], "по конфигу (.fio)")
 
     def test_test_mode_marks_regime_and_skips_irrelevant_flags(self):
         args = mock.Mock()
@@ -1151,6 +1156,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.fast = True
         args.logging = True
         args.runtime = 60
+        args.warmup = 15
         args.block = 100
         args.add = [1]
         args.delete = None
@@ -1160,6 +1166,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         self.assertEqual(flags["Режим"], "тестовый")
         self.assertNotIn("Предварительное заполнение", flags)
         self.assertNotIn("Длительность теста", flags)
+        self.assertNotIn("Разогрев", flags)
         self.assertNotIn("Размер тестовой области", flags)
         self.assertNotIn("Пороги NVMe", flags)
         self.assertEqual(flags["Выбор дисков (--add)"], "1")
@@ -1171,6 +1178,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.fast = False
         args.logging = False
         args.runtime = 60
+        args.warmup = 0
         args.block = 100
         args.add = None
         args.delete = None
@@ -1180,6 +1188,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         self.assertEqual(flags["Режим"], "последовательный")
         self.assertEqual(flags["Предварительное заполнение"], "включено")
         self.assertEqual(flags["Длительность теста"], "60 сек")
+        self.assertEqual(flags["Разогрев"], "0 сек")
         self.assertEqual(flags["Размер тестовой области"], "100 ГБ")
 
     def test_block_zero_rendered_as_full_disk(self):
@@ -1188,6 +1197,7 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.fast = False
         args.logging = False
         args.runtime = None
+        args.warmup = None
         args.block = 0
         args.add = None
         args.delete = None
@@ -1195,6 +1205,48 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         info = fio_test._build_run_info(args)
         flags = dict(info["flags"])
         self.assertEqual(flags["Размер тестовой области"], "весь диск")
+
+
+class BuildDiskPlansWarmupTests(unittest.TestCase):
+    """-w/--warmup: замена ramp_time из конфига либо вставка при отсутствии."""
+
+    def _args(self, warmup):
+        a = mock.Mock()
+        a.target_iops = fio_test.DEFAULT_TARGET_IOPS
+        a.runtime = None
+        a.block = None
+        a.warmup = warmup
+        return a
+
+    def _ramps_by_test(self, plan):
+        out = {}
+        for t, fio_args in plan:
+            ramps = [a for a in fio_args if a.startswith("--ramp_time=")]
+            self.assertEqual(len(ramps), 1, f"{t}: {fio_args}")
+            out[t] = ramps[0]
+        return out
+
+    def test_warmup_applied_to_all_interfaces(self):
+        disks = fio_test.build_fake_disks()
+        plans, _ = fio_test.build_disk_plans(disks, self._args(30))
+        self.assertTrue(plans)
+        for idx, disk, plan in plans:
+            for tid, ramp in self._ramps_by_test(plan).items():
+                self.assertEqual(ramp, "--ramp_time=30", f"disk #{idx} {tid}")
+
+    def test_warmup_zero_disables_ramp(self):
+        disks = fio_test.build_fake_disks()
+        plans, _ = fio_test.build_disk_plans(disks, self._args(0))
+        for idx, disk, plan in plans:
+            for tid, ramp in self._ramps_by_test(plan).items():
+                self.assertEqual(ramp, "--ramp_time=0", f"disk #{idx} {tid}")
+
+    def test_no_flag_keeps_config_value(self):
+        disks = fio_test.build_fake_disks()
+        plans, _ = fio_test.build_disk_plans(disks, self._args(None))
+        for idx, disk, plan in plans:
+            for tid, ramp in self._ramps_by_test(plan).items():
+                self.assertEqual(ramp, "--ramp_time=15", f"disk #{idx} {tid}")
 
 
 class BuildTestPlanTests(unittest.TestCase):

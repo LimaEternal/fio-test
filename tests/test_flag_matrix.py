@@ -90,6 +90,8 @@ class FlagMatrixTests(unittest.TestCase):
     def test_value_flag_combos(self):
         combos = [
             ["-r", "30"],
+            ["-w", "10"],
+            ["-w", "0"],
             ["-b", "200"],
             ["-b", "0"],
             ["--target-iops", "1000"],
@@ -108,9 +110,9 @@ class FlagMatrixTests(unittest.TestCase):
                 self.assertIn(code, (0, 1, 2))
 
     def test_t_ignores_other_flags(self):
-        # -t молча игнорирует -s/-f/-r/-b/-c (по решению).
+        # -t молча игнорирует -s/-f/-r/-b/-c/-w (по решению).
         argv = [
-            "-t", "-s", "-f", "-r", "60", "-b", "200", "-c",
+            "-t", "-s", "-f", "-r", "60", "-b", "200", "-c", "-w", "5",
         ]
         code = _run(["fio-test.py"] + argv)
         self.assertEqual(code, 0)
@@ -122,6 +124,7 @@ class FlagNegativeTests(unittest.TestCase):
     BAD = [
         ["-r", "0"],
         ["-r", "-1"],
+        ["-w", "-1"],
         ["-b", "-1"],
         ["--target-iops", "0"],
         ["-a", "1", "-d", "2"],

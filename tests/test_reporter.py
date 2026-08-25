@@ -389,12 +389,18 @@ class GenerateReportLatP99Tests(unittest.TestCase):
 
 
 class RenderSamplerTablesRampTests(unittest.TestCase):
-    def test_ramp_rows_without_load_skipped_when_fio_source(self):
+    def test_ramp_rows_without_load_skipped_and_renumbered_from_load(self):
+        # Нагрузка начинается с 3-го сэмпла (spawn + ramp): строки без
+        # нагрузки скрываются, нумерация начинается с 1 от первой нагрузки.
         samples = [
             {"ts": 1.0, "gts": 32.0, "width": 4, "temp": 40.0,
              "read_mbs": None, "write_mbs": None, "iops": None},
-            {"ts": 2.0, "gts": 32.0, "width": 4, "temp": 40.0,
+            {"ts": 2.0, "gts": 32.0, "width": 4, "temp": 40.5,
+             "read_mbs": None, "write_mbs": None, "iops": None},
+            {"ts": 3.0, "gts": 32.0, "width": 4, "temp": 41.0,
              "read_mbs": 12400.5, "write_mbs": 0.0, "iops": 47694},
+            {"ts": 4.0, "gts": 32.0, "width": 4, "temp": 41.2,
+             "read_mbs": 12300.0, "write_mbs": 0.0, "iops": 47000},
         ]
         store = {
             "nvme1n1": {
@@ -408,8 +414,9 @@ class RenderSamplerTablesRampTests(unittest.TestCase):
             store, "nvme1n1", {"seq_read": "1. Послед. Чтение"}
         )
         text = "\n".join(lines)
-        self.assertNotIn("| 1 | 32 GT/s x4 | 40.0 | — |", text)
-        self.assertIn("| 2 | 32 GT/s x4 | 40.0 | 12400.5 | 0.0 | 47,694 |", text)
+        self.assertNotIn("| 17 |", text)
+        self.assertIn("| 1 | 32 GT/s x4 | 41.0 | 12400.5 | 0.0 | 47,694 |", text)
+        self.assertIn("| 2 | 32 GT/s x4 | 41.2 | 12300.0 | 0.0 | 47,000 |", text)
 
     def test_empty_rows_kept_when_no_fio_load_source(self):
         samples = [{"ts": 1.0, "gts": 32.0, "width": 4, "temp": 40.0,
