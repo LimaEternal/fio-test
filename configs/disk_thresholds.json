@@ -1,2 +1,15 @@
 {
+  "SAMSUNG MZWLO1T9HCJR-00A07": {
+    "seq_read":  { "min_bw_mb": 14000 },
+    "seq_write": { "min_bw_mb": 3000 },
+    "rand_read": { "min_iops": 1700000 },
+    "rand_write": { "min_iops": 700000 }
+  },
+  "KIOXIA KCMY1VUG3T20": {
+    "seq_read":  { "min_bw_mb": 14000 },
+    "seq_write": { "min_bw_mb": 6700 },
+    "rand_read": { "min_iops": 2000000 },
+    "rand_write": { "min_iops": 1300000 }
+  }
+
 }
