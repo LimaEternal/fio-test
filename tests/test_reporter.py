@@ -302,16 +302,16 @@ class GenerateReportTestPlansTests(unittest.TestCase):
                     "rand_write": {"bs": "4k", "iodepth": 16, "numjobs": 16},
                 },
                 "thresholds": {
-                    "seq_read": {"min_bw_mb": 12477.0},
-                    "seq_write": {"min_bw_mb": 6612.8},
+                    "seq_read": {"min_bw_mb": 5000},
+                    "seq_write": {"min_bw_mb": 3000},
                     "rand_read": {"min_iops": 500000},
                     "rand_write": {"min_iops": 200000},
                 },
                 "threshold_source": {
-                    "seq_read": "sysfs (формула)",
-                    "seq_write": "sysfs (формула)",
-                    "rand_read": "конфиг (thresholds.json)",
-                    "rand_write": "конфиг (thresholds.json)",
+                    "seq_read": "персональные (по модели)",
+                    "seq_write": "персональные (по модели)",
+                    "rand_read": "общие (nvme gen4)",
+                    "rand_write": "общие (nvme gen4)",
                 },
             }
         }
@@ -329,11 +329,11 @@ class GenerateReportTestPlansTests(unittest.TestCase):
         self.assertIn("256k", text)
         self.assertIn("2", text)
         self.assertIn("**Пороги PASS/FAIL:**", text)
-        self.assertIn("12477 МБ/с", text)
-        self.assertIn("6613 МБ/с", text)
+        self.assertIn("5000 МБ/с", text)
+        self.assertIn("3000 МБ/с", text)
         self.assertIn("500,000 IOPS", text)
-        self.assertIn("sysfs (формула)", text)
-        self.assertIn("конфиг (thresholds.json)", text)
+        self.assertIn("персональные (по модели)", text)
+        self.assertIn("общие (nvme gen4)", text)
 
     def test_report_without_test_plans_has_no_config_section(self):
         with tempfile.TemporaryDirectory() as tmp:

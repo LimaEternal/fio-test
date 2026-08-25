@@ -10,14 +10,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.hw_profile import (
     _detect_interface,
-    _link_generation,
     _read_mpss,
     _read_mpss_from_config,
     _read_upstream_max_payload,
-    compute_pass_thresholds,
     estimate_ceiling_mbps,
     find_nvme_link_dir,
     link_bandwidth_mbps,
+    link_generation,
     read_nvme_max_payload,
 )
 from utils.disk_filter import _is_occupied_device, scan_disks
@@ -28,12 +27,12 @@ KNOWN_INTERFACES = {"nvme": [], "sas": [], "sata": []}
 
 class LinkGenerationTests(unittest.TestCase):
     def test_generation_mapping(self):
-        self.assertEqual(_link_generation(64.0), 6)
-        self.assertEqual(_link_generation(32.0), 5)
-        self.assertEqual(_link_generation(16.0), 4)
-        self.assertEqual(_link_generation(8.0), 3)
-        self.assertEqual(_link_generation(5.0), 2)
-        self.assertEqual(_link_generation(2.5), 1)
+        self.assertEqual(link_generation(64.0), 6)
+        self.assertEqual(link_generation(32.0), 5)
+        self.assertEqual(link_generation(16.0), 4)
+        self.assertEqual(link_generation(8.0), 3)
+        self.assertEqual(link_generation(5.0), 2)
+        self.assertEqual(link_generation(2.5), 1)
 
 
 class FindNvmeLinkDirTests(unittest.TestCase):
@@ -447,62 +446,6 @@ class NvmeMaxPayloadTests(unittest.TestCase):
         with mock.patch("utils.hw_profile.Path", return_value=fake_dev):
             result = _read_upstream_max_payload("0000:01:00.0")
         self.assertIsNone(result)
-
-
-class ComputePassThresholdsTests(unittest.TestCase):
-    """Динамические пороги PASS/FAIL из профиля (ТЗ Zero-Config)."""
-
-    def _disk(self, interface, rotational=0, link=None):
-        return {"tran": interface, "profile": {
-            "interface": interface, "rotational": rotational, "link": link,
-        }}
-
-    def test_nvme_gen5_x4(self):
-        d = self._disk("nvme", link={"width": 4, "speed_gts": 32.0})
-        thr = compute_pass_thresholds(d)
-        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 12477.0, places=0)
-        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 6612.8, places=1)
-
-    def test_nvme_gen4_x4(self):
-        d = self._disk("nvme", link={"width": 4, "speed_gts": 16.0})
-        thr = compute_pass_thresholds(d)
-        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 6238.5, places=0)
-        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 3306.4, places=0)
-
-    def test_nvme_gen3_x4(self):
-        d = self._disk("nvme", link={"width": 4, "speed_gts": 8.0})
-        thr = compute_pass_thresholds(d)
-        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 3083.8, places=0)
-        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 1634.4, places=0)
-
-    def test_sata_iii(self):
-        d = self._disk("sata", link={"spd_limit_gbps": 6.0})
-        thr = compute_pass_thresholds(d)
-        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 495.0, places=0)
-        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 445.5, places=0)
-
-    def test_sas_12g(self):
-        d = self._disk("sas", link={"negotiated_gbps": 12.0})
-        thr = compute_pass_thresholds(d)
-        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 1035.0, places=0)
-        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 931.5, places=0)
-
-    def test_hdd_media_only(self):
-        d = self._disk("sata", rotational=1, link={"spd_limit_gbps": 3.0})
-        thr = compute_pass_thresholds(d)
-        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 198.0, places=0)
-        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 198.0, places=0)
-
-    def test_missing_sysfs_returns_empty(self):
-        # NVMe без линка → данных нет, пороги считаются из конфига (fallback)
-        self.assertEqual(compute_pass_thresholds(self._disk("nvme")), {})
-        self.assertEqual(compute_pass_thresholds(self._disk("sata")), {})
-
-    def test_target_percent_scales(self):
-        d = self._disk("sata", link={"spd_limit_gbps": 6.0})
-        thr = compute_pass_thresholds(d, target_percent=0.50)
-        self.assertAlmostEqual(thr["seq_read"]["min_bw_mb"], 275.0, places=0)
-        self.assertAlmostEqual(thr["seq_write"]["min_bw_mb"], 247.5, places=0)
 
 
 if __name__ == "__main__":

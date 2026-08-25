@@ -32,13 +32,11 @@ fio-test.py — Автоматический бенчмаркинг несист
     python fio-test.py -o my.md         — свой путь отчёта
     python fio-test.py --target-iops 50 — целевая нагрузка IOPS на поток для расчёта
                                            bs/numjobs/iodepth последовательных тестов
-    python fio-test.py --target-percent 0.8 — масштабировать динамические пороги
-                                           PASS/FAIL (доля от расчётного потолка)
 
 Примечания по флагам:
   - -a/--add и -d/--delete взаимоисключающие: передача обоих вызывает ошибку
     (SystemExit) ещё на этапе разбора аргументов.
-  - -t/--test (тестовый режим) молча игнорирует -s/-f/-r/-b/-c/--target-percent:
+  - -t/--test (тестовый режим) молча игнорирует -s/-f/-r/-b/-c:
     эти флаги не влияют на пробную таблицу и в отчёт тестового режима не попадают.
   - -r/--runtime должен быть положительным числом (>0); некорректное значение —
     ошибка разбора.
@@ -51,9 +49,9 @@ fio-test.py — Автоматический бенчмаркинг несист
 
 Читает configs/<interface>.fio -> {интерфейс: {id: [аргументы]}}.
 
-### `def _load_thresholds()`
+### Загрузка порогов (при импорте модуля)
 
-Читает configs/thresholds.json -> {интерфейс: {id: {порог: значение}}}.
+Пороги читаются из utils.thresholds при старте (fail-fast): `BASE_THRESHOLDS` <- configs/base_thresholds.json (общие по интерфейсу+поколению), `PERSONAL_THRESHOLDS` <- configs/disk_thresholds.json (персональные по моделям). Ошибка чтения/парсинга останавливает запуск; структура обоих файлов дополнительно проверяется в validate_configs().
 
 ### `def _expand_short_flags(argv)`
 
@@ -95,17 +93,17 @@ _без docstring_
 
 Возвращает ключ интерфейса (nvme/sas/sata) для диска.
 
-### `def _resolve_thresholds(base, disk, target_percent)`
+### `resolve_thresholds(disk, base, personal)` (из utils/thresholds.py)
 
-Итоговые пороги диска: база (configs/thresholds.json) + динамические seq-пороги из sysfs (Zero-Config), когда данные линка доступны.  Возвращает (merged, source): merged — {test_id: {min_bw_mb|min_iops}}, source — {test_id: "sysfs (формула)" | "конфиг (thresholds.json)"}.
+Выбирает итоговые пороги диска. Приоритет: 1) персональная запись по нормализованной модели (upper-case, схлопывание пробелов) — применяется ЦЕЛИКОМ; 2) секция hdd при rotational == 1; 3) строка интерфейс+поколение из base_thresholds.json (NVMe: поколение PCIe из sysfs-линка с клампингом к доступным строкам; sas/sata/hdd: первая строка секции); 4) поколение неизвестно -> нижняя строка интерфейса. Возвращает (thresholds, source): source — {тест: "персональные (по модели)" | "общие (<интерфейс> <строка>)"}.
 
-### `def collect_plan_info(disks, disk_plans, target_iops, target_percent)`
+### `def collect_plan_info(disks, disk_plans, target_iops)`
 
-Собирает фактические параметры тестов для отчёта.  Возвращает {имя_диска: {"interface", "ceiling_mbps", "max_sectors_kb", "target_iops", "tests": {тест: {"bs", "iodepth", "numjobs"}}, "thresholds": {тест: {min_bw_mb|min_iops}}, "threshold_source": {тест: "sysfs (формула)" | "конфиг (thresholds.json)"}}}.  В реальном режиме параметры берутся из уже построенного плана (disk_plans) — ровно те, с которыми пойдут тесты; в тестовом режиме (disk_plans=None) — считаются из профиля диска.
+Собирает фактические параметры тестов для отчёта.  Возвращает {имя_диска: {"interface", "ceiling_mbps", "max_sectors_kb", "target_iops", "tests": {тест: {"bs", "iodepth", "numjobs"}}, "thresholds": {тест: {min_bw_mb|min_iops}}, "threshold_source": {тест: "персональные (по модели)" | "общие (...)"}}}.  В реальном режиме параметры берутся из уже построенного плана (disk_plans) — ровно те, с которыми пойдут тесты; в тестовом режиме (disk_plans=None) — считаются из профиля диска.
 
-### `def build_disk_plans(disks, thresholds, args)`
+### `def build_disk_plans(disks, args)`
 
-Строит планы тестов для всех дисков.  Возвращает (disk_plans, disk_thresholds): disk_plans — список [(disk_idx, disk, plan)], где plan — [(test_id, fio_args)] с переопределёнными bs/iodepth/numjobs и добавленными --runtime/--size; disk_thresholds — {disk_idx: итоговые пороги (динамика из sysfs для seq + fallback из configs/thresholds.json, который также даёт rand)}.
+Строит планы тестов для всех дисков.  Возвращает (disk_plans, disk_thresholds): disk_plans — список [(disk_idx, disk, plan)], где plan — [(test_id, fio_args)] с переопределёнными bs/iodepth/numjobs и добавленными --runtime/--size; disk_thresholds — {disk_idx: итоговые пороги (персональные по модели либо общие из configs/base_thresholds.json)}.
 
 ### `def _fake_profile(tran, rotational, **link)`
 
@@ -233,7 +231,9 @@ _без docstring_
 
 - `INTERFACE_CONFIGS`
 
-- `INTERFACE_THRESHOLDS`
+- `BASE_THRESHOLDS`
+
+- `PERSONAL_THRESHOLDS`
 
 - `TEST_NAMES`
 
@@ -1076,14 +1076,6 @@ _без docstring_
 
 _без docstring_
 
-##### ### `def test_bad_target_percent_exits(self)`
-
-_без docstring_
-
-##### ### `def test_target_percent_applies_to_dynamic_thresholds(self)`
-
-_без docstring_
-
 #### `class ElapsedParseTests(unittest.TestCase)`
 
 ##### ### `def test_elapsed_parsed_from_job(self)`
@@ -1778,46 +1770,6 @@ _без docstring_
 
 _без docstring_
 
-#### `class ComputePassThresholdsTests(unittest.TestCase)`
-
-Динамические пороги PASS/FAIL из профиля (ТЗ Zero-Config).
-
-##### ### `def _disk(self, interface, rotational, link)`
-
-_без docstring_
-
-##### ### `def test_nvme_gen5_x4(self)`
-
-_без docstring_
-
-##### ### `def test_nvme_gen4_x4(self)`
-
-_без docstring_
-
-##### ### `def test_nvme_gen3_x4(self)`
-
-_без docstring_
-
-##### ### `def test_sata_iii(self)`
-
-_без docstring_
-
-##### ### `def test_sas_12g(self)`
-
-_без docstring_
-
-##### ### `def test_hdd_media_only(self)`
-
-_без docstring_
-
-##### ### `def test_missing_sysfs_returns_empty(self)`
-
-_без docstring_
-
-##### ### `def test_target_percent_scales(self)`
-
-_без docstring_
-
 ### Константы/переменные модуля
 
 - `PROJECT_ROOT`
@@ -2354,13 +2306,52 @@ _без методов_
 Форматирует скорость (байт/с) в человекочитаемый вид (Б/с…ГБ/с).
 
 
+## utils/thresholds.py
+
+Пороги PASS/FAIL: загрузка, валидация и выбор для конкретного диска.
+
+Никаких формул — два декларативных JSON-файла в configs/: base_thresholds.json (общие лояльные пороги по интерфейсу и поколению линка плюс секция hdd) и disk_thresholds.json (персональные пороги моделей, ключ — модель из lsblk в нормализованном виде). Приоритет выбора: персональная запись по модели (целиком) -> hdd -> интерфейс+поколение -> нижняя строка интерфейса, если поколение неизвестно.
+
+### Функции модуля
+
+### `def normalize_model(model)`
+
+Нормализует строку модели: upper-case + схлопывание пробелов.
+
+### `def load_base_thresholds(path)`
+
+Читает общий файл порогов -> {интерфейс: {строка: {тест: {порог}}}}.
+
+### `def load_disk_thresholds(path)`
+
+Читает персональные пороги -> {модель: {тест: {порог}}}. Может быть пустым.
+
+### `def validate_base_thresholds(base)`
+
+Валидирует общий файл. Требования: каждый интерфейс (nvme/sas/sata, опционально hdd) содержит хотя бы одну строку; каждая строка — все четыре теста с корректными значениями ({min_bw_mb|min_iops}: число > 0).
+
+### `def validate_disk_thresholds(personal)`
+
+Валидирует персональный файл. Записи могут быть неполными (применяются целиком, недостающее — FAIL), но каждый указанный тест обязан быть известен и содержать корректный порог.
+
+### `def resolve_thresholds(disk, base, personal)`
+
+Итоговые пороги диска и источник каждого порога. См. описание в разделе fio-test.py.
+
+### Константы/переменные модуля
+
+- `KNOWN_TESTS`
+- `BASE_THRESHOLDS_PATH`
+- `DISK_THRESHOLDS_PATH`
+
+
 ## utils/hw_profile.py
 
 Профилирование аппаратной части диска из sysfs.
 
 Собирает физику линка (PCIe/SAS/SATA), параметры очереди блочного
 устройства, MaxPayload PCIe и NUMA-узел; вычисляет теоретические
-потолки шины и динамические пороги PASS/FAIL (Zero-Config) по ТЗ.
+потолки шины (используются для подбора параметров тестов).
 
 ### Функции модуля
 
@@ -2392,7 +2383,7 @@ _без методов_
 
 Читает sata_spd_limit для SATA диска через ata_link.
 
-### `def _link_generation(speed_gts)`
+### `def link_generation(speed_gts)`
 
 Сопоставляет скорость линка (GT/s) с поколением PCIe.
 
@@ -2406,7 +2397,7 @@ _без методов_
 
 ### `def nvme_line_rate_mbps(gts, width)`
 
-Базовая линейная скорость NVMe без учёта кодирования/TLP (МБ/с).  (GT/s × 1000/8) × width — общая основа для link_bandwidth_mbps и compute_pass_thresholds; вынесена, чтобы не дублировать формулу.
+Базовая линейная скорость NVMe без учёта кодирования/TLP (МБ/с).  (GT/s × 1000/8) × width — основа для link_bandwidth_mbps; вынесена, чтобы не дублировать формулу.
 
 ### `def link_bandwidth_mbps(interface, link)`
 
@@ -2415,10 +2406,6 @@ _без методов_
 ### `def estimate_ceiling_mbps(interface, link, rotational)`
 
 Оценивает максимальную реальную скорость диска в МБ/с.  Для NVMe/SAS совпадает с пропускной способностью шины. Для SATA дополнительно ограничивается реальным потолком флеш/механики.
-
-### `def compute_pass_thresholds(disk, target_percent)`
-
-Динамические пороги PASS/FAIL для последовательных тестов (МБ/с), рассчитанные из профиля железа (sysfs) по ТЗ Zero-Config.  Возвращает {"seq_read": {"min_bw_mb": float}, "seq_write": {"min_bw_mb": float}} или {} если данных sysfs недостаточно (тогда используется fallback из configs/thresholds.json).  Категории: 1) HDD (rotational == 1): BW_media = 220 МБ/с; read = write = BW_media * target_percent. 2) NVMe (PCIe): BW_bus = (gts*1000/8)*(128/130)*tlp*width, tlp = 0.88 (>=16 GT/s) иначе 0.87; read = BW_bus * target_percent; write = BW_bus * 0.53 * target_percent. 3) SATA/SAS SSD (rotational == 0, не PCIe): SATA bus = spd_limit_gbps * (550/6); SAS bus = neg_gbps * (1150/12); read = bus * target_percent; write = bus * 0.90 * target_percent.
 
 ### `def _read_mpss(bdf)`
 
@@ -2441,22 +2428,6 @@ Best-effort: MaxPayload upstream PCIe-моста (порта) из sysfs.  По�
 - `_ENC_128B130B`
 
 - `_ENC_8B10B`
-
-- `DEFAULT_TARGET_PERCENT`
-
-- `_NVME_TLP_EFF_GEN4PLUS`
-
-- `_NVME_TLP_EFF_GEN3`
-
-- `_NVME_WRITE_FACTOR`
-
-- `_SATA_SAS_WRITE_FACTOR`
-
-- `_HDD_MEDIA_MBPS`
-
-- `_SATA_BUS_MBPS_PER_GBPS`
-
-- `_SAS_BUS_MBPS_PER_GBPS`
 
 
 ## utils/nvme_admin.py
@@ -2805,8 +2776,11 @@ FIO-конфиги по интерфейсам. Загружаются `parse_fi
 ### `configs/prefill.fio`
 Конфиг предварительного заполнения дисков (префилл перед тестами).
 
-### `configs/thresholds.json`
-Пороги PASS/FAIL по интерфейсам: для каждого теста — `min_bw_mb` (последовательные) или `min_iops` (случайные). Загружаются в `INTERFACE_THRESHOLDS`. Для seq-тестов при наличии sysfs поверх подставляются динамические пороги (`compute_pass_thresholds`).
+### `configs/base_thresholds.json`
+Общие («лояльные») пороги PASS/FAIL: секции nvme (gen3/gen4/gen5…), sas, sata, hdd; в каждой строке — все четыре теста через `min_bw_mb` или `min_iops`. Действуют для дисков без персональной записи; для NVMe строка выбирается по поколению PCIe-линка из sysfs с клампингом к доступным строкам, для остальных — первая строка секции. Загружаются в `BASE_THRESHOLDS`, выбор — `utils.thresholds.resolve_thresholds`.
+
+### `configs/disk_thresholds.json`
+Персональные пороги по моделям дисков (ключ — модель как в lsblk, нормализуется: upper-case + схлопывание пробелов). Запись применяется целиком; недостающие тесты = FAIL без порога. Имеет приоритет над общим файлом и секцией hdd. Загружаются в `PERSONAL_THRESHOLDS`; может быть пустым.
 
 ### `README.md`
 Описание проекта для пользователя (руководство, примеры запуска).

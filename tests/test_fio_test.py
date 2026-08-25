@@ -1129,27 +1129,6 @@ class TestModeDiskSelectionTests(unittest.TestCase):
             code = fio_test.main()
         self.assertEqual(code, 0)
 
-    def test_bad_target_percent_exits(self):
-        with mock.patch.object(fio_test.sys, "argv",
-                                ["fio-test.py", "-t", "--target-percent", "1.5"]):
-            with self.assertRaises(SystemExit):
-                fio_test.main()
-
-    def test_target_percent_applies_to_dynamic_thresholds(self):
-        disks = fio_test.build_fake_disks()
-        args = mock.Mock()
-        args.target_iops = fio_test.DEFAULT_TARGET_IOPS
-        args.target_percent = 0.50
-        args.runtime = None
-        args.block = None
-        _, disk_thr = fio_test.build_disk_plans(disks, fio_test.INTERFACE_THRESHOLDS, args)
-        # NVMe Gen5 x4: BW_bus ~13863, seq_read = 13863 * 0.50 ~ 6932
-        nvme = next(d for d in disks if d["name"] == "nvme0n1")
-        idx = disks.index(nvme)
-        self.assertAlmostEqual(
-            disk_thr[idx]["seq_read"]["min_bw_mb"], 13863.4 * 0.50, places=0
-        )
-
 
 class ElapsedParseTests(unittest.TestCase):
 
@@ -1179,7 +1158,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.block = 100
         args.add = None
         args.delete = None
-        args.target_percent = 0.90
         args.output = None
         info = fio_test._build_run_info(
             args, prefill_duration=125, tests_duration=3725
@@ -1197,7 +1175,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.block = 100
         args.add = None
         args.delete = None
-        args.target_percent = 0.90
         args.output = None
         info = fio_test._build_run_info(args)
         self.assertEqual(
@@ -1214,7 +1191,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.block = 100
         args.add = [1]
         args.delete = None
-        args.target_percent = 0.90
         args.output = "reports/t.md"
         info = fio_test._build_run_info(args, test_mode=True)
         flags = dict(info["flags"])
@@ -1235,7 +1211,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.block = 100
         args.add = None
         args.delete = None
-        args.target_percent = 0.90
         args.output = None
         info = fio_test._build_run_info(args)
         flags = dict(info["flags"])
@@ -1243,7 +1218,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         self.assertEqual(flags["Предварительное заполнение"], "включено")
         self.assertEqual(flags["Длительность теста"], "60 сек")
         self.assertEqual(flags["Размер тестовой области"], "100 ГБ")
-        self.assertEqual(flags["Целевая доля PASS (--target-percent)"], "0.90")
 
     def test_block_zero_rendered_as_full_disk(self):
         args = mock.Mock()
@@ -1254,7 +1228,6 @@ class BuildRunInfoTimingTests(unittest.TestCase):
         args.block = 0
         args.add = None
         args.delete = None
-        args.target_percent = 0.90
         args.output = None
         info = fio_test._build_run_info(args)
         flags = dict(info["flags"])

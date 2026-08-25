@@ -186,7 +186,8 @@ def _render_test_plans(test_plans: dict) -> List[str]:
                 )
         lines.append("")
 
-        # Пороги PASS/FAIL (динамические из sysfs для seq + конфиг для rand).
+        # Пороги PASS/FAIL: персональные по модели либо общие
+        # (интерфейс+поколение) из configs/base_thresholds.json.
         thr = info.get("thresholds") or {}
         src = info.get("threshold_source") or {}
         if thr:

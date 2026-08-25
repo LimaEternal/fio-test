@@ -47,10 +47,17 @@ from utils.process import run_process
 from utils.reporter import generate_report
 from utils.disk_filter import scan_disks
 from utils.hw_profile import (
-    DEFAULT_TARGET_PERCENT,
     _detect_interface,
-    compute_pass_thresholds,
     estimate_ceiling_mbps,
+)
+from utils.thresholds import (
+    BASE_THRESHOLDS_PATH,
+    DISK_THRESHOLDS_PATH,
+    load_base_thresholds,
+    load_disk_thresholds,
+    resolve_thresholds,
+    validate_base_thresholds,
+    validate_disk_thresholds,
 )
 from utils.table_renderer import build_results_table
 from utils.tuner import SystemTuner
@@ -79,16 +86,16 @@ def _load_fio_configs():
     }
 
 
-def _load_thresholds():
-    """Читает configs/thresholds.json -> {интерфейс: {id: {порог: значение}}}."""
-    path = CONFIG_DIR / "thresholds.json"
-    with path.open(encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-# Конфигурации интерфейсов и пороги (загружаются при старте, fail-fast)
+# Конфигурации интерфейсов и пороги (загружаются при старте, fail-fast).
+# Пороги — два декларативных файла: общие по интерфейсу+поколению и
+# персональные по моделям дисков (см. utils/thresholds.py).
 INTERFACE_CONFIGS = _load_fio_configs()
-INTERFACE_THRESHOLDS = _load_thresholds()
+try:
+    BASE_THRESHOLDS = load_base_thresholds()
+    PERSONAL_THRESHOLDS = load_disk_thresholds()
+except ValueError as exc:
+    console.print(f"[bold red]ОШИБКА:[/bold red] {exc}")
+    sys.exit(1)
 
 TEST_NAMES = {}
 for _tests in INTERFACE_CONFIGS.values():
@@ -165,8 +172,7 @@ def parse_args():
             "  python fio-test.py -a 1 3-5                  — только диски 1 и 3..5 (номера/диапазоны)\n"
             "  python fio-test.py -d 4 6-8                  — все диски, кроме 4 и 6..8\n"
             "  python fio-test.py -o reports/custom.md       — свой путь отчёта\n"
-            "  python fio-test.py --target-percent 0.85       — порог PASS = 85% от потолка шины\n"
-            "  python fio-test.py -t                        — тестовый режим (динамические пороги из sysfs)"
+            "  python fio-test.py -t                        — тестовый режим (пробные данные)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -232,12 +238,6 @@ def parse_args():
              "диапазоны, через пробел: 1 3-5). Без номеров — запросит список "
              "интерактивно",
     )
-    parser.add_argument(
-        "--target-percent", type=float, default=DEFAULT_TARGET_PERCENT,
-        help="Доля от теоретического потолка шины/носителя, при которой "
-             "последовательный тест считается PASS (по умолчанию 0.90). "
-             "Используется при динамическом расчёте порогов из sysfs.",
-    )
     args = parser.parse_args(_expand_short_flags(sys.argv[1:]))
     if args.add is not None:
         args.add = [n for tok in args.add for n in tok]
@@ -247,8 +247,6 @@ def parse_args():
         parser.error("--runtime должен быть положительным числом секунд")
     if args.target_iops <= 0:
         parser.error("--target-iops должен быть больше нуля")
-    if not (0.0 < args.target_percent <= 1.0):
-        parser.error("--target-percent должен быть в диапазоне (0, 1]")
     if args.output is not None:
         out = Path(args.output)
         if out.is_dir():
@@ -389,8 +387,6 @@ def _build_run_info(args, prefill_duration=None, tests_duration=None, test_mode=
         flags.append(("Выбор дисков (--add)", ", ".join(str(n) for n in args.add)))
     if args.delete is not None:
         flags.append(("Выбор дисков (--delete)", ", ".join(str(n) for n in args.delete)))
-    if not test_mode:
-        flags.append(("Целевая доля PASS (--target-percent)", f"{args.target_percent:.2f}"))
     if args.output:
         flags.append(("Выходной отчёт", args.output))
     command = "python fio-test.py " + " ".join(sys.argv[1:])
@@ -402,33 +398,15 @@ def _disk_interface(disk: dict) -> str:
     return _detect_interface(disk.get("name", ""), disk.get("tran"))
 
 
-def _resolve_thresholds(base: dict, disk: dict, target_percent: float) -> tuple:
-    """
-    Итоговые пороги диска: база (configs/thresholds.json) + динамические
-    seq-пороги из sysfs (Zero-Config), когда данные линка доступны.
-
-    Возвращает (merged, source): merged — {test_id: {min_bw_mb|min_iops}},
-    source — {test_id: "sysfs (формула)" | "конфиг (thresholds.json)"}.
-    """
-    dyn = compute_pass_thresholds(disk, target_percent)
-    merged = dict(base)
-    merged.update(dyn)
-    source = {}
-    for tid in INTERFACE_CONFIGS.get(_disk_interface(disk), {}):
-        source[tid] = "sysfs (формула)" if tid in dyn else "конфиг (thresholds.json)"
-    return merged, source
-
-
 def collect_plan_info(disks: list, disk_plans=None,
-                      target_iops: int = DEFAULT_TARGET_IOPS,
-                      target_percent: float = DEFAULT_TARGET_PERCENT) -> dict:
+                      target_iops: int = DEFAULT_TARGET_IOPS) -> dict:
     """
     Собирает фактические параметры тестов для отчёта.
 
     Возвращает {имя_диска: {"interface", "ceiling_mbps", "max_sectors_kb",
     "target_iops", "tests": {тест: {"bs", "iodepth", "numjobs"}},
     "thresholds": {тест: {min_bw_mb|min_iops}},
-    "threshold_source": {тест: "sysfs (формула)" | "конфиг (thresholds.json)"}}}.
+    "threshold_source": {тест: "персональные (по модели)" | "общие (...)"} }.
 
     В реальном режиме параметры берутся из уже построенного плана
     (disk_plans) — ровно те, с которыми пойдут тесты; в тестовом режиме
@@ -461,9 +439,7 @@ def collect_plan_info(disks: list, disk_plans=None,
                 overrides = compute_test_overrides(profile, interface, test_id, target_iops)
                 tests[test_id] = dict(overrides)
 
-        merged, source = _resolve_thresholds(
-            INTERFACE_THRESHOLDS.get(interface, {}), disk, target_percent
-        )
+        merged, source = resolve_thresholds(disk, BASE_THRESHOLDS, PERSONAL_THRESHOLDS)
 
         info[name] = {
             "interface": interface,
@@ -477,15 +453,15 @@ def collect_plan_info(disks: list, disk_plans=None,
     return info
 
 
-def build_disk_plans(disks: list, thresholds: dict, args) -> tuple:
+def build_disk_plans(disks: list, args) -> tuple:
     """
     Строит планы тестов для всех дисков.
 
     Возвращает (disk_plans, disk_thresholds): disk_plans — список
     [(disk_idx, disk, plan)], где plan — [(test_id, fio_args)] с
     переопределёнными bs/iodepth/numjobs и добавленными --runtime/--size;
-    disk_thresholds — {disk_idx: итоговые пороги (динамика из sysfs для
-    seq + fallback из configs/thresholds.json, который также даёт rand)}.
+    disk_thresholds — {disk_idx: итоговые пороги (персональные по модели,
+    иначе общие из configs/base_thresholds.json)}.
     """
     disk_plans = []
     disk_thresholds = {}
@@ -493,9 +469,9 @@ def build_disk_plans(disks: list, thresholds: dict, args) -> tuple:
     for disk_idx, disk in enumerate(disks):
         tran_key = _disk_interface(disk)
         tests = INTERFACE_CONFIGS.get(tran_key, INTERFACE_CONFIGS["sata"])
-        # Итоговые пороги: база из configs/thresholds.json (fallback для seq
-        # при отсутствии sysfs + rand_read/rand_write) + динамические seq из sysfs.
-        disk_thr, _ = _resolve_thresholds(thresholds.get(tran_key, {}), disk, args.target_percent)
+        # Итоговые пороги: персональная запись по модели (целиком) либо
+        # общая строка интерфейс+поколение из configs/base_thresholds.json.
+        disk_thr, _ = resolve_thresholds(disk, BASE_THRESHOLDS, PERSONAL_THRESHOLDS)
         disk_thresholds[disk_idx] = disk_thr
 
         plan = build_test_plan(disk, tests, target_iops=args.target_iops)
@@ -590,9 +566,8 @@ def build_fake_results(disks: list) -> list:
 
 
 def validate_configs():
-    """Валидирует .fio-конфиги и пороги всех интерфейсов."""
+    """Валидирует .fio-конфиги и пороговые файлы configs/."""
     valid_bs = {"4k", "8k", "16k", "32k", "64k", "128k", "256k", "512k", "1m"}
-    required_thresh_keys = {"seq_read", "seq_write", "rand_read", "rand_write"}
 
     for name, tests in INTERFACE_CONFIGS.items():
         desc = name
@@ -638,31 +613,21 @@ def validate_configs():
                 )
                 sys.exit(1)
 
-        # Проверка порогов
-        thresh = INTERFACE_THRESHOLDS.get(name)
-        if not isinstance(thresh, dict):
+    # Пороги: общий файл (по интерфейсу+поколению) и персональные записи.
+    # Структуру обоих файлов проверяет utils/thresholds.
+    for iface in INTERFACES:
+        if iface not in BASE_THRESHOLDS:
             console.print(
-                f"[red]ОШИБКА:[/red] {desc}: пороги не являются словарём"
+                f"[red]ОШИБКА:[/red] {BASE_THRESHOLDS_PATH.name}: "
+                f"нет секции интерфейса '{iface}'"
             )
             sys.exit(1)
-        missing_t = required_thresh_keys - set(thresh.keys())
-        if missing_t:
-            console.print(
-                f"[red]ОШИБКА:[/red] {desc}: пороги не содержат ключей {missing_t}"
-            )
-            sys.exit(1)
-        for tid, tv in thresh.items():
-            if not isinstance(tv, dict):
-                console.print(
-                    f"[red]ОШИБКА:[/red] {desc}: пороги['{tid}'] — не словарь"
-                )
-                sys.exit(1)
-            if "min_bw_mb" not in tv and "min_iops" not in tv:
-                console.print(
-                    f"[red]ОШИБКА:[/red] {desc}: пороги['{tid}'] — "
-                    f"нет min_bw_mb или min_iops"
-                )
-                sys.exit(1)
+    try:
+        validate_base_thresholds(BASE_THRESHOLDS)
+        validate_disk_thresholds(PERSONAL_THRESHOLDS)
+    except ValueError as exc:
+        console.print(f"[red]ОШИБКА:[/red] пороги: {exc}")
+        sys.exit(1)
 
 
 def _run_io_process(cmd, cancel_event):
@@ -1291,15 +1256,6 @@ def main():
             exit_code = max(exit_code, 2)
         return exit_code
 
-    # Настройка пороговых значений с возможностью переопределения
-    # Базовые пороги из configs/thresholds.json (fallback для seq при отсутствии
-    # sysfs + источник rand_read/rand_write). Динамические seq-пороги из sysfs
-    # подставляются позже в build_disk_plans() поверх этого словаря.
-    thresholds = {
-        iface: dict(thr_map)
-        for iface, thr_map in INTERFACE_THRESHOLDS.items()
-    }
-
     console.print("[bold]Сканирование дисков...[/bold]")
 
     try:
@@ -1401,7 +1357,7 @@ def main():
 
     # Планы тестов строятся до первой записи отчёта: отчёт сразу показывает
     # фактические параметры (bs/iodepth/numjobs), с которыми пойдут тесты.
-    disk_plans, disk_thresholds = build_disk_plans(disks, thresholds, args)
+    disk_plans, disk_thresholds = build_disk_plans(disks, args)
     for disk_idx, thr in disk_thresholds.items():
         results[disk_idx]["_thresholds"] = thr
     test_plans = collect_plan_info(disks, disk_plans, target_iops=args.target_iops)

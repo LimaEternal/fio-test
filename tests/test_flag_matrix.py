@@ -93,7 +93,6 @@ class FlagMatrixTests(unittest.TestCase):
             ["-b", "200"],
             ["-b", "0"],
             ["--target-iops", "1000"],
-            ["--target-percent", "0.8"],
             ["-a", "1"],
             ["-d", "1"],
             ["-o", "custom.md"],
@@ -109,10 +108,9 @@ class FlagMatrixTests(unittest.TestCase):
                 self.assertIn(code, (0, 1, 2))
 
     def test_t_ignores_other_flags(self):
-        # -t молча игнорирует -s/-f/-r/-b/-c/--target-percent (по решению).
+        # -t молча игнорирует -s/-f/-r/-b/-c (по решению).
         argv = [
             "-t", "-s", "-f", "-r", "60", "-b", "200", "-c",
-            "--target-percent", "0.8",
         ]
         code = _run(["fio-test.py"] + argv)
         self.assertEqual(code, 0)
@@ -125,8 +123,6 @@ class FlagNegativeTests(unittest.TestCase):
         ["-r", "0"],
         ["-r", "-1"],
         ["-b", "-1"],
-        ["--target-percent", "1.5"],
-        ["--target-percent", "0"],
         ["--target-iops", "0"],
         ["-a", "1", "-d", "2"],
         ["-o", str(PROJECT_ROOT)],  # существующий каталог, а не файл
