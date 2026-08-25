@@ -10,6 +10,12 @@
     "seq_write": { "min_bw_mb": 6700 },
     "rand_read": { "min_iops": 2000000 },
     "rand_write": { "min_iops": 1300000 }
-  }
+  },
+  "INTEL SSDPF2KE032T1": {
+    "seq_read":  { "min_bw_mb": 6700 },
+    "seq_write": { "min_bw_mb": 3600 },
+    "rand_read": { "min_iops": 1000000 },
+    "rand_write": { "min_iops": 750000 }
+  } 
 
 }
